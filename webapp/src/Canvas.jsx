@@ -8,7 +8,7 @@ import { decodeMask, maskToBbox, maskToRLE, rleToMask, maskToCanvas } from './sa
 
 export default function Canvas({
   imageUrl, imageId, tool, anns, setAnns, ontology, activeClass,
-  selectedId, setSelectedId, onMsg = () => {}, onExemplar = null,
+  selectedId, setSelectedId, hoverId = null, onMsg = () => {}, onExemplar = null,
   size = { w: 900, h: 640 },
 }) {
   const [img] = useImage(imageUrl, 'anonymous')
@@ -164,10 +164,16 @@ export default function Canvas({
         {anns.map((a) => a.segmentation?.counts && (
           <MaskAnn key={`m-${a._key}`} ann={a} color={classColor(ontology, a.class_name)} />
         ))}
-        {anns.map((a) => (
+        {anns.map((a, i) => (
           <BoxAnn
-            key={a._key} ann={a} color={classColor(ontology, a.class_name)}
+            key={a._key} ann={a} index={i + 1}
+            color={classColor(ontology, a.class_name)}
             selected={selectedId === a._key}
+            highlighted={hoverId === a._key || selectedId === a._key}
+            // 하나가 강조되면 나머지는 흐리게 — 밀집 장면에서 구분
+            dimmed={(hoverId || selectedId) && hoverId !== a._key && selectedId !== a._key}
+            // 라벨 텍스트: 붐비면(9개+) 강조된 것만 표시
+            showLabel={anns.length < 9 || hoverId === a._key || selectedId === a._key}
             onSelect={() => setSelectedId(a._key)}
             onChange={(bbox) => updateBox(a._key, bbox)}
             scale={view.scale}
@@ -207,28 +213,33 @@ function LiveMask({ mask, W, H, color }) {
   return <KImage image={canvas} name="mask" listening={false} />
 }
 
-function BoxAnn({ ann, color, selected, onSelect, onChange, scale, interactive = true }) {
+function BoxAnn({
+  ann, index, color, selected, highlighted = false, dimmed = false,
+  showLabel = true, onSelect, onChange, scale, interactive = true,
+}) {
   const [x, y, w, h] = ann.bbox
-  const sw = (selected ? 2.5 : 1.5) / scale
-  const label = `${ann.class_name}${ann.confidence != null ? ` ${ann.confidence.toFixed(2)}` : ''}`
+  const sw = (highlighted ? 3 : 1.5) / scale
+  const label = `#${index} ${ann.class_name}${ann.confidence != null ? ` ${ann.confidence.toFixed(2)}` : ''}`
   const HANDLE = 8 / scale
 
   return (
-    <Group listening={interactive}>
+    <Group listening={interactive} opacity={dimmed ? 0.25 : 1}>
       <Rect
         x={x} y={y} width={w} height={h}
         stroke={color} strokeWidth={sw}
-        fill={selected ? color + '22' : 'transparent'}
+        fill={highlighted ? color + '33' : 'transparent'}
         draggable
         onClick={onSelect} onTap={onSelect}
         onDragEnd={(e) => onChange([e.target.x(), e.target.y(), w, h].map(r1))}
         onMouseEnter={(e) => (e.target.getStage().container().style.cursor = 'move')}
         onMouseLeave={(e) => (e.target.getStage().container().style.cursor = 'crosshair')}
       />
-      <Text
-        x={x} y={y - 16 / scale} text={label} fill={color}
-        fontSize={13 / scale} fontStyle="bold" listening={false}
-      />
+      {showLabel && (
+        <Text
+          x={x} y={y - 16 / scale} text={label} fill={color}
+          fontSize={13 / scale} fontStyle="bold" listening={false}
+        />
+      )}
       {selected && (
         <Rect
           x={x + w - HANDLE / 2} y={y + h - HANDLE / 2} width={HANDLE} height={HANDLE}

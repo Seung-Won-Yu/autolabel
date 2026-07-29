@@ -10,6 +10,7 @@ export default function App() {
   const [current, setCurrent] = useState(null)
   const [anns, setAnns] = useState([])
   const [selectedId, setSelectedId] = useState(null)
+  const [hoverId, setHoverId] = useState(null) // 패널 행 ↔ 캔버스 박스 상호 하이라이트
   const [activeClass, setActiveClass] = useState('')
   const [job, setJob] = useState({ status: 'idle' })
   const [toast, setToast] = useState(null)
@@ -349,6 +350,7 @@ export default function App() {
                 ontology={project.ontology}
                 activeClass={activeClass}
                 selectedId={selectedId} setSelectedId={setSelectedId}
+                hoverId={hoverId}
                 onExemplar={async (bbox) => {
                   setMsg('예시로 유사 객체 검색 중…')
                   const r = await api.exemplar(current.id, bbox, activeClass)
@@ -361,6 +363,7 @@ export default function App() {
               <AnnPanel
                 anns={anns} ontology={project.ontology}
                 selectedId={selectedId} setSelectedId={setSelectedId}
+                hoverId={hoverId} setHoverId={setHoverId}
                 onDelete={(key) => { setAnnsDirty(anns.filter((a) => a._key !== key)); if (selectedId === key) setSelectedId(null) }}
                 onClass={(key, cls) => setAnnsDirty(anns.map((a) =>
                   a._key === key ? { ...a, class_name: cls, source: 'human' } : a))}
@@ -425,15 +428,27 @@ function NextStep({ project, images, trainInfo, job, onAutolabel }) {
   )
 }
 
-function AnnPanel({ anns, ontology, selectedId, setSelectedId, onDelete, onClass }) {
+function AnnPanel({ anns, ontology, selectedId, setSelectedId, hoverId, setHoverId, onDelete, onClass }) {
+  const listRef = useRef()
+  // 캔버스에서 박스를 클릭하면 패널의 해당 행으로 스크롤
+  useEffect(() => {
+    if (!selectedId || !listRef.current) return
+    listRef.current.querySelector(`[data-key="${selectedId}"]`)
+      ?.scrollIntoView({ block: 'nearest' })
+  }, [selectedId])
+
   return (
-    <div className="annpanel">
+    <div className="annpanel" ref={listRef}>
       <div className="panel-title">어노테이션 ({anns.length})</div>
+      <div className="hint">행에 마우스를 올리면 캔버스에서 해당 박스만 밝게 표시됩니다</div>
       {anns.length === 0 && <div className="hint">아직 없음 — 오토라벨 또는 드래그로 시작</div>}
-      {anns.map((a) => (
-        <div key={a._key}
-          className={`annrow ${selectedId === a._key ? 'active' : ''}`}
-          onClick={() => setSelectedId(a._key)}>
+      {anns.map((a, i) => (
+        <div key={a._key} data-key={a._key}
+          className={`annrow ${selectedId === a._key ? 'active' : ''} ${hoverId === a._key ? 'hovered' : ''}`}
+          onClick={() => setSelectedId(a._key)}
+          onMouseEnter={() => setHoverId(a._key)}
+          onMouseLeave={() => setHoverId(null)}>
+          <span className="annidx">{i + 1}</span>
           <i style={{ background: classColor(ontology, a.class_name) }} />
           <select value={a.class_name} onClick={(e) => e.stopPropagation()}
             onChange={(e) => onClass(a._key, e.target.value)}>
