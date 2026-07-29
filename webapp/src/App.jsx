@@ -46,8 +46,18 @@ export default function App() {
     const full = await api.getProject(p.id)
     setProject(full)
     setActiveClass(full.ontology[0]?.name || '')
-    setImages(await api.listImages(p.id))
+    const imgs = await api.listImages(p.id)
+    setImages(imgs)
     setCurrent(null); setAnns([])
+    // 첫 이미지 자동 열기 — 빈 캔버스로 시작하지 않게
+    if (imgs.length) {
+      const first = imgs.find((im) => im.status === 'prelabeled')
+        || imgs.find((im) => im.status === 'unlabeled') || imgs[0]
+      const list = await api.getAnnotations(first.id)
+      setCurrent(first)
+      setAnns(list.map((a) => ({ ...a, _key: `db-${a.id}` })))
+      ensureEmbed(first.id).catch(() => {})
+    }
   }
 
   const saveAnns = useCallback(async (imageId, list) => {
@@ -180,27 +190,46 @@ export default function App() {
 
       <div className="layout">
         <aside className="sidebar">
+          <NextStep
+            project={project} images={images} trainInfo={trainInfo} job={job}
+            onAutolabel={async () => {
+              if (!project.ontology.length) return setMsg('클래스를 먼저 정의하세요')
+              setJob(await api.autolabelBatch(project.id, { masks: false }))
+            }}
+          />
           <OntologyEditor project={project} setProject={setProject} />
           <UploadBox project={project} onUploaded={async () => setImages(await api.listImages(project.id))} />
-          <div className="row actions">
-            <button className="primary" disabled={job.status === 'running'}
-              onClick={async () => {
-                if (!project.ontology.length) return setMsg('온톨로지를 먼저 정의하세요')
-                setJob(await api.autolabelBatch(project.id, { masks: false }))
-              }}>
-              {job.status === 'running' ? `오토라벨 ${job.done ?? 0}/${job.total}` : '▶ 전체 오토라벨'}
-            </button>
-            <button onClick={async () => {
-              setMsg('QA 분석 중…')
-              const r = await api.runQa(project.id)
-              if (r.error) return setMsg(r.error)
-              setImages(await api.listImages(project.id))
-              setMsg(`QA 완료 — "의심 우선" 정렬 사용 가능`)
-            }}>QA 분석</button>
-            <a href={api.exportUrl(project.id, 'coco')} download={`${project.name}_coco.json`}><button>COCO</button></a>
-            <a href={api.exportUrl(project.id, 'yolo')} download={`${project.name}_yolo.json`}><button>YOLO</button></a>
+          <div className="card">
+            <div className="panel-title">일괄 작업</div>
+            <div className="row">
+              <button className="primary" disabled={job.status === 'running'}
+                title="전 이미지에 모델이 라벨 초안을 생성합니다 (덮어쓰지 않고 모델 라벨만 갱신)"
+                onClick={async () => {
+                  if (!project.ontology.length) return setMsg('클래스를 먼저 정의하세요')
+                  setJob(await api.autolabelBatch(project.id, { masks: false }))
+                }}>
+                {job.status === 'running' ? `오토라벨 ${job.done ?? 0}/${job.total}` : '▶ 전체 오토라벨'}
+              </button>
+              <button title="전용 모델과 저장된 라벨을 대조해 의심 라벨을 찾고, 클래스별 권장 임계값을 계산합니다 (전용 모델 필요)"
+                onClick={async () => {
+                  setMsg('QA 분석 중…')
+                  const r = await api.runQa(project.id)
+                  if (r.error) return setMsg(r.error)
+                  setImages(await api.listImages(project.id))
+                  const taus = Object.entries(r.recommended_thresholds || {})
+                    .filter(([, v]) => v.tau != null).map(([c, v]) => `${c}≥${v.tau}`).join(' ')
+                  setMsg(`QA 완료 — 이미지 목록에서 "의심" 정렬 사용 가능. 권장 임계값: ${taus || '표본 부족'}`)
+                }}>QA 분석</button>
+            </div>
+            <div className="hint">라벨 내보내기</div>
+            <div className="row">
+              <a href={api.exportUrl(project.id, 'coco')} download={`${project.name}_coco.json`}>
+                <button title="COCO 형식 JSON (마스크 포함)">COCO</button></a>
+              <a href={api.exportUrl(project.id, 'yolo')} download={`${project.name}_yolo.json`}>
+                <button title="YOLO 형식 (파일별 txt를 JSON으로 묶음)">YOLO</button></a>
+            </div>
           </div>
-          <TrainPanel trainInfo={trainInfo} onTrigger={async () => {
+          <TrainPanel trainInfo={trainInfo} approved={approved} onTrigger={async () => {
             setTrainInfo({ ...trainInfo, job: await api.triggerTrain(project.id) })
           }} />
           <ImageList images={images} current={current} onOpen={openImage} />
@@ -240,6 +269,11 @@ export default function App() {
             <button className="bad" onClick={() => setStatus('rejected')} title="거부 후 다음 (X)">✗ 거부</button>
           </div>
 
+          <div className="toolhint">
+            {tool === 'box' && <>드래그로 박스를 그립니다 · 박스 클릭=선택 후 이동/크기조절 · <kbd>1~9</kbd>로 클래스 변경 · <kbd>Del</kbd> 삭제</>}
+            {tool === 'sam' && <>객체를 클릭하면 마스크가 생깁니다 · 클릭=다음 객체(이전 확정) · <kbd>Shift</kbd>+클릭=현재 객체 넓히기 · 우클릭=빼기 · <kbd>Enter</kbd> 확정</>}
+            {tool === 'ex' && <>찾고 싶은 객체 하나에 박스를 그리면, 같은 이미지에서 <b>닮은 것을 모두</b> 찾아줍니다 (텍스트로 부르기 어려운 객체용)</>}
+          </div>
           {current ? (
             <div className="workspace">
               <Canvas
@@ -278,6 +312,49 @@ export default function App() {
 
       {toast && <div className="toast">{toast}</div>}
       {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
+    </div>
+  )
+}
+
+const MIN_APPROVED = 8
+
+// 현재 상태에서 "지금 해야 할 일" 하나만 크게 안내 — 순서를 외우지 않게
+function NextStep({ project, images, trainInfo, job, onAutolabel }) {
+  const approved = images.filter((im) => im.status === 'approved').length
+  const labeled = images.filter((im) => im.ann_count > 0).length
+  const pending = images.filter((im) => im.status === 'prelabeled').length
+  const model = trainInfo.active_model
+  const training = trainInfo.job?.status === 'running'
+
+  let step
+  if (!project.ontology.length || project.ontology.some((c) => !c.name))
+    step = { n: 1, title: '클래스를 정의하세요', desc: '찾을 객체 이름 + 검출 프롬프트(영문). 예: helmet / safety helmet' }
+  else if (!images.length)
+    step = { n: 2, title: '이미지를 업로드하세요', desc: '여러 장 한번에 선택 가능' }
+  else if (job.status === 'running')
+    step = { n: 3, title: `오토라벨 중… ${job.done ?? 0}/${job.total}`, desc: '완료되면 리뷰 대기로 넘어갑니다' }
+  else if (!labeled)
+    step = { n: 3, title: '전체 오토라벨을 실행하세요', desc: '모델이 전 이미지에 라벨 초안을 깝니다', action: { label: '▶ 전체 오토라벨 실행', fn: onAutolabel } }
+  else if (pending)
+    step = { n: 4, title: `리뷰 ${pending}장 남음`, desc: '맞으면 A(승인), 틀리면 고친 뒤 A. 필요 없으면 X(거부)' }
+  else if (training)
+    step = { n: 5, title: '전용 모델 학습 중…', desc: `${trainInfo.job.phase} — 끝나면 오토라벨이 더 정확해집니다` }
+  else if (approved < MIN_APPROVED)
+    step = { n: 5, title: `전용 모델까지 승인 ${approved}/${MIN_APPROVED}장`, desc: `${MIN_APPROVED - approved}장 더 승인하면 자동으로 학습이 시작됩니다` }
+  else if (!model)
+    step = { n: 5, title: '학습 준비 완료', desc: '"지금 학습"을 누르거나 승인을 더 쌓으세요' }
+  else
+    step = { n: 6, title: `전용 모델 가동 중 (mAP50 ${model.map50?.toFixed(2)})`, desc: '이미지를 더 넣고 오토라벨 → 리뷰를 반복하면 정확도가 계속 올라갑니다' }
+
+  return (
+    <div className="nextstep">
+      <div className="ns-head">지금 할 일 · {step.n}단계</div>
+      <div className="ns-title">{step.title}</div>
+      <div className="ns-desc">{step.desc}</div>
+      {step.action && (
+        <button className="primary" style={{ marginTop: 8, width: '100%' }}
+          onClick={step.action.fn}>{step.action.label}</button>
+      )}
     </div>
   )
 }
@@ -398,19 +475,25 @@ function UploadBox({ project, onUploaded }) {
   )
 }
 
-function TrainPanel({ trainInfo, onTrigger }) {
+function TrainPanel({ trainInfo, onTrigger, approved = 0 }) {
   const { job, active_model } = trainInfo
   const running = job.status === 'running'
+  const pct = Math.min(100, (approved / MIN_APPROVED) * 100)
   return (
     <div className="card">
-      <div className="panel-title">전용 모델 (자동 파인튜닝)</div>
+      <div className="panel-title">전용 모델 (내 데이터로 학습)</div>
       <div className="hint">
         {active_model
-          ? <>활성 mAP50 <b>{active_model.map50?.toFixed(3)}</b> · 학습 {active_model.train_images}장 — 오토라벨 담당 중</>
-          : <>승인 8장부터 자동 학습, 이후 5장마다 재학습</>}
+          ? <>지금 이 모델이 오토라벨 담당 · mAP50 <b>{active_model.map50?.toFixed(3)}</b> · 승인 {active_model.train_images}장으로 학습</>
+          : <>승인 라벨이 <b>{MIN_APPROVED}장</b> 모이면 자동으로 학습이 시작됩니다 (현재 {approved}장)</>}
       </div>
+      {!active_model && (
+        <div className="progress mini"><div className="progress-fill" style={{ width: `${pct}%` }} />
+          <span>{approved}/{MIN_APPROVED}</span></div>
+      )}
       <div className="row">
-        <button disabled={running} onClick={onTrigger}>
+        <button disabled={running} onClick={onTrigger}
+          title="승인 라벨로 지금 즉시 학습합니다 (조건 미달이어도 강제 실행)">
           {running ? `학습 중 (${job.phase || '…'})` : '지금 학습'}
         </button>
         {job.status === 'failed' && <small className="bad-text">실패: {job.error}</small>}
