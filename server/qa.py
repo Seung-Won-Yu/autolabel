@@ -94,15 +94,17 @@ def analyze(pid: int) -> dict:
     conn.close()
 
     # 클래스별 추천 임계값: 정밀도 95% 달성하는 최소 conf (골드 val 기준)
+    # 표본 하한 8, 임계값 바닥 0.25 — 소표본 요행·무의미한 저값 추천 방지
+    MIN_SUPPORT = 8
     thresholds = {}
     for cls, pts in calib.items():
-        if len(pts) < 5:
-            thresholds[cls] = {"tau": None, "note": f"val 표본 부족 ({len(pts)})"}
+        if len(pts) < MIN_SUPPORT:
+            thresholds[cls] = {"tau": None, "note": f"val 표본 부족 ({len(pts)}<{MIN_SUPPORT}) — 승인 더 필요"}
             continue
         best = None
-        for tau in [i / 20 for i in range(2, 20)]:
+        for tau in [i / 20 for i in range(5, 20)]:  # 0.25부터
             sel = [ok for conf, ok in pts if conf >= tau]
-            if len(sel) >= 3:
+            if len(sel) >= MIN_SUPPORT:
                 prec = sum(sel) / len(sel)
                 if prec >= 0.95:
                     best = {"tau": tau, "precision": round(prec, 3), "support": len(sel)}

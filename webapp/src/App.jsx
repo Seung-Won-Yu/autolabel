@@ -16,8 +16,16 @@ export default function App() {
   const [tool, setTool] = useState('box')
   const [trainInfo, setTrainInfo] = useState({ job: { status: 'idle' }, active_model: null })
   const [showHelp, setShowHelp] = useState(false)
+  const [filter, setFilter] = useState('all')
+  const [sortMode, setSortMode] = useState('none')
+  const [lastQa, setLastQa] = useState(null)
   const dirty = useRef(false)
   const undoStack = useRef([])
+
+  // 화면에 보이는 목록(필터·정렬 적용) — 이동(←→)도 이 순서를 따른다
+  let visible = filter === 'all' ? images : images.filter((im) => im.status === filter)
+  if (sortMode === 'conf') visible = [...visible].sort((a, b) => (a.min_conf ?? 2) - (b.min_conf ?? 2))
+  else if (sortMode === 'qa') visible = [...visible].sort((a, b) => (b.qa_score ?? -1) - (a.qa_score ?? -1))
 
   const setMsg = useCallback((text) => {
     setToast(text)
@@ -92,11 +100,20 @@ export default function App() {
   }, [setMsg])
 
   const moveImage = useCallback((delta) => {
-    if (!current || !images.length) return
-    const i = images.findIndex((im) => im.id === current.id)
-    const next = images[i + delta]
+    if (!current || !visible.length) return
+    const i = visible.findIndex((im) => im.id === current.id)
+    const next = visible[i + delta] || (i === -1 ? visible[0] : null)
     if (next) openImage(next)
-  }, [current, images, openImage])
+  }, [current, visible, openImage])
+
+  // 자동 저장 — 수정 후 2초 조용하면 저장 (S 강제도 여전히 가능)
+  useEffect(() => {
+    if (!dirty.current || !current) return
+    const t = setTimeout(() => {
+      if (dirty.current) saveAnns(current.id, anns)
+    }, 2000)
+    return () => clearTimeout(t)
+  }, [anns, current, saveAnns])
 
   const setStatus = useCallback(async (status) => {
     if (!current) return
@@ -137,6 +154,24 @@ export default function App() {
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
   })
+
+  // 드래그앤드롭 업로드 — 창 어디에 놓아도 됨
+  useEffect(() => {
+    if (!project) return
+    const over = (e) => e.preventDefault()
+    const drop = async (e) => {
+      e.preventDefault()
+      const files = [...e.dataTransfer.files].filter((f) => f.type.startsWith('image/'))
+      if (!files.length) return
+      setMsg(`${files.length}장 업로드 중…`)
+      await api.uploadImages(project.id, files)
+      setImages(await api.listImages(project.id))
+      setMsg(`${files.length}장 업로드 완료`)
+    }
+    window.addEventListener('dragover', over)
+    window.addEventListener('drop', drop)
+    return () => { window.removeEventListener('dragover', over); window.removeEventListener('drop', drop) }
+  }, [project?.id, setMsg]) // eslint-disable-line
 
   // 배치 잡 폴링
   useEffect(() => {
@@ -216,23 +251,54 @@ export default function App() {
                   const r = await api.runQa(project.id)
                   if (r.error) return setMsg(r.error)
                   setImages(await api.listImages(project.id))
+                  setLastQa(r)
                   const taus = Object.entries(r.recommended_thresholds || {})
                     .filter(([, v]) => v.tau != null).map(([c, v]) => `${c}≥${v.tau}`).join(' ')
-                  setMsg(`QA 완료 — 이미지 목록에서 "의심" 정렬 사용 가능. 권장 임계값: ${taus || '표본 부족'}`)
+                  setMsg(`QA 완료 — "의심" 정렬 사용 가능. 권장 임계값: ${taus || '표본 부족'}`)
                 }}>QA 분석</button>
             </div>
-            <div className="hint">라벨 내보내기</div>
+            {lastQa?.recommended_thresholds && Object.values(lastQa.recommended_thresholds).some((v) => v.tau != null) && (
+              <div className="row">
+                <button className="ok" title="정밀도 95% 기준으로 계산된 클래스별 임계값을 온톨로지에 반영합니다"
+                  onClick={async () => {
+                    const next = project.ontology.map((c) => {
+                      const t = lastQa.recommended_thresholds[c.name]
+                      return t?.tau != null ? { ...c, threshold: t.tau } : c
+                    })
+                    await api.saveOntology(project.id, next)
+                    setProject({ ...project, ontology: next })
+                    setMsg('권장 임계값 적용됨 — 다음 오토라벨부터 반영')
+                  }}>✓ 권장 임계값 적용</button>
+              </div>
+            )}
+            <div className="hint">내보내기 (zip — 바로 학습 가능한 구조)</div>
             <div className="row">
-              <a href={api.exportUrl(project.id, 'coco')} download={`${project.name}_coco.json`}>
-                <button title="COCO 형식 JSON (마스크 포함)">COCO</button></a>
-              <a href={api.exportUrl(project.id, 'yolo')} download={`${project.name}_yolo.json`}>
-                <button title="YOLO 형식 (파일별 txt를 JSON으로 묶음)">YOLO</button></a>
+              <a href={api.exportUrl(project.id, 'coco')}>
+                <button title="images/ + annotations.json (마스크 포함)">COCO.zip</button></a>
+              <a href={api.exportUrl(project.id, 'yolo')}>
+                <button title="images/ + labels/*.txt + data.yaml — ultralytics로 바로 학습 가능">YOLO.zip</button></a>
+              {trainInfo.active_model && (
+                <a href={api.modelUrl(project.id)}>
+                  <button title="현재 활성 전용 모델 가중치 (.pt) — 다른 곳에서 바로 추론 가능">모델 .pt</button></a>
+              )}
             </div>
           </div>
           <TrainPanel trainInfo={trainInfo} approved={approved} onTrigger={async () => {
             setTrainInfo({ ...trainInfo, job: await api.triggerTrain(project.id) })
           }} />
-          <ImageList images={images} current={current} onOpen={openImage} />
+          <ImageList
+            visible={visible} current={current} onOpen={openImage}
+            filter={filter} setFilter={setFilter}
+            sortMode={sortMode} setSortMode={setSortMode}
+            onDelete={async (im) => {
+              if (!confirm(`${im.file_name} 삭제? 라벨도 함께 지워집니다.`)) return
+              await api.deleteImage(im.id)
+              const imgs = await api.listImages(project.id)
+              setImages(imgs)
+              if (current?.id === im.id) { setCurrent(null); setAnns([]) }
+              setMsg('이미지 삭제됨')
+            }}
+          />
         </aside>
 
         <main className="main">
@@ -422,6 +488,13 @@ function ProjectPicker({ projects, onOpen, onCreated }) {
         {projects.map((p) => (
           <li key={p.id} onClick={() => onOpen(p)}>
             <b>{p.name}</b> <small>{p.image_count ?? 0}장</small>
+            <button className="x rowdel" title="프로젝트 삭제"
+              onClick={async (e) => {
+                e.stopPropagation()
+                if (!confirm(`프로젝트 "${p.name}" 삭제? 이미지·라벨·모델 기록이 모두 지워집니다.`)) return
+                await api.deleteProject(p.id)
+                onCreated()
+              }}>×</button>
           </li>
         ))}
       </ul>
@@ -507,14 +580,7 @@ function TrainPanel({ trainInfo, onTrigger, approved = 0 }) {
   )
 }
 
-function ImageList({ images, current, onOpen }) {
-  const [filter, setFilter] = useState('all')
-  const [sortMode, setSortMode] = useState('none')
-
-  let list = filter === 'all' ? images : images.filter((im) => im.status === filter)
-  if (sortMode === 'conf') list = [...list].sort((a, b) => (a.min_conf ?? 2) - (b.min_conf ?? 2))
-  else if (sortMode === 'qa') list = [...list].sort((a, b) => (b.qa_score ?? -1) - (a.qa_score ?? -1))
-
+function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setSortMode, onDelete }) {
   const badge = { unlabeled: '·', prelabeled: '◐', approved: '✓', rejected: '✗' }
   return (
     <div className="imagelist">
@@ -529,8 +595,9 @@ function ImageList({ images, current, onOpen }) {
         <button className={sortMode === 'qa' ? 'active' : ''}
           onClick={() => setSortMode(sortMode === 'qa' ? 'none' : 'qa')} title="모델과 라벨이 싸우는 이미지 먼저 (QA 분석 후)">의심</button>
       </div>
+      <div className="hint">←→ 이동도 이 목록 순서를 따릅니다</div>
       <ul className="ilist">
-        {list.map((im) => (
+        {visible.map((im) => (
           <li key={im.id} className={current?.id === im.id ? 'active' : ''} onClick={() => onOpen(im)}>
             <img src={api.imageUrl(im.id)} loading="lazy" alt="" />
             <div className="meta">
@@ -542,6 +609,8 @@ function ImageList({ images, current, onOpen }) {
                 {im.qa_score != null ? ` · QA ${im.qa_score}` : ''}
               </small>
             </div>
+            <button className="x rowdel" title="이미지 삭제"
+              onClick={(e) => { e.stopPropagation(); onDelete(im) }}>×</button>
           </li>
         ))}
       </ul>

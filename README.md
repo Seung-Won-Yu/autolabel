@@ -58,9 +58,12 @@
 
 **리뷰**
 - 썸네일 리스트 + 상태·라벨수·신뢰도·QA 점수
-- 필터 4종 · **불확실 우선** · **의심 우선** 정렬
+- 필터 4종 · **불확실 우선** · **의심 우선** 정렬 — `←→` 이동도 이 순서를 따름
 - `A`/`X` 승인·거부 후 자동 다음, `1~9` 클래스 재할당, `Cmd+Z` 실행 취소(50단계)
 - 우측 어노테이션 패널 — 선택·클래스 변경·삭제, 출처 표시(🤖 모델 / ✍️ 사람 / ▦ 마스크)
+- **2초 자동 저장** · 드래그앤드롭 업로드 · "지금 할 일" 단계 안내 배너
+- QA 권장 임계값 **원클릭 적용** · 전용 모델 `.pt` 다운로드
+- 익스포트는 **바로 학습 가능한 zip** (YOLO: images/ + labels/ + data.yaml)
 
 **학습 & 품질**
 - 승인 8장부터 자동 파인튜닝, 이후 5장마다 재학습 (별도 프로세스 — 서버 재시작에도 생존)
@@ -85,19 +88,8 @@ server/   FastAPI + SQLite
 ## 실행
 
 ```bash
-# 백엔드
-.venv/bin/python -m uvicorn server.main:app --port 8899
-
-# 프론트
-cd webapp && npm run dev     # → http://localhost:5173
-```
-
-SAM 인코더만 별도로 받으면 된다 (1.2GB, 용량 때문에 저장소 미포함):
-
-```bash
-curl -L -o models/sam_vit_l_0b3195.pth \
-  https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth
-cp release/sam_decoder_vit_l.onnx webapp/public/sam_decoder.onnx
+./setup.sh    # 최초 1회: venv + 의존성 + SAM 가중치(1.2GB) + 브라우저 디코더
+./start.sh    # 백엔드 + 프론트 동시 실행, 브라우저 자동 오픈 (종료: Ctrl+C)
 ```
 
 Grounding DINO · YOLO11n은 첫 사용 시 자동 다운로드.

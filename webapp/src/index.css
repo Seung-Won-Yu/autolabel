@@ -109,6 +109,9 @@ kbd {
   padding: 5px 6px; border-radius: 8px; cursor: pointer;
 }
 .ilist li:hover { background: var(--bg3); }
+.rowdel { visibility: hidden; margin-left: auto; }
+.ilist li:hover .rowdel, .plist li:hover .rowdel { visibility: visible; }
+.plist li { display: flex; align-items: center; gap: 8px; }
 .ilist li.active { background: #2c3e50; }
 .ilist img {
   width: 44px; height: 44px; object-fit: cover; border-radius: 6px;

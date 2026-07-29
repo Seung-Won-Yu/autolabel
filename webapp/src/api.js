@@ -53,7 +53,10 @@ export const api = {
       body: JSON.stringify(opts),
     }).then(j),
   autolabelStatus: (pid) => fetch(`/api/projects/${pid}/autolabel/status`).then(j),
-  exportUrl: (pid, fmt) => `/api/projects/${pid}/export?fmt=${fmt}`,
+  exportUrl: (pid, fmt) => `/api/projects/${pid}/export.zip?fmt=${fmt}`,
+  modelUrl: (pid) => `/api/projects/${pid}/model`,
+  deleteImage: (iid) => fetch(`/api/images/${iid}`, { method: 'DELETE' }).then(j),
+  deleteProject: (pid) => fetch(`/api/projects/${pid}`, { method: 'DELETE' }).then(j),
   exemplar: (iid, bbox, className) =>
     fetch(`/api/images/${iid}/exemplar`, {
       method: 'POST',

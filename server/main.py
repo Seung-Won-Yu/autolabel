@@ -281,6 +281,101 @@ def exemplar(iid: int, body: dict):
     return {"detections": dets}
 
 
+# ---------- 삭제 ----------
+
+@app.delete("/api/images/{iid}")
+def delete_image(iid: int):
+    path = _image_path(iid)
+    conn = get_db()
+    conn.execute("DELETE FROM annotations WHERE image_id=?", (iid,))
+    conn.execute("DELETE FROM images WHERE id=?", (iid,))
+    conn.commit()
+    conn.close()
+    path.unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.delete("/api/projects/{pid}")
+def delete_project(pid: int):
+    import shutil
+
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM annotations WHERE image_id IN (SELECT id FROM images WHERE project_id=?)",
+        (pid,))
+    conn.execute("DELETE FROM images WHERE project_id=?", (pid,))
+    conn.execute("DELETE FROM models WHERE project_id=?", (pid,))
+    conn.execute("DELETE FROM projects WHERE id=?", (pid,))
+    conn.commit()
+    conn.close()
+    shutil.rmtree(DATA_DIR / str(pid), ignore_errors=True)
+    return {"ok": True}
+
+
+# ---------- 모델 다운로드 ----------
+
+@app.get("/api/projects/{pid}/model")
+def download_model(pid: int):
+    m = train.active_model(pid)
+    if not m:
+        raise HTTPException(404, "활성 전용 모델 없음")
+    return FileResponse(m["path"], filename=f"model_p{pid}_map{m['map50']:.3f}.pt")
+
+
+# ---------- zip 익스포트 (바로 학습 가능한 구조) ----------
+
+@app.get("/api/projects/{pid}/export.zip")
+def export_zip(pid: int, fmt: str = "yolo"):
+    import io as _io
+    import zipfile
+
+    from fastapi.responses import StreamingResponse
+
+    conn = get_db()
+    proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    ontology = json.loads(proj["ontology"])
+    names = [c["name"] for c in ontology]
+    cls_id = {n: i for i, n in enumerate(names)}
+    images = conn.execute("SELECT * FROM images WHERE project_id=?", (pid,)).fetchall()
+
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        if fmt == "yolo":
+            z.writestr("data.yaml",
+                       f"path: .\ntrain: images\nval: images\nnames: {json.dumps(names)}\n")
+            for im in images:
+                fname = f"{im['id']}_{im['file_name']}"
+                src = DATA_DIR / str(pid) / fname
+                if not src.exists():
+                    continue
+                z.write(src, f"images/{fname}")
+                lines = []
+                for a in conn.execute(
+                        "SELECT * FROM annotations WHERE image_id=?", (im["id"],)):
+                    d = row_to_dict(a)
+                    if d["class_name"] not in cls_id:
+                        continue
+                    x, y, w, h = d["bbox"]
+                    lines.append(
+                        f"{cls_id[d['class_name']]} "
+                        f"{(x + w / 2) / im['width']:.6f} {(y + h / 2) / im['height']:.6f} "
+                        f"{w / im['width']:.6f} {h / im['height']:.6f}")
+                z.writestr(f"labels/{Path(fname).stem}.txt", "\n".join(lines))
+        else:  # coco
+            coco = export(pid, fmt="coco")
+            z.writestr("annotations.json", json.dumps(coco, ensure_ascii=False))
+            for im in images:
+                src = DATA_DIR / str(pid) / f"{im['id']}_{im['file_name']}"
+                if src.exists():
+                    z.write(src, f"images/{im['file_name']}")
+    conn.close()
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition":
+                 f"attachment; filename={proj['name']}_{fmt}.zip"})
+
+
 # ---------- QA ----------
 
 @app.post("/api/projects/{pid}/qa")

@@ -1,0 +1,17 @@
+torch
+torchvision
+transformers
+segment-anything
+ultralytics
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+opencv-python
+numpy
+pycocotools
+supervision
+requests
+onnx
+onnxscript
+onnxruntime
