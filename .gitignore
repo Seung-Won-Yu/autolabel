@@ -1,0 +1,23 @@
+# 파이썬
+.venv/
+__pycache__/
+*.pyc
+
+# 노드
+node_modules/
+webapp/dist/
+
+# 모델 가중치 (수백MB~GB — 스크립트로 재다운로드)
+models/
+*.pt
+*.pth
+*.onnx
+
+# 데이터·DB·학습 산출물
+data/
+autolabel.db
+output/
+runs/
+
+# OS
+.DS_Store

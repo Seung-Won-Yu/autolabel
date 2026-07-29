@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "sam-demo",
+      "runtimeExecutable": "/Users/est/Documents/claude/autolabel/.venv/bin/python",
+      "runtimeArgs": ["scripts/embed_server.py"],
+      "port": 8765
+    }
+  ]
+}

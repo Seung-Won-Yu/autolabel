@@ -1,0 +1,258 @@
+"""모델 서비스: SAM 인코더(임베딩) + Grounding DINO(텍스트→박스) + SAM(박스→마스크).
+
+Phase 0에서 검증된 코드 이식. 모델은 최초 사용 시 lazy 로드 (기동 속도 확보).
+"""
+import base64
+import hashlib
+import io
+import threading
+import time
+
+import numpy as np
+import torch
+from PIL import Image
+
+DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+SAM_CKPT = "models/sam_vit_l_0b3195.pth"
+DINO_MODEL = "IDEA-Research/grounding-dino-base"
+
+_lock = threading.Lock()
+_sam_predictor = None
+_dino = None
+_embed_cache: dict[str, dict] = {}
+_current_key: str | None = None
+
+
+def get_sam():
+    global _sam_predictor
+    with _lock:
+        if _sam_predictor is None:
+            from segment_anything import SamPredictor, sam_model_registry
+
+            sam = sam_model_registry["vit_l"](checkpoint=SAM_CKPT).to(DEVICE)
+            _sam_predictor = SamPredictor(sam)
+    return _sam_predictor
+
+
+def get_dino():
+    global _dino
+    with _lock:
+        if _dino is None:
+            from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+            proc = AutoProcessor.from_pretrained(DINO_MODEL)
+            model = (
+                AutoModelForZeroShotObjectDetection.from_pretrained(DINO_MODEL)
+                .to(DEVICE).eval()
+            )
+            _dino = (proc, model)
+    return _dino
+
+
+def embed_image(data: bytes) -> dict:
+    """SAM 임베딩 — 이미지 해시 캐시. 브라우저 디코더용."""
+    global _current_key
+    key = hashlib.sha256(data).hexdigest()
+    if key in _embed_cache:
+        return {**_embed_cache[key], "cached": True, "encode_ms": 0}
+
+    image = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+    predictor = get_sam()
+    t0 = time.perf_counter()
+    predictor.set_image(image)
+    _current_key = key
+    encode_ms = round((time.perf_counter() - t0) * 1000)
+    emb = predictor.get_image_embedding().cpu().numpy().astype(np.float32)
+    result = {
+        "key": key,
+        "embedding": base64.b64encode(emb.tobytes()).decode(),
+        "shape": list(emb.shape),
+        "orig_size": [image.shape[0], image.shape[1]],
+    }
+    _embed_cache[key] = result
+    return {**result, "cached": False, "encode_ms": encode_ms}
+
+
+@torch.no_grad()
+def exemplar_detect(image_np: np.ndarray, bbox: list[float],
+                    topk: int = 20, sim_thr: float = 0.6) -> list[dict]:
+    """시각 예시 검출 (PerSAM 패턴, 학습 프리):
+    예시 박스의 SAM 특징 평균 → 특징맵 코사인 유사도 → 피크 → 포인트 프롬프트 → 마스크 → NMS.
+    """
+    predictor = get_sam()
+    predictor.set_image(image_np)
+    global _current_key
+    _current_key = None  # 임베딩 캐시와 별개 경로 — 상태 오염 방지
+
+    feats = predictor.features[0]  # [256, 64, 64]
+    C, FH, FW = feats.shape
+    H, W = image_np.shape[:2]
+    x, y, w, h = bbox
+    # 박스를 특징맵 격자로 사영 (SAM은 긴 변 1024 + 패딩 — 특징맵은 패딩 포함 정사각)
+    scale = 1024 / max(H, W)
+    fx1 = int(x * scale / 1024 * FW); fy1 = int(y * scale / 1024 * FH)
+    fx2 = max(fx1 + 1, int((x + w) * scale / 1024 * FW))
+    fy2 = max(fy1 + 1, int((y + h) * scale / 1024 * FH))
+    ex_feat = feats[:, fy1:fy2, fx1:fx2].mean(dim=(1, 2))  # [256]
+
+    fmap = feats / (feats.norm(dim=0, keepdim=True) + 1e-6)
+    ex_feat = ex_feat / (ex_feat.norm() + 1e-6)
+    sim = torch.einsum("c,chw->hw", ex_feat, fmap)  # [64, 64] 코사인 유사도
+
+    # 유효 영역(패딩 제외)만
+    vh = max(1, round(H * scale / 1024 * FH))
+    vw = max(1, round(W * scale / 1024 * FW))
+    sim_valid = sim[:vh, :vw].clone()
+
+    # 적응 임계값: 텍스처 빈약 도메인(PCB 등)은 유사도가 전체적으로 높게 번짐 —
+    # 절대값과 분포 기반(mean+2σ) 중 높은 쪽 사용
+    adaptive = (sim_valid.mean() + 2 * sim_valid.std()).item()
+    thr = max(sim_thr, adaptive)
+
+    # 로컬 피크 상위 K개 → 이미지 좌표 포인트
+    flat = sim_valid.flatten()
+    order = torch.argsort(flat, descending=True)
+    picked_pts = []
+    taken = torch.zeros_like(sim_valid, dtype=torch.bool)
+    for idx in order[: topk * 8]:
+        v = flat[idx].item()
+        if v < thr or len(picked_pts) >= topk:
+            break
+        py, px = divmod(idx.item(), sim_valid.shape[1])
+        if taken[max(0, py - 2):py + 3, max(0, px - 2):px + 3].any():
+            continue  # 근접 피크 억제
+        taken[py, px] = True
+        picked_pts.append(((px + 0.5) / FW * 1024 / scale, (py + 0.5) / FH * 1024 / scale, v))
+
+    def pooled_sim(bx, by, bw, bh) -> float:
+        """후보 박스 영역 특징 풀링 → 예시와 코사인 (재검증 점수)."""
+        gx1 = int(bx * scale / 1024 * FW); gy1 = int(by * scale / 1024 * FH)
+        gx2 = max(gx1 + 1, int((bx + bw) * scale / 1024 * FW))
+        gy2 = max(gy1 + 1, int((by + bh) * scale / 1024 * FH))
+        f = feats[:, gy1:gy2, gx1:gx2].mean(dim=(1, 2))
+        f = f / (f.norm() + 1e-6)
+        return float((f * ex_feat).sum())
+
+    # 각 피크 → SAM 마스크 → 박스 → 재검증
+    candidates = []
+    for cx, cy, peak in picked_pts:
+        masks, ious, _ = predictor.predict(
+            point_coords=np.array([[cx, cy]]), point_labels=np.array([1]),
+            multimask_output=False)
+        m = masks[0]
+        ys, xs = np.where(m)
+        if len(xs) < 8:
+            continue
+        bx1, by1, bx2, by2 = float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+        bw, bh = bx2 - bx1, by2 - by1
+        # 크기 필터 (완화): 마스크가 결함 일부만 잡는 케이스 허용
+        area_ratio = (bw * bh) / max(w * h, 1)
+        if not (0.08 <= area_ratio <= 12.0):
+            continue
+        # 재검증: 후보 영역 특징이 예시와 실제로 닮았는지 (피크는 한 점, 이건 영역 전체)
+        score = pooled_sim(bx1, by1, bw, bh)
+        if score < sim_thr:
+            continue
+        candidates.append({
+            "bbox": [bx1, by1, bw, bh],
+            "confidence": round(score, 4),
+        })
+
+    # NMS (IoU 0.5)
+    def iou(a, b):
+        ax1, ay1, aw, ah = a; bx1, by1, bw, bh = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax1 + aw, bx1 + bw), min(ay1 + ah, by1 + bh)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        return inter / (aw * ah + bw * bh - inter + 1e-6)
+
+    candidates.sort(key=lambda d: -d["confidence"])
+    kept = []
+    for c in candidates:
+        if all(iou(c["bbox"], k["bbox"]) < 0.5 for k in kept):
+            kept.append(c)
+    return kept
+
+
+_students: dict[str, object] = {}
+
+
+def detect_student(image: Image.Image, model_row: dict, ontology: list[dict]) -> list[dict]:
+    """파인튜닝된 학생 모델(YOLO) 추론 — 활성 champion이 있으면 이쪽이 기본."""
+    from ultralytics import YOLO
+
+    path = model_row["path"]
+    if path not in _students:
+        _students[path] = YOLO(path)
+    names = model_row["meta"]["names"]
+    thresholds = {c["name"]: float(c.get("threshold", 0.35)) for c in ontology}
+    result = _students[path].predict(image, device=DEVICE, verbose=False)[0]
+    detections = []
+    for box in result.boxes:
+        name = names[int(box.cls)]
+        conf = float(box.conf)
+        if conf < thresholds.get(name, 0.35):
+            continue
+        x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+        detections.append({
+            "class_name": name,
+            "bbox": [round(x1, 1), round(y1, 1), round(x2 - x1, 1), round(y2 - y1, 1)],
+            "confidence": round(conf, 4),
+        })
+    return detections
+
+
+@torch.no_grad()
+def detect(image: Image.Image, ontology: list[dict]) -> list[dict]:
+    """온톨로지 기반 검출: 클래스별 프롬프트·임계값 적용."""
+    proc, dino = get_dino()
+    prompts = {c["name"]: c.get("prompt") or c["name"] for c in ontology}
+    thresholds = {c["name"]: float(c.get("threshold", 0.35)) for c in ontology}
+    text = ". ".join(prompts.values()) + "."
+    min_thr = min(thresholds.values()) if thresholds else 0.35
+
+    inputs = proc(images=image, text=text, return_tensors="pt").to(DEVICE)
+    outputs = dino(**inputs)
+    results = proc.post_process_grounded_object_detection(
+        outputs, threshold=min_thr, text_threshold=min_thr,
+        target_sizes=[image.size[::-1]],
+    )[0]
+
+    detections = []
+    for box, score, label in zip(results["boxes"], results["scores"], results["text_labels"]):
+        label = label.strip()
+        matched = next(
+            (name for name, p in prompts.items() if p in label or name in label), None)
+        if matched is None or score.item() < thresholds[matched]:
+            continue
+        x1, y1, x2, y2 = (float(v) for v in box)
+        detections.append({
+            "class_name": matched,
+            "bbox": [round(x1, 1), round(y1, 1), round(x2 - x1, 1), round(y2 - y1, 1)],
+            "confidence": round(score.item(), 4),
+        })
+    return detections
+
+
+@torch.no_grad()
+def boxes_to_masks(image: Image.Image, boxes_xywh: list[list[float]]) -> list[dict]:
+    """박스 배치 → COCO RLE 마스크 목록."""
+    from pycocotools import mask as mask_utils
+
+    if not boxes_xywh:
+        return []
+    arr = np.array(image.convert("RGB"))
+    predictor = get_sam()
+    predictor.set_image(arr)
+    boxes_xyxy = torch.tensor(
+        [[x, y, x + w, y + h] for x, y, w, h in boxes_xywh],
+        dtype=torch.float32, device=DEVICE)
+    tb = predictor.transform.apply_boxes_torch(boxes_xyxy, arr.shape[:2])
+    masks, _, _ = predictor.predict_torch(
+        point_coords=None, point_labels=None, boxes=tb, multimask_output=False)
+    rles = []
+    for m in masks[:, 0].cpu().numpy():
+        rle = mask_utils.encode(np.asfortranarray(m.astype(np.uint8)))
+        rle["counts"] = rle["counts"].decode("utf-8")
+        rles.append(rle)
+    return rles
