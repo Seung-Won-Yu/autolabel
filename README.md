@@ -92,8 +92,22 @@ server/   FastAPI + SQLite
 cd webapp && npm run dev     # → http://localhost:5173
 ```
 
-`models/sam_vit_l_0b3195.pth` 필요 ([SAM 공식 체크포인트](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth)).
+SAM 인코더만 별도로 받으면 된다 (1.2GB, 용량 때문에 저장소 미포함):
+
+```bash
+curl -L -o models/sam_vit_l_0b3195.pth \
+  https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth
+cp release/sam_decoder_vit_l.onnx webapp/public/sam_decoder.onnx
+```
+
 Grounding DINO · YOLO11n은 첫 사용 시 자동 다운로드.
+
+### [`release/`](release/) — 바로 쓸 수 있는 가중치
+
+| 파일 | 내용 |
+|---|---|
+| `sam_decoder_vit_l.onnx` | SAM 브라우저 디코더 (16MB) — 위 명령으로 복사하면 SAM 클릭 활성화 |
+| `pcb_defect_yolo11n_map50_0.738.pt` | **이 도구로 만든 전용 모델 예시** (5.2MB) — PCB 결함 6종, 승인 42장으로 12분 학습 |
 
 ## 사용 흐름
 

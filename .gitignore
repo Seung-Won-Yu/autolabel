@@ -7,11 +7,15 @@ __pycache__/
 node_modules/
 webapp/dist/
 
-# 모델 가중치 (수백MB~GB — 스크립트로 재다운로드)
+# 파운데이션 모델 가중치 (수백MB~GB — 공식 배포판 재다운로드)
 models/
 *.pt
 *.pth
 *.onnx
+
+# 단, release/ 의 산출물은 커밋한다 (전용 모델 예시 + SAM 디코더)
+!release/*.pt
+!release/*.onnx
 
 # 데이터·DB·학습 산출물
 data/
