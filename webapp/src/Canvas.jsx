@@ -21,6 +21,7 @@ export default function Canvas({
   const [view, setView] = useState({ scale: 1, x: 0, y: 0 })
   const [draft, setDraft] = useState(null) // 그리는 중인 박스
   const [sam, setSam] = useState({ points: [], mask: null, busy: false })
+  const samSeq = useRef(0) // 디코드 요청 순번 — 늦게 온 응답이 새 세션을 덮지 않게
 
   // 화면에 맞추기 — 이미지 전환·창 조절·"맞춤" 버튼이 모두 이걸 쓴다
   const fitView = useRef(() => {})
@@ -110,14 +111,18 @@ export default function Canvas({
   }
 
   const runSam = async (points, committed) => {
+    const seq = ++samSeq.current
     setSam({ points, mask: null, busy: true })
     try {
       const r = await decodeMask(imageId, points)
-      if (!r) return
+      // 뒤이은 클릭이 새 디코드를 시작했으면 이 응답은 낡았다 — 새 세션을
+      // 덮어쓰지 않는다 (역전 도착 시 엉뚱한 위치의 마스크가 화면에 뜬다)
+      if (!r || seq !== samSeq.current) return
       setSam({ points, mask: r.mask, busy: false })
       if (committed.length) setAnns([...anns, ...committed])
       onMsg(`SAM IoU ${r.iou.toFixed(2)} — 클릭=다음 객체 · Shift=정제 · 우클릭=제외 · Enter=확정`)
     } catch (e) {
+      if (seq !== samSeq.current) return
       setSam({ points: [], mask: null, busy: false })
       onMsg(`SAM 오류: ${e.message}`)
     }
@@ -128,6 +133,11 @@ export default function Canvas({
     const pt = { x: p.x, y: p.y, label }
     if (label === 0 && !sam.points.length) return // 제외 포인트는 정제 전용
     if (label === 1 && !e.evt.shiftKey && sam.points.length) {
+      // 이전 객체의 마스크가 아직 계산 중이면 "새 객체" 클릭이 그 객체를
+      // 빈 확정으로 조용히 버린다 — 끝날 때까지 새 시작을 막는다
+      if (sam.busy && !sam.mask) {
+        return onMsg('마스크 계산 중 — 잠시 후 다시 클릭하세요')
+      }
       // 새 객체: 현재 마스크 확정 후 새 포인트로 시작
       const committed = commitSam(sam.points, sam.mask)
       setAnns([...anns, ...committed])

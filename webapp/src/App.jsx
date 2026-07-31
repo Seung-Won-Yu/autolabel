@@ -88,6 +88,12 @@ export default function App() {
     setCurrent(null); setAnns([])
     // 빈 프로젝트는 설정부터 해야 하고, 이미 이미지가 있으면 바로 라벨링이다
     setSetupOpen(imgs.length === 0)
+    // 새로고침·재진입 시 서버에서 아직 도는 배치를 복원한다 — 안 하면 진행
+    // 표시가 사라지고, 재클릭은 409로 무음 실패한다. await 금지: 여기서 열기
+    // 흐름을 늦추면 사용자가 이미 이동한 뒤 아래 setCurrent가 위치를 되감는다
+    api.autolabelStatus(p.id)
+      .then((s) => { if (s?.status === 'running') setJob(s) })
+      .catch(() => {})
     // 첫 이미지 자동 열기 — 빈 캔버스로 시작하지 않게
     if (imgs.length) {
       const first = imgs.find((im) => im.status === 'prelabeled')
@@ -348,9 +354,13 @@ export default function App() {
       const files = [...e.dataTransfer.files].filter((f) => f.type.startsWith('image/'))
       if (!files.length) return
       setMsg(`${files.length}장 업로드 중…`)
-      await api.uploadImages(project.id, files)
+      const r = await api.uploadImages(project.id, files)
       setImages(await api.listImages(project.id))
-      setMsg(`${files.length}장 업로드 완료`)
+      // 요청 개수가 아니라 서버가 실제 저장한 개수로 말한다 — 손상 파일이
+      // 섞이면 서버는 건너뛰고 200을 주므로 응답을 봐야 거짓 보고가 안 된다
+      if (r.failed?.length) {
+        setMsg(`${r.saved.length}/${files.length}장 업로드 — 실패: ${r.failed.join(', ')}`, true)
+      } else setMsg(`${r.saved.length}장 업로드 완료`)
     }
     window.addEventListener('dragover', over)
     window.addEventListener('drop', drop)
@@ -434,10 +444,12 @@ export default function App() {
             project={project} images={images} trainInfo={trainInfo} job={job}
             onAutolabel={async () => {
               if (!project.ontology.length) return setMsg('클래스를 먼저 정의하세요')
-              const j = await api.autolabelBatch(project.id, { masks: false })
-              setJob(j)
-              // 대상 0장이면 폴링이 돌지 않아 안내가 사라진다 — 즉시 알린다
-              if (j.status !== 'running') setMsg(j.advice || '실행할 이미지가 없습니다')
+              try {
+                const j = await api.autolabelBatch(project.id, { masks: false })
+                setJob(j)
+                // 대상 0장이면 폴링이 돌지 않아 안내가 사라진다 — 즉시 알린다
+                if (j.status !== 'running') setMsg(j.advice || '실행할 이미지가 없습니다')
+              } catch (e) { setMsg(`배치 시작 실패: ${e.message}`) }
             }}
           />
           {sampling && (
@@ -465,7 +477,8 @@ export default function App() {
           {setupOpen && (
             <div className="setup-body">
           <OntologyEditor project={project} setProject={setProject} />
-          <UploadBox project={project} onUploaded={async () => setImages(await api.listImages(project.id))} />
+          <UploadBox project={project} onMsg={setMsg}
+            onUploaded={async () => setImages(await api.listImages(project.id))} />
           <LinkImport project={project} setProject={setProject} onMsg={setMsg}
             onDone={async () => setImages(await api.listImages(project.id))} />
           <PromptLab project={project} setProject={setProject} onMsg={setMsg}
@@ -477,9 +490,11 @@ export default function App() {
                 title="전 이미지에 모델이 라벨 초안을 생성합니다 (덮어쓰지 않고 모델 라벨만 갱신)"
                 onClick={async () => {
                   if (!project.ontology.length) return setMsg('클래스를 먼저 정의하세요')
-                  const j = await api.autolabelBatch(project.id, { masks: false })
-                  setJob(j)
-                  if (j.status !== 'running') setMsg(j.advice || '실행할 이미지가 없습니다')
+                  try {
+                    const j = await api.autolabelBatch(project.id, { masks: false })
+                    setJob(j)
+                    if (j.status !== 'running') setMsg(j.advice || '실행할 이미지가 없습니다')
+                  } catch (e) { setMsg(`배치 시작 실패: ${e.message}`) }
                 }}>
                 {job.status === 'running' ? `오토라벨 ${job.done ?? 0}/${job.total}` : '▶ 전체 오토라벨'}
               </button>
@@ -579,8 +594,9 @@ export default function App() {
               if (!ids.length) return
               const r = await api.bulkStatus(ids, status)
               setImages(await api.listImages(project.id))
+              // 백엔드는 started가 아니라 status를 준다 (scheduled=디바운스 예약)
               setMsg(`${r.count}장 ${status === 'approved' ? '승인' : '거부'}`
-                + (r.train?.started ? ' · 전용 모델 학습 시작' : ''))
+                + (['scheduled', 'running'].includes(r.train?.status) ? ' · 전용 모델 학습 예약' : ''))
             }}
           />
         </aside>
@@ -893,6 +909,10 @@ function ProjectPicker({ projects, onOpen, onCreated }) {
 
 function OntologyEditor({ project, setProject }) {
   const [rows, setRows] = useState(project.ontology)
+  // 임계값 적용·프롬프트 실험 등 에디터 밖에서 온톨로지가 바뀌면 로컬
+  // 스냅샷도 따라간다 — 안 하면 다음 키 입력의 save가 이전 스냅샷 전체를
+  // PUT해 그 변경을 조용히 되돌린다
+  useEffect(() => { setRows(project.ontology) }, [project.ontology])
   const save = async (next) => {
     setRows(next)
     await api.saveOntology(project.id, next)
@@ -919,7 +939,7 @@ function OntologyEditor({ project, setProject }) {
   )
 }
 
-function UploadBox({ project, onUploaded }) {
+function UploadBox({ project, onUploaded, onMsg }) {
   const [busy, setBusy] = useState(false)
   return (
     <label className="upload">
@@ -928,9 +948,14 @@ function UploadBox({ project, onUploaded }) {
         onChange={async (e) => {
           if (!e.target.files.length) return
           setBusy(true)
-          await api.uploadImages(project.id, [...e.target.files])
+          const files = [...e.target.files]
+          const r = await api.uploadImages(project.id, files)
           e.target.value = ''
           setBusy(false)
+          // 부분 실패를 조용히 넘기지 않는다 (드래그앤드롭 경로와 같은 규칙)
+          if (r.failed?.length) {
+            onMsg?.(`${r.saved.length}/${files.length}장 업로드 — 실패: ${r.failed.join(', ')}`, true)
+          }
           onUploaded()
         }} />
     </label>

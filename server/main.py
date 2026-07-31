@@ -99,26 +99,35 @@ def get_project(pid: int):
 @app.post("/api/projects/{pid}/images")
 async def upload_images(pid: int, files: list[UploadFile]):
     conn = get_db()
-    saved = []
+    saved, failed = [], []
     pdir = DATA_DIR / str(pid)
     pdir.mkdir(exist_ok=True)
-    for f in files:
-        data = await f.read()
-        try:
-            im = Image.open(io.BytesIO(data))
-            w, h = im.size
-        except Exception:
-            continue
-        cur = conn.execute(
-            "INSERT INTO images (project_id, file_name, width, height) VALUES (?,?,?,?)",
-            (pid, f.filename, w, h))
-        iid = cur.lastrowid
-        # 파일명 충돌 회피 — id 프리픽스 저장
-        (pdir / f"{iid}_{f.filename}").write_bytes(data)
-        saved.append(iid)
-    conn.commit()
-    conn.close()
-    return {"saved": saved}
+    try:
+        for f in files:
+            data = await f.read()
+            # 경로 구분자가 든 파일명은 저장 경로를 의도 밖으로 끌고 간다
+            # (없는 디렉터리로 배치 전체 실패 + 고아 파일) — basename만 쓴다
+            fname = Path(f.filename or "").name or "upload"
+            iid = None
+            try:
+                im = Image.open(io.BytesIO(data))
+                w, h = im.size
+                cur = conn.execute(
+                    "INSERT INTO images (project_id, file_name, width, height) VALUES (?,?,?,?)",
+                    (pid, fname, w, h))
+                iid = cur.lastrowid
+                # 파일명 충돌 회피 — id 프리픽스 저장
+                (pdir / f"{iid}_{fname}").write_bytes(data)
+                saved.append(iid)
+            except Exception:
+                # 조용히 스킵하면 프론트가 전량 성공으로 보고한다 — 목록으로 알린다
+                if iid is not None:
+                    conn.execute("DELETE FROM images WHERE id=?", (iid,))
+                failed.append(fname)
+        conn.commit()
+    finally:
+        conn.close()
+    return {"saved": saved, "failed": failed}
 
 
 @app.get("/api/projects/{pid}/images")
@@ -305,6 +314,9 @@ def autolabel_one(iid: int, body: dict | None = None):
     """단일 이미지 오토라벨 (프리뷰용). 결과는 저장하지 않고 반환만."""
     conn = get_db()
     img = conn.execute("SELECT * FROM images WHERE id=?", (iid,)).fetchone()
+    if not img:
+        conn.close()
+        raise HTTPException(404, "이미지 없음")
     proj = conn.execute("SELECT * FROM projects WHERE id=?", (img["project_id"],)).fetchone()
     conn.close()
     ontology = (body or {}).get("ontology") or json.loads(proj["ontology"])
@@ -393,6 +405,9 @@ def autolabel_batch(pid: int, body: dict):
         raise HTTPException(409, "이미 실행 중인 잡 있음")
     conn = get_db()
     proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    if not proj:
+        conn.close()
+        raise HTTPException(404, "프로젝트 없음")
     ontology = body.get("ontology") or json.loads(proj["ontology"])
     # 기본 대상은 리뷰 전 이미지만. 승인 이미지를 포함하면 사람이 검토한 라벨을
     # 무검토 검출로 교체하면서 status는 approved로 남아, 오염된 라벨이 승인
@@ -726,10 +741,11 @@ def _exportable_images(conn, pid: int, include_rejected: bool):
 
 @app.get("/api/projects/{pid}/export.zip")
 def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
-    import io as _io
+    import os as _os
+    import tempfile
     import zipfile
 
-    from fastapi.responses import StreamingResponse
+    from starlette.background import BackgroundTask
 
     conn = get_db()
     proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
@@ -738,10 +754,14 @@ def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
     cls_id = {n: i for i, n in enumerate(names)}
     images = _exportable_images(conn, pid, include_rejected)
 
-    buf = _io.BytesIO()
+    # zip을 RAM(BytesIO)에 통째로 만들면 메모리가 데이터셋 크기만큼 치솟는다 —
+    # 이미지 항목은 DEFLATE로 거의 안 줄어들어 수만 장이면 수십 GB다 (OOM).
+    # 디스크 임시파일에 쓰고 전송이 끝나면 지운다. 이미지는 이미 압축본이라
+    # STORED로 넣어 CPU도 아낀다.
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
     missing = 0  # 원본이 사라진 이미지 — 헤더로 알린다 (조용한 빈 zip 방지)
     skipped = 0  # 온톨로지에 없는 클래스의 라벨 — 오라벨 대신 제외하고 알린다
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
         if fmt == "yolo":
             z.writestr("data.yaml",
                        f"path: .\ntrain: images\nval: images\nnames: {json.dumps(names)}\n")
@@ -751,7 +771,7 @@ def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
                 if not src.exists():
                     missing += 1
                     continue
-                z.write(src, f"images/{fname}")
+                z.write(src, f"images/{fname}", compress_type=zipfile.ZIP_STORED)
                 lines = []
                 for a in conn.execute(
                         "SELECT * FROM annotations WHERE image_id=?", (im["id"],)):
@@ -776,17 +796,19 @@ def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
             for im in images:
                 src = _row_image_path(im)
                 if src.exists():
-                    z.write(src, f"images/{im['id']}_{im['file_name']}")
+                    z.write(src, f"images/{im['id']}_{im['file_name']}",
+                            compress_type=zipfile.ZIP_STORED)
                 else:
                     missing += 1
     conn.close()
-    buf.seek(0)
-    return StreamingResponse(
-        buf, media_type="application/zip",
+    tmp.close()
+    return FileResponse(
+        tmp.name, media_type="application/zip",
         headers={"Content-Disposition": _attachment(f"{proj['name']}_{fmt}.zip"),
                  "X-Images-Exported": str(len(images) - missing),
                  "X-Images-Missing": str(missing),
-                 "X-Annotations-Skipped": str(skipped)})
+                 "X-Annotations-Skipped": str(skipped)},
+        background=BackgroundTask(_os.unlink, tmp.name))
 
 
 # ---------- 통계적 배치 검수 ----------
@@ -930,6 +952,9 @@ def suggestions(iid: int, min_conf: float = 0.4):
 
     conn = get_db()
     im = conn.execute("SELECT * FROM images WHERE id=?", (iid,)).fetchone()
+    if not im:
+        conn.close()
+        raise HTTPException(404, "이미지 없음")
     proj = conn.execute("SELECT * FROM projects WHERE id=?", (im["project_id"],)).fetchone()
     labels = [row_to_dict(a) for a in conn.execute(
         "SELECT * FROM annotations WHERE image_id=?", (iid,))]

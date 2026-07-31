@@ -450,6 +450,45 @@ def test_export_skips_labels_of_removed_classes(client, make_image, tmp_path):
     assert "skipped_unknown_class" not in meta  # 표준 COCO 키가 아니다
 
 
+def test_upload_reports_failures_and_sanitizes_filenames(client, make_image, tmp_path):
+    """업로드는 실패를 세서 알리고, 경로 구분자 파일명은 basename으로 정규화한다.
+
+    실측 결함(감사): 디코드 실패 파일을 조용히 건너뛰어 프론트가 전량 성공으로
+    보고했고, 파일명에 '/'가 섞이면 없는 디렉터리를 가리켜 배치 전체가 500으로
+    죽고 이미 쓴 파일은 고아로 남았다.
+    """
+    pid = _project(client, "upload-hard")
+    ok = make_image(tmp_path / "uh", "good.jpg")
+    with open(ok, "rb") as f:
+        r = client.post(f"/api/projects/{pid}/images", files=[
+            ("files", ("good.jpg", f, "image/jpeg")),
+            ("files", ("broken.jpg", io.BytesIO(b"not an image"), "image/jpeg")),
+        ]).json()
+    assert len(r["saved"]) == 1
+    assert r["failed"] == ["broken.jpg"]
+
+    with open(ok, "rb") as f:
+        r = client.post(f"/api/projects/{pid}/images", files=[
+            ("files", ("sub/dir/evil.jpg", f, "image/jpeg"))])
+    assert r.status_code == 200
+    r = r.json()
+    assert len(r["saved"]) == 1 and not r["failed"], r
+    rows = client.get(f"/api/projects/{pid}/images").json()
+    assert any(x["file_name"] == "evil.jpg" for x in rows), rows
+    assert client.get(f"/api/images/{r['saved'][0]}/file").status_code == 200
+
+
+def test_missing_ids_return_404_not_500(client):
+    """없는 id는 500이 아니라 404여야 한다.
+
+    실측 결함(감사): fetchone() 결과를 존재 확인 없이 인덱싱해 None['...']
+    TypeError 500 — 다른 탭에서 삭제된 이미지의 낡은 목록으로도 도달한다.
+    """
+    assert client.post("/api/images/999999/autolabel", json={}).status_code == 404
+    assert client.get("/api/images/999999/suggestions").status_code == 404
+    assert client.post("/api/projects/999999/autolabel", json={}).status_code == 404
+
+
 def test_capabilities_reports_model_availability(client):
     cap = client.get("/api/capabilities").json()
     assert set(cap) >= {"sam3", "sam_encoder", "device"}
