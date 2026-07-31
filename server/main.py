@@ -131,17 +131,25 @@ def list_images(pid: int, status: str | None = None):
     return rows
 
 
+def _row_image_path(row) -> Path:
+    """이미지 행 하나의 실제 디스크 경로.
+
+    연결 임포트된 이미지는 복사본이 없고 src_path에 원본 경로만 있다.
+    업로드 경로만 보면 조용히 건너뛰게 되므로(익스포트·학습 사고) 항상 이걸 쓴다.
+    """
+    src = row["src_path"] if "src_path" in row.keys() else None
+    if src:
+        return Path(src)
+    return DATA_DIR / str(row["project_id"]) / f"{row['id']}_{row['file_name']}"
+
+
 def _image_path(iid: int) -> Path:
     conn = get_db()
     row = conn.execute("SELECT * FROM images WHERE id=?", (iid,)).fetchone()
     conn.close()
     if not row:
         raise HTTPException(404)
-    # 연결 임포트된 이미지는 원본 경로 참조 (복사본 없음)
-    src = row["src_path"] if "src_path" in row.keys() else None
-    if src:
-        return Path(src)
-    return DATA_DIR / str(row["project_id"]) / f"{iid}_{row['file_name']}"
+    return _row_image_path(row)
 
 
 @app.get("/api/images/{iid}/file")
@@ -549,14 +557,16 @@ def export_zip(pid: int, fmt: str = "yolo"):
     images = conn.execute("SELECT * FROM images WHERE project_id=?", (pid,)).fetchall()
 
     buf = _io.BytesIO()
+    missing = 0  # 원본이 사라진 이미지 — 헤더로 알린다 (조용한 빈 zip 방지)
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         if fmt == "yolo":
             z.writestr("data.yaml",
                        f"path: .\ntrain: images\nval: images\nnames: {json.dumps(names)}\n")
             for im in images:
                 fname = f"{im['id']}_{im['file_name']}"
-                src = DATA_DIR / str(pid) / fname
+                src = _row_image_path(im)
                 if not src.exists():
+                    missing += 1
                     continue
                 z.write(src, f"images/{fname}")
                 lines = []
@@ -573,17 +583,25 @@ def export_zip(pid: int, fmt: str = "yolo"):
                 z.writestr(f"labels/{Path(fname).stem}.txt", "\n".join(lines))
         else:  # coco
             coco = export(pid, fmt="coco")
+            # 여러 폴더를 한 프로젝트로 임포트하면 동명 파일이 생긴다. zip 안에서
+            # 덮어쓰이지 않게 id를 붙이고, json의 file_name도 같이 맞춘다.
+            for entry in coco.get("images", []):
+                entry["file_name"] = f"{entry['id']}_{entry['file_name']}"
             z.writestr("annotations.json", json.dumps(coco, ensure_ascii=False))
             for im in images:
-                src = DATA_DIR / str(pid) / f"{im['id']}_{im['file_name']}"
+                src = _row_image_path(im)
                 if src.exists():
-                    z.write(src, f"images/{im['file_name']}")
+                    z.write(src, f"images/{im['id']}_{im['file_name']}")
+                else:
+                    missing += 1
     conn.close()
     buf.seek(0)
     return StreamingResponse(
         buf, media_type="application/zip",
         headers={"Content-Disposition":
-                 f"attachment; filename={proj['name']}_{fmt}.zip"})
+                 f"attachment; filename={proj['name']}_{fmt}.zip",
+                 "X-Images-Exported": str(len(images) - missing),
+                 "X-Images-Missing": str(missing)})
 
 
 # ---------- 통계적 배치 검수 ----------

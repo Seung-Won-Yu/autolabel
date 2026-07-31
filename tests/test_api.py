@@ -1,5 +1,7 @@
 """API 종단 회귀 테스트 — 실제로 깨졌던 경로를 재현해 막는다."""
+import io
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -43,6 +45,18 @@ def test_upload_annotate_export_roundtrip(client, make_image, tmp_path):
 
     zip_res = client.get(f"/api/projects/{pid}/export.zip?fmt=yolo")
     assert zip_res.status_code == 200 and zip_res.content[:2] == b"PK"
+    names = zipfile.ZipFile(io.BytesIO(zip_res.content)).namelist()
+    assert "data.yaml" in names
+    assert sum(n.startswith("images/") for n in names) == 1, names
+    assert sum(n.startswith("labels/") for n in names) == 1, names
+
+    # COCO zip은 자체 정합해야 한다 — json의 file_name이 zip 안 실제 경로와 일치
+    cz = zipfile.ZipFile(io.BytesIO(
+        client.get(f"/api/projects/{pid}/export.zip?fmt=coco").content))
+    meta = json.loads(cz.read("annotations.json"))
+    inside = set(cz.namelist())
+    for entry in meta["images"]:
+        assert f"images/{entry['file_name']}" in inside, (entry, inside)
 
 
 def test_linked_import_reads_yolo_labels_without_copying(client, make_image, tmp_path):
@@ -72,6 +86,14 @@ def test_linked_import_reads_yolo_labels_without_copying(client, make_image, tmp
     assert a["bbox"] == [150.0, 50.0, 100.0, 100.0]
     # 원본을 그대로 서빙해야 한다 (복사본 없음)
     assert client.get(f"/api/images/{rows[0]['id']}/file").status_code == 200
+
+    # 익스포트도 src_path를 따라가야 한다 — 업로드 경로만 보면 이미지가 통째로
+    # 빠진 채 data.yaml만 든 zip이 나간다 (실제로 발생했던 사고)
+    z = client.get(f"/api/projects/{pid}/export.zip?fmt=yolo")
+    assert z.headers["x-images-missing"] == "0"
+    names = zipfile.ZipFile(io.BytesIO(z.content)).namelist()
+    assert any(n.startswith("images/") for n in names), names
+    assert any(n.startswith("labels/") for n in names), names
 
 
 def test_auto_approve_respects_threshold(client, make_image, tmp_path):
