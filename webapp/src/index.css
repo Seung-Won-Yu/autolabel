@@ -52,12 +52,37 @@ kbd {
 }
 
 .layout { display: flex; flex: 1; min-height: 0; }
+/* 사이드바는 스스로 스크롤하지 않는다. 설정 영역과 이미지 목록이 각자
+   스크롤하고, 목록이 남은 높이를 전부 가져간다 — 라벨링 중 매번 쓰는 건
+   목록이라 항상 보여야 한다 (예전엔 설정이 다 펼쳐져 목록이 화면 밖이었다). */
 .sidebar {
   width: 320px; padding: 10px; border-right: 1px solid var(--border);
-  overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px;
+  overflow: hidden; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px;
+}
+.setup-toggle {
+  display: flex; align-items: baseline; gap: 8px; width: 100%;
+  text-align: left; background: var(--bg2); border: 1px solid var(--border);
+}
+.setup-toggle small { color: var(--dim); font-size: 11px; }
+.setup-body {
+  display: flex; flex-direction: column; gap: 8px;
+  overflow-y: auto; max-height: 45vh; flex-shrink: 0;
+  padding-right: 4px;
 }
 .main { flex: 1; display: flex; flex-direction: column; padding: 8px; min-width: 0; }
 .workspace { display: flex; flex: 1; min-height: 0; gap: 8px; }
+/* 캔버스가 차지할 실제 영역 — ResizeObserver가 이걸 잰다 */
+.canvas-host { flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+.canvas-wrap { position: relative; width: 100%; height: 100%; }
+/* 배율 표시와 맞춤 — 휠만 있으면 한번 어긋난 뷰를 되돌릴 수가 없다 */
+.zoombar {
+  position: absolute; right: 8px; bottom: 8px; z-index: 5;
+  display: flex; align-items: center; gap: 4px;
+  background: rgba(20, 22, 26, 0.85); border: 1px solid var(--border);
+  border-radius: 8px; padding: 3px 6px; font-size: 12px;
+}
+.zoombar span { min-width: 42px; text-align: center; color: var(--dim); }
+.zoombar button { padding: 1px 7px; font-size: 12px; }
 .toolbar { margin-bottom: 6px; }
 .toolbar .cls { display: inline-flex; align-items: center; gap: 6px; border-color: var(--c); }
 .toolbar .cls i { width: 9px; height: 9px; border-radius: 50%; background: var(--c); }
@@ -103,7 +128,13 @@ kbd {
 .plist li:hover { border-color: var(--accent); }
 
 .imagelist .filters button { padding: 2px 8px; font-size: 12px; }
-.ilist { list-style: none; overflow-y: auto; }
+/* 목록이 사이드바의 남은 높이를 전부 가져간다. 필터는 위에 고정되고
+   썸네일만 스크롤한다 */
+.imagelist {
+  flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 4px;
+}
+.imagelist .filters, .imagelist .hint { flex-shrink: 0; }
+.ilist { list-style: none; overflow-y: auto; flex: 1; min-height: 0; }
 .ilist li {
   display: flex; gap: 8px; align-items: center;
   padding: 5px 6px; border-radius: 8px; cursor: pointer;

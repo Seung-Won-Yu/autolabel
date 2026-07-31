@@ -18,15 +18,49 @@ export default function Canvas({
   const [draft, setDraft] = useState(null) // 그리는 중인 박스
   const [sam, setSam] = useState({ points: [], mask: null, busy: false })
 
-  // 이미지 로드 시 화면에 맞춤 + 상태 무효화 (이미지 전환 레이스 차단)
-  useEffect(() => {
+  // 화면에 맞추기 — 이미지 전환·창 조절·"맞춤" 버튼이 모두 이걸 쓴다
+  const fitView = useRef(() => {})
+  fitView.current = () => {
     if (!img) return
     const s = Math.min(size.w / img.width, size.h / img.height, 1)
     setView({ scale: s, x: (size.w - img.width * s) / 2, y: (size.h - img.height * s) / 2 })
+  }
+
+  // 이미지 로드 시 화면에 맞춤 + 상태 무효화 (이미지 전환 레이스 차단)
+  useEffect(() => {
+    if (!img) return
+    fitView.current()
     setDraft(null)
     setSam({ points: [], mask: null, busy: false })
     setSelectedId(null)
   }, [img]) // eslint-disable-line
+
+  // 캔버스 크기가 바뀌면 다시 맞춘다 (창 조절·패널 접기)
+  useEffect(() => { fitView.current() }, [size.w, size.h])
+
+  /** 캔버스 중앙을 기준으로 배율 변경 — 버튼·단축키용. */
+  const zoomBy = (factor) => {
+    const cx = size.w / 2
+    const cy = size.h / 2
+    const scale = Math.min(Math.max(view.scale * factor, 0.05), 20)
+    setView({
+      scale,
+      x: cx - ((cx - view.x) / view.scale) * scale,
+      y: cy - ((cy - view.y) / view.scale) * scale,
+    })
+  }
+
+  // 줌 단축키 — 라벨링 중 손이 캔버스를 떠나지 않게
+  useEffect(() => {
+    const h = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+      if (e.key === '0') fitView.current()
+      else if (e.key === '+' || e.key === '=') zoomBy(1.25)
+      else if (e.key === '-' || e.key === '_') zoomBy(0.8)
+    }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  })
 
   const toImageCoords = (pos) => ({
     x: (pos.x - view.x) / view.scale,
@@ -154,6 +188,13 @@ export default function Canvas({
   const activeColor = classColor(ontology, activeClass)
 
   return (
+    <div className="canvas-wrap">
+    <div className="zoombar">
+      <button onClick={() => zoomBy(0.8)} title="축소 (−)">−</button>
+      <span title="현재 배율">{Math.round(view.scale * 100)}%</span>
+      <button onClick={() => zoomBy(1.25)} title="확대 (+)">+</button>
+      <button onClick={() => fitView.current()} title="화면에 맞춤 (0)">맞춤</button>
+    </div>
     <Stage
       ref={stageRef} width={size.w} height={size.h}
       scaleX={view.scale} scaleY={view.scale} x={view.x} y={view.y}
@@ -232,6 +273,7 @@ export default function Canvas({
         ))}
       </Layer>
     </Stage>
+    </div>
   )
 }
 

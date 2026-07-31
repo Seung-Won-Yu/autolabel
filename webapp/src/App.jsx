@@ -23,8 +23,15 @@ export default function App() {
   const [qaJob, setQaJob] = useState(null)
   const [suggest, setSuggest] = useState([]) // 현재 이미지의 누락 라벨 제안
   const [sampling, setSampling] = useState(null) // 진행 중인 통계 검수 계획
+  // 설정·도구는 라벨링을 시작하면 접는다 — 매번 쓰는 건 이미지 목록이다
+  const [setupOpen, setSetupOpen] = useState(true)
   const dirty = useRef(false)
   const undoStack = useRef([])
+  // 캔버스 크기는 컨테이너를 실측한다. 예전엔 window.innerWidth에서 상수를 뺀
+  // 값이라 실제 여백과 어긋났고(가로는 남고 세로는 넘침), 창 크기를 바꿔도
+  // 갱신되지 않았다.
+  const canvasHost = useRef(null)
+  const [canvasSize, setCanvasSize] = useState({ w: 900, h: 640 })
 
   // 화면에 보이는 목록(필터·정렬 적용) — 이동(←→)도 이 순서를 따른다
   let visible = filter === 'all' ? images : images.filter((im) => im.status === filter)
@@ -61,6 +68,8 @@ export default function App() {
     const imgs = await api.listImages(p.id)
     setImages(imgs)
     setCurrent(null); setAnns([])
+    // 빈 프로젝트는 설정부터 해야 하고, 이미 이미지가 있으면 바로 라벨링이다
+    setSetupOpen(imgs.length === 0)
     // 첫 이미지 자동 열기 — 빈 캔버스로 시작하지 않게
     if (imgs.length) {
       const first = imgs.find((im) => im.status === 'prelabeled')
@@ -100,6 +109,18 @@ export default function App() {
       || images.find((im) => im.status === 'unlabeled') || images[0]
     openImage(first)
   }, [images, current, openImage])
+
+  // 캔버스 컨테이너 크기 추적 — 창 조절·패널 접기에도 캔버스가 따라간다
+  useEffect(() => {
+    const el = canvasHost.current
+    if (!el) return
+    const ro = new ResizeObserver(([e]) => {
+      const { width, height } = e.contentRect
+      if (width > 0 && height > 0) setCanvasSize({ w: Math.round(width), h: Math.round(height) })
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [current?.id])
 
   // 모든 어노테이션 변경은 이 함수로 — 언두 스택 자동 축적
   const setAnnsDirty = useCallback((next) => {
@@ -265,6 +286,30 @@ export default function App() {
               setJob(await api.autolabelBatch(project.id, { masks: false }))
             }}
           />
+          {sampling && (
+            <SamplingPanel plan={sampling} onClose={() => setSampling(null)}
+              onSubmit={async (defects) => {
+                const r = await api.acceptanceResult(project.id, {
+                  sample_size: sampling.sample_size, defects,
+                  max_defects: sampling.max_defects,
+                  target_error_rate: sampling.target_error_rate,
+                  confidence: sampling.confidence,
+                })
+                setImages(await api.listImages(project.id))
+                setMsg(r.message + (r.approved_images ? ` · ${r.approved_images}장 승인됨` : ''))
+                if (r.accepted) setSampling(null)
+              }} />
+          )}
+
+          {/* 설정·도구는 접힌다. 예전엔 이게 전부 펼쳐진 채 이미지 목록 위에
+              쌓여 있어서 좌측 패널이 10화면 높이가 됐고, 정작 라벨링에 매번
+              쓰는 이미지 목록은 화면 밖에서 시작했다. */}
+          <button className="setup-toggle" onClick={() => setSetupOpen(!setupOpen)}>
+            <span>{setupOpen ? '▾' : '▸'} 설정 · 도구</span>
+            <small>클래스 · 업로드 · 오토라벨 · 익스포트 · 학습</small>
+          </button>
+          {setupOpen && (
+            <div className="setup-body">
           <OntologyEditor project={project} setProject={setProject} />
           <UploadBox project={project} onUploaded={async () => setImages(await api.listImages(project.id))} />
           <LinkImport project={project} setProject={setProject} onMsg={setMsg}
@@ -356,24 +401,12 @@ export default function App() {
                 </button></a>
             </div>
           </div>
-          {sampling && (
-            <SamplingPanel plan={sampling} onClose={() => setSampling(null)}
-              onSubmit={async (defects) => {
-                const r = await api.acceptanceResult(project.id, {
-                  sample_size: sampling.sample_size, defects,
-                  max_defects: sampling.max_defects,
-                  target_error_rate: sampling.target_error_rate,
-                  confidence: sampling.confidence,
-                })
-                setImages(await api.listImages(project.id))
-                setMsg(r.message + (r.approved_images ? ` · ${r.approved_images}장 승인됨` : ''))
-                if (r.accepted) setSampling(null)
-              }} />
-          )}
           <TrainPanel trainInfo={trainInfo} approved={approved} pid={project.id} onMsg={setMsg}
             onTrigger={async () => {
             setTrainInfo({ ...trainInfo, job: await api.triggerTrain(project.id) })
           }} />
+            </div>
+          )}
           <ImageList
             visible={visible} current={current} onOpen={openImage}
             filter={filter} setFilter={setFilter}
@@ -442,6 +475,7 @@ export default function App() {
           </div>
           {current ? (
             <div className="workspace">
+              <div className="canvas-host" ref={canvasHost}>
               <Canvas
                 imageUrl={api.imageUrl(current.id)}
                 imageId={current.id} tool={tool} onMsg={setMsg}
@@ -466,8 +500,9 @@ export default function App() {
                     ...d, _key: `ex-${Date.now()}-${i}`, source: 'model', meta: { engine: 'exemplar' } }))])
                   setMsg(`예시 매칭 ${r.detections.length}개 — 틀린 것만 정리하세요`)
                 }}
-                size={{ w: window.innerWidth - 560, h: window.innerHeight - 120 }}
+                size={canvasSize}
               />
+              </div>
               <AnnPanel
                 anns={anns} ontology={project.ontology}
                 selectedId={selectedId} setSelectedId={setSelectedId}
@@ -589,7 +624,7 @@ function HelpOverlay({ onClose }) {
     ['Del', '선택 박스 삭제'], ['Cmd+Z', '실행 취소'], ['S', '저장'],
     ['SAM: 클릭', '새 객체 (이전 자동 확정)'], ['SAM: Shift+클릭', '현재 객체 정제(포함)'],
     ['SAM: 우클릭', '제외 포인트'], ['SAM: Enter / Esc', '확정 / 취소'],
-    ['휠 / Alt+드래그', '줌 / 팬'],
+    ['휠 / Alt+드래그', '줌 / 팬'], ['+ / − / 0', '확대 / 축소 / 화면에 맞춤'],
   ]
   return (
     <div className="overlay" onClick={onClose}>
@@ -1001,7 +1036,7 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
         <button className={sortMode === 'qa' ? 'active' : ''}
           onClick={() => setSortMode(sortMode === 'qa' ? 'none' : 'qa')} title="모델과 라벨이 싸우는 이미지 먼저 (QA 분석 후)">의심</button>
       </div>
-      <div className="hint">←→ 이동도 이 목록 순서를 따릅니다</div>
+      <div className="hint">{visible.length}장 · ←→ 이동도 이 순서를 따릅니다</div>
       <ul className="ilist">
         {visible.map((im) => (
           <li key={im.id} className={current?.id === im.id ? 'active' : ''} onClick={() => onOpen(im)}>

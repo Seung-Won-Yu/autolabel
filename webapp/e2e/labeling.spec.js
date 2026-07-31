@@ -114,9 +114,56 @@ test('클래스를 지우면 캔버스 도구 힌트가 사라지지 않는다',
   await page.getByText(name).click()
   await expect(page.locator('canvas').first()).toBeVisible()
 
+  // 클래스 편집은 설정·도구 안이다 (라벨링 중엔 접혀 있다)
+  await page.locator('.setup-toggle').click()
   await page.getByRole('button', { name: '×' }).first().click()
   await expect(page.getByText('클래스 (0)')).toBeVisible()
   await expect(page.locator('canvas').first()).toBeVisible()
+})
+
+test('이미지 목록이 스크롤 없이 보이고 캔버스가 컨테이너에 딱 맞는다', async ({ page }) => {
+  // 예전엔 설정 카드가 전부 펼쳐진 채 목록 위에 쌓여 사이드바가 10화면
+  // 높이(scrollHeight 8580 / 화면 855)가 됐고, 목록은 뷰포트 밖에서 시작했다.
+  // 캔버스는 window.innerWidth에서 상수를 뺀 크기라 컨테이너와 어긋났다.
+  const { id, name } = await newProject(page, 'layout', ONE_CLASS)
+  await uploadImage(page, id)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+
+  const m = await page.evaluate(() => {
+    const side = document.querySelector('.sidebar')
+    const list = document.querySelector('.ilist')
+    const host = document.querySelector('.canvas-host')
+    const cv = document.querySelector('canvas')
+    return {
+      sideOverflow: side.scrollHeight - side.clientHeight,
+      listTop: list.getBoundingClientRect().top,
+      vh: window.innerHeight,
+      fits: host.clientWidth === cv.width && host.clientHeight === cv.height,
+    }
+  })
+  expect(m.sideOverflow, '사이드바 자체는 스크롤되지 않아야 한다').toBeLessThanOrEqual(0)
+  expect(m.listTop, '이미지 목록이 화면 안에서 시작해야 한다').toBeLessThan(m.vh)
+  expect(m.fits, '캔버스가 컨테이너 크기와 일치해야 한다').toBe(true)
+})
+
+test('줌 컨트롤로 확대하고 맞춤으로 되돌린다', async ({ page }) => {
+  // 휠만 있으면 한번 어긋난 뷰를 되돌릴 방법이 없었다
+  const { id, name } = await newProject(page, 'zoom', ONE_CLASS)
+  await uploadImage(page, id)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('.zoombar')).toBeVisible()
+
+  const pct = () => page.locator('.zoombar span').innerText()
+  const fitted = await pct()
+  await page.locator('.zoombar button', { hasText: '+' }).click()
+  await expect.poll(pct).not.toBe(fitted)
+  await page.locator('.zoombar button', { hasText: '맞춤' }).click()
+  await expect.poll(pct).toBe(fitted)
 })
 
 test('한글 프로젝트명으로도 익스포트가 된다', async ({ page }) => {
