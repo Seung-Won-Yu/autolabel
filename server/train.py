@@ -60,6 +60,9 @@ def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
         anns = [row_to_dict(a) for a in conn.execute(
             "SELECT * FROM annotations WHERE image_id=?", (im["id"],))]
         rows.append((dict(im), anns))
+    if not rows:
+        conn.close()
+        return 0, names
 
     # 고정 골드 val: 최초 학습 시점에 승인 이미지의 20%를 영구 마킹.
     # 이후 재학습은 항상 같은 val로 평가 — 게이트 비교 기준이 라운드 간 흔들리지 않게.
@@ -82,7 +85,11 @@ def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
         (out / "images" / split).mkdir(parents=True, exist_ok=True)
         (out / "labels" / split).mkdir(parents=True, exist_ok=True)
         for im, anns in items:
-            src = ROOT / "data" / "uploads" / str(pid) / f"{im['id']}_{im['file_name']}"
+            # 연결 임포트 이미지는 원본 경로, 업로드 이미지는 복사본 경로
+            src = Path(im["src_path"]) if im.get("src_path") else (
+                ROOT / "data" / "uploads" / str(pid) / f"{im['id']}_{im['file_name']}")
+            if not src.exists():
+                continue  # 원본이 사라진 연결 이미지는 건너뜀
             dst = out / "images" / split / f"{im['id']}_{im['file_name']}"
             shutil.copy(src, dst)
             lines = []
