@@ -38,6 +38,35 @@ def _status_path(pid: int) -> Path:
     return RUNS / f"train_status_{pid}.json"
 
 
+def plan_splits(assigned: dict) -> dict:
+    """이미지별 train/val/test 배정. 입력 {id: 기존 split 또는 None} → {id: split}.
+
+    val·test 하한(MIN_VAL·MIN_TEST)은 예산 안에서만 채운다 — train에 항상
+    절반 이상을 남긴다. 실측 사고: 승인 8장에서 need_val=30이 pool을 전부
+    val로 소진해 train 0장으로 학습이 실패했고, 배정은 DB에 고착이라 승인을
+    아무리 늘려도 초기 이미지들이 학습에서 영영 배제됐다.
+    """
+    n = len(assigned)
+    if n and all(s in ("val", "test") for s in assigned.values()):
+        # 위 사고를 이미 겪은 DB — 전량이 val/test에 고착돼 train이 영원히
+        # 0장이다. 이 경우만 배정을 처음부터 다시 한다 (라운드 간 비교 기준
+        # 유지보다 학습이 되는 것이 먼저다).
+        assigned = dict.fromkeys(assigned)
+    val_ids = {i for i, s in assigned.items() if s == "val"}
+    test_ids = {i for i, s in assigned.items() if s == "test"}
+    pool = [i for i, s in assigned.items() if s is None]
+    random.Random(42).shuffle(pool)
+
+    budget = max(0, (n - max(1, n // 2)) - len(val_ids) - len(test_ids))
+    for ids, need in ((val_ids, max(MIN_VAL, int(n * VAL_RATIO))),
+                      (test_ids, max(MIN_TEST, int(n * TEST_RATIO)))):
+        while len(ids) < need and pool and budget > 0:
+            ids.add(pool.pop())
+            budget -= 1
+    return {i: ("val" if i in val_ids else "test" if i in test_ids else "train")
+            for i in assigned}
+
+
 def _alive(os_pid) -> bool:
     """OS 프로세스 생존 확인 — 서버 재시작 후엔 Popen 핸들이 없다."""
     if not os_pid:
@@ -95,26 +124,16 @@ def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
     # 모델을 0.57로 오판해 승격을 막은 사고에서 나온 규칙.
     assigned = {r[0]["id"]: (r[0]["split"] or ("val" if r[0]["is_val"] else None))
                 for r in rows}
-    val_ids = {i for i, s in assigned.items() if s == "val"}
-    test_ids = {i for i, s in assigned.items() if s == "test"}
-    need_val = max(MIN_VAL, int(len(rows) * VAL_RATIO))
-    need_test = max(MIN_TEST, int(len(rows) * TEST_RATIO))
-    pool = [i for i, s in assigned.items() if s is None]
-    random.Random(42).shuffle(pool)
-
-    updates = []
-    for target, ids, need in (("val", val_ids, need_val), ("test", test_ids, need_test)):
-        while len(ids) < need and pool:
-            i = pool.pop()
-            ids.add(i)
-            updates.append((target, i))
-    # 기존 is_val 기반 멤버도 split 컬럼에 반영 (표시·조회 일관성)
-    updates += [("val", i) for i in val_ids] + [("test", i) for i in test_ids]
-    updates += [("train", i) for i in pool]
-    if updates:
-        conn.executemany("UPDATE images SET split=? WHERE id=?", updates)
-        conn.execute("UPDATE images SET is_val=1 WHERE split='val' AND project_id=?", (pid,))
-        conn.commit()
+    plan = plan_splits(assigned)
+    val_ids = {i for i, s in plan.items() if s == "val"}
+    test_ids = {i for i, s in plan.items() if s == "test"}
+    conn.executemany("UPDATE images SET split=? WHERE id=?",
+                     [(s, i) for i, s in plan.items()])
+    conn.execute("UPDATE images SET is_val=1 WHERE split='val' AND project_id=?", (pid,))
+    # 복구 재배정으로 val에서 빠진 이미지의 is_val도 정리 — 남겨두면 QA
+    # 캘리브레이션이 train 이미지를 골드 val로 오인한다 (라벨 누출)
+    conn.execute("UPDATE images SET is_val=0 WHERE split!='val' AND project_id=?", (pid,))
+    conn.commit()
     conn.close()
 
     splits = {

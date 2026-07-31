@@ -66,6 +66,11 @@ def write_status(pid: int, **kw):
     RUNS.mkdir(parents=True, exist_ok=True)
     path = RUNS / f"train_status_{pid}.json"
     cur = json.loads(path.read_text()) if path.exists() else {}
+    # pid_os는 생사 판정 키다. None으로 병합하면 런처가 남긴 pid가 지워져
+    # 서버 재시작 후 살아있는 학습을 failed로 오보하고, 재시도가 워커 2개를
+    # 겹치게 한다 (실측). None은 버리고 기존 값을 지킨다.
+    if kw.get("pid_os") is None:
+        kw.pop("pid_os", None)
     cur.update(kw)
     path.write_text(json.dumps(cur, ensure_ascii=False))
 
@@ -74,12 +79,14 @@ def main(pid: int):
     from server.db import get_db
     from server.train import _export_yolo_dataset
 
-    write_status(pid, status="running", phase="export", pid_os=None)
+    write_status(pid, status="running", phase="export")
     try:
         run_dir = RUNS / f"p{pid}_{int(time.time())}"
         n_images, names = _export_yolo_dataset(pid, run_dir / "dataset")
-        if n_images < 4:
-            write_status(pid, status="failed", error=f"승인 이미지 부족 ({n_images}장)")
+        n_train = len(list((run_dir / "dataset" / "images" / "train").glob("*")))
+        if n_images < 4 or n_train == 0:
+            write_status(pid, status="failed",
+                         error=f"학습 데이터 부족 (train {n_train}장 / 전체 {n_images}장)")
             return
         write_status(pid, phase="training", images=n_images)
 

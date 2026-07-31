@@ -112,7 +112,10 @@ def _run_import(pid: int, images_dir: str, labels_dir: str | None,
                 continue
             candidates.append((key, src, rows))
         if not labels:  # 라벨 없이 이미지만
-            candidates = [(p.name, p, []) for p in by_name.values() if p.is_file()]
+            # by_name은 파일명과 stem 두 키가 같은 파일을 가리킨다 (라벨 매칭용).
+            # 그대로 values()를 돌면 모든 이미지가 두 번 임포트된다 (실측).
+            uniq = dict.fromkeys(by_name.values())
+            candidates = [(p.name, p, []) for p in uniq if p.is_file()]
 
         random.Random(seed).shuffle(candidates)
         if limit:

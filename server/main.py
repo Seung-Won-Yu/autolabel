@@ -394,10 +394,18 @@ def autolabel_batch(pid: int, body: dict):
     conn = get_db()
     proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
     ontology = body.get("ontology") or json.loads(proj["ontology"])
+    # 기본 대상은 리뷰 전 이미지만. 승인 이미지를 포함하면 사람이 검토한 라벨을
+    # 무검토 검출로 교체하면서 status는 approved로 남아, 오염된 라벨이 승인
+    # 데이터로 둔갑해 학습셋에 들어간다. 재실행이 필요하면 image_ids로 명시.
     ids = body.get("image_ids") or [
         r["id"] for r in conn.execute(
-            "SELECT id FROM images WHERE project_id=?", (pid,))]
+            "SELECT id FROM images WHERE project_id=? "
+            "AND status IN ('unlabeled','prelabeled')", (pid,))]
     conn.close()
+    if not ids:
+        return {"status": "completed", "done": 0, "total": 0,
+                "advice": "라벨할 이미지가 없습니다 — 리뷰 전(unlabeled/prelabeled) "
+                          "이미지가 없습니다. 승인·거부된 라벨은 덮어쓰지 않습니다."}
     _jobs[pid] = {"status": "running", "done": 0, "total": len(ids)}
     jobs.start("autolabel", pid, done=0, total=len(ids))
     threading.Thread(
@@ -656,13 +664,21 @@ def bulk_status(body: dict):
 
 @app.delete("/api/images/{iid}")
 def delete_image(iid: int):
-    path = _image_path(iid)
     conn = get_db()
+    row = conn.execute("SELECT * FROM images WHERE id=?", (iid,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404)
+    linked = bool(row["src_path"]) if "src_path" in row.keys() else False
     conn.execute("DELETE FROM annotations WHERE image_id=?", (iid,))
     conn.execute("DELETE FROM images WHERE id=?", (iid,))
     conn.commit()
     conn.close()
-    path.unlink(missing_ok=True)
+    # 연결 임포트 이미지의 실제 파일은 사용자의 원본 데이터셋이다 — 프로젝트에서만
+    # 빼고 디스크는 절대 건드리지 않는다. 지우는 건 우리가 만든 업로드 복사본뿐.
+    if not linked:
+        (DATA_DIR / str(row["project_id"]) / f"{row['id']}_{row['file_name']}").unlink(
+            missing_ok=True)
     return {"ok": True}
 
 
@@ -724,6 +740,7 @@ def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
 
     buf = _io.BytesIO()
     missing = 0  # 원본이 사라진 이미지 — 헤더로 알린다 (조용한 빈 zip 방지)
+    skipped = 0  # 온톨로지에 없는 클래스의 라벨 — 오라벨 대신 제외하고 알린다
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         if fmt == "yolo":
             z.writestr("data.yaml",
@@ -740,6 +757,7 @@ def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
                         "SELECT * FROM annotations WHERE image_id=?", (im["id"],)):
                     d = row_to_dict(a)
                     if d["class_name"] not in cls_id:
+                        skipped += 1
                         continue
                     x, y, w, h = d["bbox"]
                     lines.append(
@@ -749,6 +767,7 @@ def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
                 z.writestr(f"labels/{Path(fname).stem}.txt", "\n".join(lines))
         else:  # coco
             coco = export(pid, fmt="coco", include_rejected=include_rejected)
+            skipped = coco.pop("skipped_unknown_class", 0)  # 표준 COCO 키가 아니라 뺀다
             # 여러 폴더를 한 프로젝트로 임포트하면 동명 파일이 생긴다. zip 안에서
             # 덮어쓰이지 않게 id를 붙이고, json의 file_name도 같이 맞춘다.
             for entry in coco.get("images", []):
@@ -766,7 +785,8 @@ def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
         buf, media_type="application/zip",
         headers={"Content-Disposition": _attachment(f"{proj['name']}_{fmt}.zip"),
                  "X-Images-Exported": str(len(images) - missing),
-                 "X-Images-Missing": str(missing)})
+                 "X-Images-Missing": str(missing),
+                 "X-Annotations-Skipped": str(skipped)})
 
 
 # ---------- 통계적 배치 검수 ----------
@@ -1040,10 +1060,14 @@ def export(pid: int, fmt: str = "coco", include_rejected: bool = False):
     cat_id = {c["name"]: i + 1 for i, c in enumerate(ontology)}
     images = _exportable_images(conn, pid, include_rejected)
 
+    # 온톨로지에 없는 클래스(이름 변경·삭제 뒤 남은 옛 라벨)는 건너뛴다.
+    # 예전엔 yolo가 class 0으로, coco가 category_id 0으로 조용히 오라벨해
+    # 이 파일로 학습한 외부 모델이 엉뚱한 클래스를 배웠다.
     if fmt == "coco":
         out = {
             "images": [], "annotations": [],
             "categories": [{"id": i + 1, "name": c["name"]} for i, c in enumerate(ontology)],
+            "skipped_unknown_class": 0,
         }
         aid = 0
         for im in images:
@@ -1053,10 +1077,13 @@ def export(pid: int, fmt: str = "coco", include_rejected: bool = False):
             for a in conn.execute(
                     "SELECT * FROM annotations WHERE image_id=?", (im["id"],)):
                 d = row_to_dict(a)
+                if d["class_name"] not in cat_id:
+                    out["skipped_unknown_class"] += 1
+                    continue
                 aid += 1
                 out["annotations"].append({
                     "id": aid, "image_id": im["id"],
-                    "category_id": cat_id.get(d["class_name"], 0),
+                    "category_id": cat_id[d["class_name"]],
                     "bbox": d["bbox"], "area": d["bbox"][2] * d["bbox"][3],
                     "segmentation": d.get("segmentation"), "iscrowd": 0,
                     "score": d.get("confidence"), "source": d["source"]})
@@ -1070,10 +1097,12 @@ def export(pid: int, fmt: str = "coco", include_rejected: bool = False):
             for a in conn.execute(
                     "SELECT * FROM annotations WHERE image_id=?", (im["id"],)):
                 d = row_to_dict(a)
+                if d["class_name"] not in cat_id:
+                    continue
                 x, y, w, h = d["bbox"]
-                cid = cat_id.get(d["class_name"], 1) - 1
                 lines.append(
-                    f"{cid} {(x + w / 2) / im['width']:.6f} {(y + h / 2) / im['height']:.6f} "
+                    f"{cat_id[d['class_name']] - 1} "
+                    f"{(x + w / 2) / im['width']:.6f} {(y + h / 2) / im['height']:.6f} "
                     f"{w / im['width']:.6f} {h / im['height']:.6f}")
             files[Path(im["file_name"]).stem + ".txt"] = "\n".join(lines)
         conn.close()

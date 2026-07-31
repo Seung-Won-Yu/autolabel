@@ -101,7 +101,10 @@ export default function App() {
 
   const saveAnns = useCallback(async (imageId, list) => {
     await api.saveAnnotations(imageId, list.map(({ _key, id, ...a }) => a))
-    dirty.current = false
+    // 저장 비행 중 새 편집이 있었으면(annsRef가 이미 다른 참조) dirty를 지우지
+    // 않는다 — 지우면 그 편집의 자동저장 타이머와 이탈 경고가 전부 조용히
+    // 건너뛰어, "저장됨" 토스트를 보고 닫은 탭에서 마지막 편집이 사라진다
+    if (annsRef.current === list) dirty.current = false
     setMsg('저장됨')
   }, [setMsg])
 
@@ -330,7 +333,7 @@ export default function App() {
         clearInterval(t)
         setImages(await api.listImages(project.id))
         if (s.result) { setLastQa(s.result); setMsg(qaSummary(s.result), true) }
-        else setMsg(`심판 실패: ${s.error}`)
+        else setMsg(`심판 실패: ${s.error || '진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요'}`, true)
       }
     }, 2000)
     return () => clearInterval(t)
@@ -363,10 +366,17 @@ export default function App() {
       if (s.status !== 'running') {
         clearInterval(t)
         setImages(await api.listImages(project.id))
-        if (current) {
-          const list = await api.getAnnotations(current.id)
-          setAnns(list.map((a) => ({ ...a, _key: `db-${a.id}` })))
-          dirty.current = false
+        // 배치가 도는 동안 사용자는 이미지를 옮겨 다닌다 — state의 current는
+        // 폴링 시작 시점 클로저라 낡았다. 완료 시점의 현재 이미지(ref)를 쓰고,
+        // 편집 중(dirty)이면 서버 갱신으로 미저장 편집을 덮지 않는다.
+        const cur = currentRef.current
+        if (cur && !dirty.current) {
+          const list = await api.getAnnotations(cur.id)
+          if (currentRef.current?.id === cur.id && !dirty.current) {
+            const mapped = list.map((a) => ({ ...a, _key: `db-${a.id}` }))
+            annsRef.current = mapped
+            setAnns(mapped)
+          }
         }
         // 완료가 아닌 종료를 완료로 말하지 않는다. 예전엔 서버 재시작으로
         // 잡 기록이 사라지면 "완료: undefined/undefined장"을 띄웠다 — 절반만
@@ -424,7 +434,10 @@ export default function App() {
             project={project} images={images} trainInfo={trainInfo} job={job}
             onAutolabel={async () => {
               if (!project.ontology.length) return setMsg('클래스를 먼저 정의하세요')
-              setJob(await api.autolabelBatch(project.id, { masks: false }))
+              const j = await api.autolabelBatch(project.id, { masks: false })
+              setJob(j)
+              // 대상 0장이면 폴링이 돌지 않아 안내가 사라진다 — 즉시 알린다
+              if (j.status !== 'running') setMsg(j.advice || '실행할 이미지가 없습니다')
             }}
           />
           {sampling && (
@@ -464,7 +477,9 @@ export default function App() {
                 title="전 이미지에 모델이 라벨 초안을 생성합니다 (덮어쓰지 않고 모델 라벨만 갱신)"
                 onClick={async () => {
                   if (!project.ontology.length) return setMsg('클래스를 먼저 정의하세요')
-                  setJob(await api.autolabelBatch(project.id, { masks: false }))
+                  const j = await api.autolabelBatch(project.id, { masks: false })
+                  setJob(j)
+                  if (j.status !== 'running') setMsg(j.advice || '실행할 이미지가 없습니다')
                 }}>
                 {job.status === 'running' ? `오토라벨 ${job.done ?? 0}/${job.total}` : '▶ 전체 오토라벨'}
               </button>
@@ -594,9 +609,17 @@ export default function App() {
             </div>
             <button onClick={async () => {
               if (!current) return
+              // 추론은 수 초 걸리고 그 사이 →로 이미지를 넘기는 게 리뷰의 기본
+              // 동선이다. 응답이 늦게 오면 클릭 시점 이미지가 아닌 지금 이미지에
+              // 검출이 합쳐져 자동저장이 엉뚱한 라벨을 서버에 덮어쓴다 — 요청
+              // 이미지가 그대로일 때만 반영한다.
+              const iid = current.id
               setMsg('오토라벨 중…')
-              const r = await api.autolabelOne(current.id, project.ontology)
-              setAnnsDirty([...anns, ...r.detections.map((d, i) => ({
+              const r = await api.autolabelOne(iid, project.ontology)
+              if (currentRef.current?.id !== iid) {
+                return setMsg('이미지를 이동해 오토라벨 결과를 버렸습니다 — 그 이미지에서 다시 실행하세요', true)
+              }
+              setAnnsDirty([...annsRef.current, ...r.detections.map((d, i) => ({
                 ...d, _key: `auto-${Date.now()}-${i}`, source: 'model' }))])
               setMsg(`오토라벨 ${r.detections.length}개 (${r.engine.split('(')[0]})`)
             }}>이 이미지 오토라벨</button>
@@ -604,8 +627,12 @@ export default function App() {
               <button title="전용 모델이 찾았는데 라벨에 없는 박스를 점선으로 보여줍니다 (누락 라벨 찾기)"
                 onClick={async () => {
                   if (!current) return
+                  const iid = current.id
                   setMsg('모델 제안 확인 중…')
-                  const r = await api.suggestions(current.id)
+                  const r = await api.suggestions(iid)
+                  // 응답 대기 중 이미지를 옮겼으면 버린다 — 다른 이미지 위에
+                  // 엉뚱한 점선 제안이 뜬다
+                  if (currentRef.current?.id !== iid) return
                   setSuggest(r.missing_labels)
                   setMsg(r.missing_labels.length
                     ? `누락 의심 ${r.missing_labels.length}개 — 점선 박스 클릭하면 라벨로 추가됩니다`
@@ -642,9 +669,14 @@ export default function App() {
                   setMsg('제안 수락 — 라벨로 추가됨')
                 }}
                 onExemplar={async (bbox) => {
+                  const iid = current.id
                   setMsg('예시로 유사 객체 검색 중…')
-                  const r = await api.exemplar(current.id, bbox, activeClass)
-                  setAnnsDirty([...anns, ...r.detections.map((d, i) => ({
+                  const r = await api.exemplar(iid, bbox, activeClass)
+                  // 단건 오토라벨과 같은 레이스 — 요청 이미지가 그대로일 때만 반영
+                  if (currentRef.current?.id !== iid) {
+                    return setMsg('이미지를 이동해 예시 매칭 결과를 버렸습니다 — 그 이미지에서 다시 실행하세요', true)
+                  }
+                  setAnnsDirty([...annsRef.current, ...r.detections.map((d, i) => ({
                     ...d, _key: `ex-${Date.now()}-${i}`, source: 'model', meta: { engine: 'exemplar' } }))])
                   setMsg(`예시 매칭 ${r.detections.length}개 — 틀린 것만 정리하세요`)
                 }}
@@ -1011,7 +1043,14 @@ function LinkImport({ project, setProject, onMsg, onDone }) {
       if (s.status !== 'running') {
         clearInterval(t)
         onDone()
-        onMsg(s.status === 'failed' ? `임포트 실패: ${s.error}` : `임포트 완료: ${s.done}장 연결됨`)
+        // 완료가 아닌 종료를 완료로 말하지 않는다 (배치 폴링과 동일한 규칙).
+        // 서버가 재시작하면 sweep이 interrupted로 남긴다 — 5만 장 중 400장만
+        // 연결된 걸 "임포트 완료: 400장"으로 알리면 안 된다.
+        const text = s.status === 'failed' ? `임포트 실패: ${s.error}`
+          : s.status === 'interrupted' ? `임포트가 중단됐습니다 (${s.done ?? 0}장 연결) — ${s.error || '다시 실행하세요'}`
+            : s.status === 'idle' ? '임포트 진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요'
+              : `임포트 완료: ${s.done}장 연결됨`
+        onMsg(text, s.status !== 'completed')
       }
     }, 1000)
     return () => clearInterval(t)

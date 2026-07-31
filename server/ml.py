@@ -19,6 +19,12 @@ DINO_MODEL = "IDEA-Research/grounding-dino-base"
 from server.tiling import drop_frame_filling  # noqa: E402
 
 _lock = threading.Lock()
+# SAM predictor는 전역 하나를 여러 스레드가 쓴다 (배치 스레드 + FastAPI 스레드풀).
+# set_image→predict 구간이 원자적이지 않으면 A의 박스가 B의 특징맵으로 디코딩돼
+# 엉뚱한 마스크가 저장되고, 잘못된 임베딩이 해시 키로 캐시에 눌러앉는다.
+# torch 연산이 GIL을 놓기 때문에 진짜로 인터리빙된다. 디바이스가 하나뿐이라
+# 직렬화해도 처리량 손해는 사실상 없다.
+_infer_lock = threading.Lock()
 _sam_predictor = None
 _dino = None
 _embed_cache: dict[str, dict] = {}
@@ -75,10 +81,11 @@ def embed_image(data: bytes) -> dict:
     image = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
     predictor = get_sam()
     t0 = time.perf_counter()
-    predictor.set_image(image)
-    _current_key = key
+    with _infer_lock:
+        predictor.set_image(image)
+        _current_key = key
+        emb = predictor.get_image_embedding().cpu().numpy().astype(np.float32)
     encode_ms = round((time.perf_counter() - t0) * 1000)
-    emb = predictor.get_image_embedding().cpu().numpy().astype(np.float32)
     result = {
         "key": key,
         "embedding": base64.b64encode(emb.tobytes()).decode(),
@@ -98,12 +105,12 @@ def exemplar_rerank(image_np: np.ndarray, bbox: list[float],
     전용 모델이 이미 후보를 뽑아준 상황이면, 그 후보 중 예시와 닮은 것만
     남기는 편이 훨씬 정확하다 — "이런 것만 골라줘" 필터로 동작.
     """
-    predictor = get_sam()
-    predictor.set_image(image_np)
     global _current_key
-    _current_key = None
-
-    feats = predictor.features[0]
+    predictor = get_sam()
+    with _infer_lock:
+        predictor.set_image(image_np)
+        _current_key = None
+        feats = predictor.features[0]  # 텐서를 잡아두면 잠금 밖에서도 안전
     C, FH, FW = feats.shape
     H, W = image_np.shape[:2]
     scale = 1024 / max(H, W)
@@ -132,84 +139,88 @@ def exemplar_detect(image_np: np.ndarray, bbox: list[float],
     """시각 예시 검출 (PerSAM 패턴, 학습 프리):
     예시 박스의 SAM 특징 평균 → 특징맵 코사인 유사도 → 피크 → 포인트 프롬프트 → 마스크 → NMS.
     """
-    predictor = get_sam()
-    predictor.set_image(image_np)
     global _current_key
-    _current_key = None  # 임베딩 캐시와 별개 경로 — 상태 오염 방지
+    predictor = get_sam()
+    # 피크→마스크 predict 루프까지 predictor의 set_image 상태에 의존한다 —
+    # 전 구간을 잠금 안에서 돌린다 (다른 스레드가 중간에 이미지를 갈아끼우면
+    # 예시와 무관한 이미지에서 마스크가 나온다)
+    with _infer_lock:
+        predictor.set_image(image_np)
+        _current_key = None  # 임베딩 캐시와 별개 경로 — 상태 오염 방지
 
-    feats = predictor.features[0]  # [256, 64, 64]
-    C, FH, FW = feats.shape
-    H, W = image_np.shape[:2]
-    x, y, w, h = bbox
-    # 박스를 특징맵 격자로 사영 (SAM은 긴 변 1024 + 패딩 — 특징맵은 패딩 포함 정사각)
-    scale = 1024 / max(H, W)
-    fx1 = int(x * scale / 1024 * FW); fy1 = int(y * scale / 1024 * FH)
-    fx2 = max(fx1 + 1, int((x + w) * scale / 1024 * FW))
-    fy2 = max(fy1 + 1, int((y + h) * scale / 1024 * FH))
-    ex_feat = feats[:, fy1:fy2, fx1:fx2].mean(dim=(1, 2))  # [256]
+        feats = predictor.features[0]  # [256, 64, 64]
+        C, FH, FW = feats.shape
+        H, W = image_np.shape[:2]
+        x, y, w, h = bbox
+        # 박스를 특징맵 격자로 사영 (SAM은 긴 변 1024 + 패딩 — 특징맵은 패딩 포함 정사각)
+        scale = 1024 / max(H, W)
+        fx1 = int(x * scale / 1024 * FW); fy1 = int(y * scale / 1024 * FH)
+        fx2 = max(fx1 + 1, int((x + w) * scale / 1024 * FW))
+        fy2 = max(fy1 + 1, int((y + h) * scale / 1024 * FH))
+        ex_feat = feats[:, fy1:fy2, fx1:fx2].mean(dim=(1, 2))  # [256]
 
-    fmap = feats / (feats.norm(dim=0, keepdim=True) + 1e-6)
-    ex_feat = ex_feat / (ex_feat.norm() + 1e-6)
-    sim = torch.einsum("c,chw->hw", ex_feat, fmap)  # [64, 64] 코사인 유사도
+        fmap = feats / (feats.norm(dim=0, keepdim=True) + 1e-6)
+        ex_feat = ex_feat / (ex_feat.norm() + 1e-6)
+        sim = torch.einsum("c,chw->hw", ex_feat, fmap)  # [64, 64] 코사인 유사도
 
-    # 유효 영역(패딩 제외)만
-    vh = max(1, round(H * scale / 1024 * FH))
-    vw = max(1, round(W * scale / 1024 * FW))
-    sim_valid = sim[:vh, :vw].clone()
+        # 유효 영역(패딩 제외)만
+        vh = max(1, round(H * scale / 1024 * FH))
+        vw = max(1, round(W * scale / 1024 * FW))
+        sim_valid = sim[:vh, :vw].clone()
 
-    # 적응 임계값: 텍스처 빈약 도메인(PCB 등)은 유사도가 전체적으로 높게 번짐 —
-    # 절대값과 분포 기반(mean+2σ) 중 높은 쪽 사용
-    adaptive = (sim_valid.mean() + 2 * sim_valid.std()).item()
-    thr = max(sim_thr, adaptive)
+        # 적응 임계값: 텍스처 빈약 도메인(PCB 등)은 유사도가 전체적으로 높게 번짐 —
+        # 절대값과 분포 기반(mean+2σ) 중 높은 쪽 사용
+        adaptive = (sim_valid.mean() + 2 * sim_valid.std()).item()
+        thr = max(sim_thr, adaptive)
 
-    # 로컬 피크 상위 K개 → 이미지 좌표 포인트
-    flat = sim_valid.flatten()
-    order = torch.argsort(flat, descending=True)
-    picked_pts = []
-    taken = torch.zeros_like(sim_valid, dtype=torch.bool)
-    for idx in order[: topk * 8]:
-        v = flat[idx].item()
-        if v < thr or len(picked_pts) >= topk:
-            break
-        py, px = divmod(idx.item(), sim_valid.shape[1])
-        if taken[max(0, py - 2):py + 3, max(0, px - 2):px + 3].any():
-            continue  # 근접 피크 억제
-        taken[py, px] = True
-        picked_pts.append(((px + 0.5) / FW * 1024 / scale, (py + 0.5) / FH * 1024 / scale, v))
+        # 로컬 피크 상위 K개 → 이미지 좌표 포인트
+        flat = sim_valid.flatten()
+        order = torch.argsort(flat, descending=True)
+        picked_pts = []
+        taken = torch.zeros_like(sim_valid, dtype=torch.bool)
+        for idx in order[: topk * 8]:
+            v = flat[idx].item()
+            if v < thr or len(picked_pts) >= topk:
+                break
+            py, px = divmod(idx.item(), sim_valid.shape[1])
+            if taken[max(0, py - 2):py + 3, max(0, px - 2):px + 3].any():
+                continue  # 근접 피크 억제
+            taken[py, px] = True
+            picked_pts.append(((px + 0.5) / FW * 1024 / scale, (py + 0.5) / FH * 1024 / scale, v))
 
-    def pooled_sim(bx, by, bw, bh) -> float:
-        """후보 박스 영역 특징 풀링 → 예시와 코사인 (재검증 점수)."""
-        gx1 = int(bx * scale / 1024 * FW); gy1 = int(by * scale / 1024 * FH)
-        gx2 = max(gx1 + 1, int((bx + bw) * scale / 1024 * FW))
-        gy2 = max(gy1 + 1, int((by + bh) * scale / 1024 * FH))
-        f = feats[:, gy1:gy2, gx1:gx2].mean(dim=(1, 2))
-        f = f / (f.norm() + 1e-6)
-        return float((f * ex_feat).sum())
+        def pooled_sim(bx, by, bw, bh) -> float:
+            """후보 박스 영역 특징 풀링 → 예시와 코사인 (재검증 점수)."""
+            gx1 = int(bx * scale / 1024 * FW); gy1 = int(by * scale / 1024 * FH)
+            gx2 = max(gx1 + 1, int((bx + bw) * scale / 1024 * FW))
+            gy2 = max(gy1 + 1, int((by + bh) * scale / 1024 * FH))
+            f = feats[:, gy1:gy2, gx1:gx2].mean(dim=(1, 2))
+            f = f / (f.norm() + 1e-6)
+            return float((f * ex_feat).sum())
 
-    # 각 피크 → SAM 마스크 → 박스 → 재검증
-    candidates = []
-    for cx, cy, peak in picked_pts:
-        masks, ious, _ = predictor.predict(
-            point_coords=np.array([[cx, cy]]), point_labels=np.array([1]),
-            multimask_output=False)
-        m = masks[0]
-        ys, xs = np.where(m)
-        if len(xs) < 8:
-            continue
-        bx1, by1, bx2, by2 = float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
-        bw, bh = bx2 - bx1, by2 - by1
-        # 크기 필터 (완화): 마스크가 결함 일부만 잡는 케이스 허용
-        area_ratio = (bw * bh) / max(w * h, 1)
-        if not (0.08 <= area_ratio <= 12.0):
-            continue
-        # 재검증: 후보 영역 특징이 예시와 실제로 닮았는지 (피크는 한 점, 이건 영역 전체)
-        score = pooled_sim(bx1, by1, bw, bh)
-        if score < sim_thr:
-            continue
-        candidates.append({
-            "bbox": [bx1, by1, bw, bh],
-            "confidence": round(score, 4),
-        })
+        # 각 피크 → SAM 마스크 → 박스 → 재검증
+        candidates = []
+        for cx, cy, peak in picked_pts:
+            masks, ious, _ = predictor.predict(
+                point_coords=np.array([[cx, cy]]), point_labels=np.array([1]),
+                multimask_output=False)
+            m = masks[0]
+            ys, xs = np.where(m)
+            if len(xs) < 8:
+                continue
+            bx1, by1, bx2, by2 = float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+            bw, bh = bx2 - bx1, by2 - by1
+            # 크기 필터 (완화): 마스크가 결함 일부만 잡는 케이스 허용
+            area_ratio = (bw * bh) / max(w * h, 1)
+            if not (0.08 <= area_ratio <= 12.0):
+                continue
+            # 재검증: 후보 영역 특징이 예시와 실제로 닮았는지 (피크는 한 점, 이건 영역 전체)
+            score = pooled_sim(bx1, by1, bw, bh)
+            if score < sim_thr:
+                continue
+            candidates.append({
+                "bbox": [bx1, by1, bw, bh],
+                "confidence": round(score, 4),
+            })
 
     # NMS (IoU 0.5)
     def iou(a, b):
@@ -359,13 +370,14 @@ def boxes_to_masks(image: Image.Image, boxes_xywh: list[list[float]]) -> list[di
         return []
     arr = np.array(image.convert("RGB"))
     predictor = get_sam()
-    predictor.set_image(arr)
-    boxes_xyxy = torch.tensor(
-        [[x, y, x + w, y + h] for x, y, w, h in boxes_xywh],
-        dtype=torch.float32, device=DEVICE)
-    tb = predictor.transform.apply_boxes_torch(boxes_xyxy, arr.shape[:2])
-    masks, _, _ = predictor.predict_torch(
-        point_coords=None, point_labels=None, boxes=tb, multimask_output=False)
+    with _infer_lock:
+        predictor.set_image(arr)
+        boxes_xyxy = torch.tensor(
+            [[x, y, x + w, y + h] for x, y, w, h in boxes_xywh],
+            dtype=torch.float32, device=DEVICE)
+        tb = predictor.transform.apply_boxes_torch(boxes_xyxy, arr.shape[:2])
+        masks, _, _ = predictor.predict_torch(
+            point_coords=None, point_labels=None, boxes=tb, multimask_output=False)
     rles = []
     for m in masks[:, 0].cpu().numpy():
         rle = mask_utils.encode(np.asfortranarray(m.astype(np.uint8)))

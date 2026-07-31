@@ -324,6 +324,132 @@ def test_rollback_to_unknown_model_is_rejected(client, tmp_path):
     assert client.post(f"/api/projects/{other}/models/{before['id']}/activate").status_code == 404
 
 
+def test_delete_linked_image_keeps_original_file(client, make_image, tmp_path):
+    """연결 임포트 이미지 삭제는 프로젝트에서만 뺀다 — 파일은 사용자 원본이다.
+
+    실측 결함(감사): delete_image가 이미지 경로를 검사 없이 unlink해, 복사
+    없이 연결한 외부 데이터셋의 원본 파일이 디스크에서 영구 삭제됐다.
+    """
+    import time
+
+    imgs = tmp_path / "orig"
+    make_image(imgs, "keep.jpg")
+    pid = _project(client, "del-linked")
+    client.post(f"/api/projects/{pid}/import", json={
+        "images_dir": str(imgs), "class_names": ["person"]})
+    for _ in range(50):
+        if client.get(f"/api/projects/{pid}/import/status").json()["status"] != "running":
+            break
+        time.sleep(0.1)
+
+    rows = client.get(f"/api/projects/{pid}/images").json()
+    assert len(rows) == 1
+    assert client.delete(f"/api/images/{rows[0]['id']}").json()["ok"]
+    assert (imgs / "keep.jpg").exists(), "이미지 삭제가 연결 원본 파일을 지웠다"
+    assert client.get(f"/api/projects/{pid}/images").json() == []
+
+    # 업로드 이미지의 복사본은 우리가 만든 파일이라 지우는 게 맞다
+    up = make_image(tmp_path / "up", "copy.jpg")
+    with open(up, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("copy.jpg", f, "image/jpeg"))]).json()["saved"][0]
+    assert client.get(f"/api/images/{iid}/file").status_code == 200
+    client.delete(f"/api/images/{iid}")
+    assert client.get(f"/api/images/{iid}/file").status_code == 404
+    assert up.exists(), "업로드 원본(사용자 파일)은 애초에 서버가 만진 적 없어야 한다"
+
+
+def test_batch_autolabel_default_skips_reviewed_images(client, make_image, tmp_path,
+                                                       monkeypatch):
+    """기본 배치 대상은 리뷰 전 이미지만.
+
+    실측 결함(감사): 대상 쿼리에 상태 필터가 없어 승인 이미지의 검토된 라벨을
+    무검토 검출로 교체했다. status는 approved로 남아 오염된 라벨이 승인
+    데이터로 둔갑해 학습셋까지 흘러간다.
+    """
+    import time
+
+    from server import main as m
+
+    pid = _project(client, "batch-target")
+    ids = {}
+    for st in ("approved", "prelabeled", "unlabeled"):
+        img = make_image(tmp_path / "bt", f"{st}.jpg")
+        with open(img, "rb") as f:
+            iid = client.post(f"/api/projects/{pid}/images",
+                              files=[("files", (f"{st}.jpg", f, "image/jpeg"))]).json()["saved"][0]
+        if st != "unlabeled":
+            client.put(f"/api/images/{iid}/status", json={"status": st})
+        ids[st] = iid
+
+    seen = {}
+
+    def fake_run(pid_, image_ids, ontology, masks):
+        seen["ids"] = image_ids
+        m._jobs[pid_].update(status="completed")
+
+    monkeypatch.setattr(m, "_run_batch", fake_run)
+    r = client.post(f"/api/projects/{pid}/autolabel", json={}).json()
+    assert r["total"] == 2, r
+    for _ in range(40):
+        if "ids" in seen:
+            break
+        time.sleep(0.05)
+    assert set(seen["ids"]) == {ids["prelabeled"], ids["unlabeled"]}, seen
+
+    # 명시적으로 지목하면 승인 이미지도 재실행할 수 있어야 한다 (의도된 탈출구)
+    r = client.post(f"/api/projects/{pid}/autolabel",
+                    json={"image_ids": [ids["approved"]]}).json()
+    assert r["total"] == 1
+
+    # 전부 리뷰가 끝났으면 대상 0장 — 돌리는 척하지 말고 즉시 알린다
+    client.post("/api/images/bulk-status",
+                json={"image_ids": list(ids.values()), "status": "approved"})
+    r = client.post(f"/api/projects/{pid}/autolabel", json={}).json()
+    assert r["status"] == "completed" and r["total"] == 0
+    assert "덮어쓰지 않습니다" in r["advice"]
+
+
+def test_export_skips_labels_of_removed_classes(client, make_image, tmp_path):
+    """온톨로지에서 빠진 클래스의 라벨은 제외해야 한다.
+
+    실측 결함(감사): 클래스 이름을 바꾸면 옛 이름의 라벨이 yolo에서 class 0,
+    coco에서 category_id 0으로 조용히 오라벨돼 — 이 파일로 학습한 외부 모델이
+    엉뚱한 클래스를 배운다.
+    """
+    pid = _project(client, "rename-cls", ontology=[
+        {"name": "cat", "prompt": "cat", "threshold": 0.35},
+        {"name": "dog", "prompt": "dog", "threshold": 0.35}])
+    img = make_image(tmp_path / "rn", "a.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("a.jpg", f, "image/jpeg"))]).json()["saved"][0]
+    client.put(f"/api/images/{iid}/annotations", json={"annotations": [
+        {"class_name": "cat", "bbox": [1, 2, 30, 40], "source": "human"},
+        {"class_name": "dog", "bbox": [50, 60, 30, 40], "source": "human"}]})
+    # 클래스 이름 변경 — 어노테이션의 dog는 옛 이름으로 남는다
+    client.put(f"/api/projects/{pid}/ontology", json={"ontology": [
+        {"name": "cat", "prompt": "cat", "threshold": 0.35},
+        {"name": "puppy", "prompt": "puppy", "threshold": 0.35}]})
+
+    coco = client.get(f"/api/projects/{pid}/export?fmt=coco").json()
+    assert len(coco["annotations"]) == 1
+    assert coco["annotations"][0]["category_id"] == 1  # cat — 0은 존재하면 안 된다
+    assert coco["skipped_unknown_class"] == 1
+
+    yolo = client.get(f"/api/projects/{pid}/export?fmt=yolo").json()
+    lines = [ln for ln in yolo["a.txt"].splitlines() if ln]
+    assert len(lines) == 1 and lines[0].startswith("0 "), lines  # cat만, dog 라벨 제외
+
+    # zip 경로도 제외 건수를 헤더로 알린다 (조용한 누락 방지)
+    z = client.get(f"/api/projects/{pid}/export.zip?fmt=yolo")
+    assert z.headers["x-annotations-skipped"] == "1"
+    cz = client.get(f"/api/projects/{pid}/export.zip?fmt=coco")
+    assert cz.headers["x-annotations-skipped"] == "1"
+    meta = json.loads(zipfile.ZipFile(io.BytesIO(cz.content)).read("annotations.json"))
+    assert "skipped_unknown_class" not in meta  # 표준 COCO 키가 아니다
+
+
 def test_capabilities_reports_model_availability(client):
     cap = client.get("/api/capabilities").json()
     assert set(cap) >= {"sam3", "sam_encoder", "device"}

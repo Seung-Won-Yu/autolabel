@@ -503,3 +503,98 @@ test('한글 프로젝트명으로도 익스포트가 된다', async ({ page }) 
     expect(r.headers()['content-disposition']).toContain("filename*=UTF-8''")
   }
 })
+
+test('추론 응답이 이미지 전환 후 도착하면 버린다', async ({ page }) => {
+  // 단건 오토라벨은 수 초 걸리고 그동안 →로 넘어가는 게 리뷰의 기본 동선이다.
+  // 예전엔 늦게 온 응답이 "클릭 시점 이미지의 라벨 + 검출"로 지금 보고 있는
+  // 이미지의 어노테이션을 통째로 교체했고, 2초 뒤 자동저장이 그걸 서버에
+  // 기록해 원래 라벨을 파괴했다.
+  const { id, name } = await newProject(page, 'stale-infer', ONE_CLASS)
+  await uploadImage(page, id, 'first.png')
+  const second = await uploadImage(page, id, 'second.png')
+
+  await page.route('**/api/images/*/autolabel', async (route) => {
+    await new Promise((r) => setTimeout(r, 1200)) // 느린 추론 흉내
+    await route.fulfill({ json: {
+      detections: [{ class_name: 'sig', bbox: [10, 10, 30, 30], confidence: 0.9 }],
+      engine: 'gdino',
+    } })
+  })
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+
+  await page.getByRole('button', { name: '이 이미지 오토라벨' }).click()
+  await page.keyboard.press('ArrowRight') // 응답 도착 전에 다음 이미지로
+
+  await expect(page.getByText(/오토라벨 결과를 버렸습니다/)).toBeVisible()
+  await expect(page.getByText('어노테이션 (0)')).toBeVisible()
+
+  // 자동저장 창이 지나도 두 번째 이미지의 서버 라벨이 오염되지 않아야 한다
+  await page.waitForTimeout(2500)
+  const r = await page.request.get(`${API}/images/${second}/annotations`)
+  expect(await r.json()).toEqual([])
+})
+
+test('저장 비행 중의 편집이 유실되지 않는다', async ({ page }) => {
+  // saveAnns가 완료 시 dirty를 무조건 지우던 시절: 저장 요청이 나가 있는 동안
+  // 그린 박스는 dirty가 곧 덮여 자동저장 타이머와 이탈 경고가 전부 건너뛰었다.
+  // "저장됨" 토스트를 보고 탭을 닫으면 마지막 편집이 조용히 사라진다.
+  const { id, name } = await newProject(page, 'inflight-edit', ONE_CLASS)
+  const iid = await uploadImage(page, id)
+
+  let slowed = false
+  await page.route('**/api/images/*/annotations', async (route) => {
+    if (route.request().method() === 'PUT' && !slowed) {
+      slowed = true
+      await new Promise((r) => setTimeout(r, 1500)) // 첫 저장을 느리게
+    }
+    await route.continue()
+  })
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+  const box = await canvasBox(page)
+  const draw = async (ox) => {
+    await page.mouse.move(box.x + ox, box.y + 40)
+    await page.mouse.down()
+    await page.mouse.move(box.x + ox + 30, box.y + 90, { steps: 8 })
+    await page.mouse.up()
+  }
+
+  const firstPut = page.waitForRequest((r) =>
+    r.url().includes(`/api/images/${iid}/annotations`) && r.method() === 'PUT')
+  await draw(30)
+  await firstPut
+  await draw(90) // 첫 저장이 비행 중일 때의 편집 — 이게 시험 대상
+
+  await expect.poll(async () => {
+    const r = await page.request.get(`${API}/images/${iid}/annotations`)
+    return (await r.json()).length
+  }, { timeout: 15_000 }).toBe(2)
+})
+
+test('중단된 임포트를 완료라고 말하지 않는다', async ({ page }) => {
+  // 서버가 재시작하면 sweep이 임포트 기록을 interrupted로 남긴다. 예전 폴링은
+  // failed만 실패로 보고 나머지를 전부 "임포트 완료: N장 연결됨"으로 알렸다 —
+  // 5만 장 중 400장만 들어온 데이터셋이 완전 임포트로 둔갑한다.
+  const { name } = await newProject(page, 'import-interrupt', ONE_CLASS)
+
+  await page.route('**/api/projects/*/import', (route) =>
+    route.fulfill({ json: { status: 'running', done: 0, total: 0 } }))
+  await page.route('**/api/projects/*/import/status', (route) =>
+    route.fulfill({ json: { status: 'interrupted', done: 400,
+      error: '서버가 재시작되어 작업이 중단됐습니다 — 다시 실행하세요' } }))
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  // 빈 프로젝트는 설정·도구가 이미 펼쳐져 있다 — 연결 섹션만 연다
+  await page.getByText('기존 데이터셋 연결 (복사 없음)').click()
+  await page.getByPlaceholder('이미지 폴더 경로 (필수)').fill('/tmp/somewhere')
+  await page.getByRole('button', { name: '연결 임포트' }).click()
+
+  await expect(page.getByText(/임포트가 중단됐습니다 \(400장 연결\)/)).toBeVisible()
+  await expect(page.getByText(/임포트 완료/)).toHaveCount(0)
+})
