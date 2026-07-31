@@ -197,21 +197,31 @@ def analyze(pid: int, progress: dict | None = None) -> dict:
 
 
 def _run_judge(pid: int):
+    from server import jobs
+
     job = _jobs[pid]
     try:
         result = analyze(pid, progress=job)
         if result.get("error"):
             job.update(status="failed", error=result["error"])
+            jobs.update("qa", pid, status="failed", error=result["error"])
         else:
             job.update(status="completed", result=result, done=job.get("total", 0))
+            # 결과 본문은 크니 디스크 기록에는 상태만 남긴다 (중단 판별용)
+            jobs.update("qa", pid, status="completed", done=job.get("total", 0))
     except Exception as e:
         job.update(status="failed", error=str(e))
+        jobs.update("qa", pid, status="failed", error=str(e))
 
 
 def start_judge(pid: int) -> dict:
     """대규모 심판 — 백그라운드 실행 (수만 장 대응)."""
+    from server import jobs
+
     if _jobs.get(pid, {}).get("status") == "running":
         return _jobs[pid]
     _jobs[pid] = {"status": "running", "done": 0, "total": 0}
+    # 서버 재시작 시 기록이 사라져 "완료"로 오독되지 않게 디스크에도 남긴다
+    jobs.start("qa", pid, done=0, total=0)
     threading.Thread(target=_run_judge, args=(pid,), daemon=True).start()
     return _jobs[pid]

@@ -313,6 +313,43 @@ test('선택한 박스는 화살표로 1px씩 옮긴다', async ({ page }) => {
   }, { timeout: 10_000 }).toEqual([21, 21, 30, 40])  // x +1 +10, y +1
 })
 
+test('중단된 배치를 완료라고 말하지 않는다', async ({ page }) => {
+  // 잡 상태가 메모리에만 있어서 서버가 재시작하면 기록이 사라졌고, 프론트는
+  // 그걸 완료로 읽어 "배치 오토라벨 완료: undefined/undefined장"을 띄웠다.
+  // 절반만 라벨된 데이터를 두고 사용자는 끝난 줄 안다.
+  const { id, name } = await newProject(page, 'interrupted', ONE_CLASS)
+  await uploadImage(page, id)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+
+  // 시작은 running, 이후 폴링은 interrupted (서버 재시작 후 정리된 상태).
+  // 글로브에서 *는 /를 넘지 않는다 — status는 따로 잡아야 한다.
+  await page.route('**/api/projects/*/autolabel', (route) =>
+    route.fulfill({ json: { status: 'running', done: 0, total: 12 } }))
+  let first = true
+  await page.route('**/api/projects/*/autolabel/status', (route) => {
+    if (first) {
+      first = false
+      return route.fulfill({ json: { status: 'running', done: 5, total: 12 } })
+    }
+    return route.fulfill({ json: {
+      status: 'interrupted', done: 5, total: 12,
+      error: '서버가 재시작되어 작업이 중단됐습니다 — 다시 실행하세요' } })
+  })
+
+  await page.locator('.setup-toggle').click()
+  await page.locator('button', { hasText: '전체 오토라벨' }).first().click()
+
+  const toast = page.locator('.toast')
+  await expect(toast).toContainText('중단', { timeout: 10_000 })
+  await expect(toast).toContainText('5/12')          // 어디까지 했는지 알려준다
+  await expect(toast).not.toContainText('완료')
+  await expect(toast).not.toContainText('undefined')
+  await expect(toast).toHaveClass(/sticky/)          // 놓치면 안 되는 안내다
+})
+
 test('저장이 실패하면 알리고 서버가 돌아오면 스스로 복구한다', async ({ page }) => {
   // 자동 저장에 catch가 없어서, 서버가 죽으면 콘솔에 "Failed to fetch"만 남고
   // 화면은 조용했다. 라벨러는 계속 작업하다 전부 잃는다.

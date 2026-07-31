@@ -7,6 +7,7 @@
 제품 배포 시 RF-DETR(Apache-2.0, CUDA) 트레이너로 교체 지점은 train_worker 하나.
 """
 import json
+import os
 import random
 import shutil
 import subprocess
@@ -37,6 +38,17 @@ def _status_path(pid: int) -> Path:
     return RUNS / f"train_status_{pid}.json"
 
 
+def _alive(os_pid) -> bool:
+    """OS 프로세스 생존 확인 — 서버 재시작 후엔 Popen 핸들이 없다."""
+    if not os_pid:
+        return False   # 기록이 없으면 판단할 수 없으니 죽은 것으로 본다
+    try:
+        os.kill(int(os_pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def job_status(pid: int) -> dict:
     p = _status_path(pid)
     if not p.exists():
@@ -47,6 +59,12 @@ def job_status(pid: int) -> dict:
         proc = _procs.get(pid)
         if proc is not None and proc.poll() is not None:
             st.update(status="failed", error=f"워커 비정상 종료 (exit {proc.returncode})")
+            p.write_text(json.dumps(st, ensure_ascii=False))
+        elif proc is None and not _alive(st.get("pid_os")):
+            # 서버가 재시작해 핸들이 없다 — OS에 직접 물어본다. 워커가 살아
+            # 있으면 그대로 두고(별도 프로세스라 생존한다), 죽었으면 실패로.
+            st.update(status="failed",
+                      error="학습 워커가 사라졌습니다 (서버 재시작 중 종료) — 다시 시도하세요")
             p.write_text(json.dumps(st, ensure_ascii=False))
     return st
 
@@ -168,9 +186,15 @@ def maybe_start_training(pid: int, force: bool = False, debounce: bool = False) 
         _status_path(pid).write_text(json.dumps(
             {"status": "running", "phase": "starting", "approved": approved}))
         log = open(RUNS / f"train_log_{pid}.txt", "a")
-        _procs[pid] = subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, "-m", "server.train_worker", str(pid)],
             cwd=ROOT, stdout=log, stderr=log)
+        _procs[pid] = proc
+        # OS pid를 상태 파일에 남긴다. _procs는 인메모리라 서버가 재시작하면
+        # 워커 생사를 알 수 없어 상태가 영원히 running으로 멈췄다.
+        _status_path(pid).write_text(json.dumps(
+            {"status": "running", "phase": "starting", "approved": approved,
+             "pid_os": proc.pid}))
         return {"status": "running", "phase": "starting", "approved": approved}
 
 

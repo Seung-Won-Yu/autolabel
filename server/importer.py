@@ -12,6 +12,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from server import jobs
 from server.db import get_db
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -146,10 +147,13 @@ def _run_import(pid: int, images_dir: str, labels_dir: str | None,
             if n % 200 == 0:
                 conn.commit()
                 job.update(done=n)
+                jobs.update("import", pid, done=n, total=len(candidates))
         conn.commit()
         job.update(status="completed", done=len(candidates))
+        jobs.update("import", pid, status="completed", done=len(candidates))
     except Exception as e:
         job.update(status="failed", error=str(e))
+        jobs.update("import", pid, status="failed", error=str(e))
     finally:
         conn.close()
 
@@ -158,6 +162,8 @@ def start_import(pid: int, body: dict) -> dict:
     if _jobs.get(pid, {}).get("status") == "running":
         return _jobs[pid]
     _jobs[pid] = {"status": "running", "done": 0, "total": 0}
+    # 서버 재시작 시 기록이 사라져 "완료"로 오독되지 않게 디스크에도 남긴다
+    jobs.start("import", pid, done=0, total=0)
     threading.Thread(
         target=_run_import,
         args=(pid, body["images_dir"], body.get("labels_dir"), body.get("coco_json"),

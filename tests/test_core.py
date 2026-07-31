@@ -3,6 +3,7 @@
 여기 있는 케이스들은 전부 실제로 한 번씩 깨졌던 것들이다.
 """
 import json
+import os
 
 import pytest
 
@@ -94,6 +95,66 @@ def test_merge_nms_dedupes_same_class_overlap():
     out = merge_nms(dets)
     assert len(out) == 2
     assert out[0]["confidence"] == 0.9  # 높은 신뢰도가 살아남음
+
+
+def test_train_status_detects_dead_worker_after_server_restart(tmp_path, monkeypatch):
+    """서버가 재시작하면 Popen 핸들이 없다 — OS pid로 워커 생사를 물어야 한다.
+
+    예전엔 핸들이 없으면 판단을 못 해서 상태가 영원히 running으로 멈췄다.
+    """
+    import json as _json
+
+    from server import train
+
+    monkeypatch.setattr(train, "RUNS", tmp_path)
+    train._procs.clear()   # 서버 재시작 흉내 — 핸들 소실
+
+    # 존재할 수 없는 pid를 남긴 채 running
+    (tmp_path / "train_status_7.json").write_text(
+        _json.dumps({"status": "running", "phase": "training", "pid_os": 2 ** 22}))
+    st = train.job_status(7)
+    assert st["status"] == "failed"
+    assert "워커" in st["error"]
+
+    # 살아 있는 프로세스(자기 자신)라면 running을 유지해야 한다 — 워커는 별도
+    # 프로세스라 서버 재시작에도 생존한다
+    (tmp_path / "train_status_8.json").write_text(
+        _json.dumps({"status": "running", "phase": "training", "pid_os": os.getpid()}))
+    assert train.job_status(8)["status"] == "running"
+
+
+def test_job_state_survives_restart_and_marks_interrupted():
+    """서버가 재시작하면 인프로세스 잡은 죽는다 — 그걸 완료로 읽어선 안 된다.
+
+    실측 사고: 상태가 메모리에만 있어서 재시작 후 프론트가 기록 없음을 완료로
+    해석해 "배치 오토라벨 완료: undefined/undefined장"을 띄웠다. 절반만 라벨된
+    데이터를 두고 사용자는 끝난 줄 안다.
+    """
+    from server import jobs
+
+    jobs.start("autolabel", 4242, done=0, total=10)
+    jobs.update("autolabel", 4242, done=3)
+    assert jobs.get("autolabel", 4242)["done"] == 3
+
+    # 재시작 흉내 — 메모리 캐시를 비우면 디스크 기록만 남는다
+    jobs._cache.clear()
+    assert jobs.get("autolabel", 4242)["status"] == "running"
+
+    assert jobs.sweep_stale() >= 1
+    jobs._cache.clear()
+    after = jobs.get("autolabel", 4242)
+    assert after["status"] == "interrupted"
+    assert after["done"] == 3, "어디까지 처리했는지 알려줘야 한다"
+    assert "다시 실행" in after["error"]
+
+    # 완료된 잡은 정리 대상이 아니다
+    jobs.update("autolabel", 4242, status="completed")
+    jobs.sweep_stale()
+    jobs._cache.clear()
+    assert jobs.get("autolabel", 4242)["status"] == "completed"
+
+    # 한 번도 실행하지 않은 잡은 idle
+    assert jobs.get("autolabel", 999999)["status"] == "idle"
 
 
 def test_batch_verdict_routes_by_detection_rate():

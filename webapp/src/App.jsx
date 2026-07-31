@@ -368,11 +368,16 @@ export default function App() {
           setAnns(list.map((a) => ({ ...a, _key: `db-${a.id}` })))
           dirty.current = false
         }
-        // 검출률이 낮으면 결과만 던지지 말고 다음 수를 알려준다
-        // 검출률이 낮을 때의 안내는 읽고 판단해야 하니 사라지지 않게 둔다
-        setMsg(s.status === 'failed' ? `배치 실패: ${s.error}`
-          : s.advice || `배치 오토라벨 완료: ${s.done}/${s.total}장`,
-        s.status === 'failed' || (s.verdict && s.verdict !== 'good'))
+        // 완료가 아닌 종료를 완료로 말하지 않는다. 예전엔 서버 재시작으로
+        // 잡 기록이 사라지면 "완료: undefined/undefined장"을 띄웠다 — 절반만
+        // 라벨된 데이터를 두고 사용자는 끝난 줄 안다.
+        const bad = s.status === 'failed' || s.status === 'interrupted' || s.status === 'idle'
+        const text = s.status === 'failed' ? `배치 실패: ${s.error}`
+          : s.status === 'interrupted' ? `배치가 중단됐습니다 (${s.done ?? 0}/${s.total ?? '?'}장 처리) — ${s.error || '다시 실행하세요'}`
+            : s.status === 'idle' ? '배치 진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요'
+              : s.advice || `배치 오토라벨 완료: ${s.done}/${s.total}장`
+        // 읽고 판단해야 하는 안내는 사라지지 않게 둔다
+        setMsg(text, bad || (s.verdict && s.verdict !== 'good'))
       }
     }, 1500)
     return () => clearInterval(t)

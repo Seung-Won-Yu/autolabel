@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from server import importer, ml, train
+from server import importer, jobs, ml, train
 from server.db import get_db, init_db, row_to_dict
 
 DATA_DIR = Path(os.environ.get("AUTOLABEL_DATA")
@@ -25,6 +25,10 @@ app = FastAPI(title="autolabel")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 init_db()
+# 이전 프로세스와 함께 죽은 인프로세스 잡을 interrupted로 정리한다.
+# 안 하면 프론트가 사라진 기록을 "완료"로 읽어, 절반만 처리된 데이터를 두고
+# 사용자에게 끝났다고 알린다.
+jobs.sweep_stale()
 
 # 배치 잡 상태 (MVP: 인메모리 단일 워커 — Phase 2에서 큐로 교체)
 _jobs: dict[int, dict] = {}
@@ -341,6 +345,9 @@ def _batch_verdict(job: dict, total: int) -> dict:
 
 def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool):
     job = _jobs[pid]
+    # 진행 상황을 디스크에도 남긴다 — 서버가 재시작하면 메모리 기록은 사라지고
+    # 프론트가 그걸 "완료"로 읽는다 (실측: "완료: undefined/undefined장")
+    jobs.update("autolabel", pid, done=0, total=len(image_ids))
     conn = get_db()
     try:
         for n, iid in enumerate(image_ids, 1):
@@ -369,9 +376,12 @@ def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool
             conn.commit()
             job.update(done=n, total=len(image_ids), found=job.get("found", 0) + len(dets),
                        hit=job.get("hit", 0) + (1 if dets else 0))
+            jobs.update("autolabel", pid, done=n, total=len(image_ids))
         job.update(status="completed", **_batch_verdict(job, len(image_ids)))
+        jobs.update("autolabel", pid, status="completed", **_batch_verdict(job, len(image_ids)))
     except Exception as e:  # 잡 실패를 상태로 노출
         job.update(status="failed", error=str(e))
+        jobs.update("autolabel", pid, status="failed", error=str(e))
     finally:
         conn.close()
 
@@ -389,6 +399,7 @@ def autolabel_batch(pid: int, body: dict):
             "SELECT id FROM images WHERE project_id=?", (pid,))]
     conn.close()
     _jobs[pid] = {"status": "running", "done": 0, "total": len(ids)}
+    jobs.start("autolabel", pid, done=0, total=len(ids))
     threading.Thread(
         target=_run_batch, args=(pid, ids, ontology, body.get("masks", True)),
         daemon=True).start()
@@ -397,7 +408,9 @@ def autolabel_batch(pid: int, body: dict):
 
 @app.get("/api/projects/{pid}/autolabel/status")
 def autolabel_status(pid: int):
-    return _jobs.get(pid, {"status": "idle"})
+    # 메모리에 없으면 디스크 기록을 본다 — 서버 재시작 후에도 중단(interrupted)을
+    # 알려야 한다. 없으면 진짜로 한 번도 실행하지 않은 것(idle)이다.
+    return _jobs.get(pid) or jobs.get("autolabel", pid)
 
 
 MAX_LAB_PROMPTS = 8  # 표본 5장 기준 이 이상은 대기가 너무 길어진다
@@ -532,7 +545,8 @@ def import_dataset(pid: int, body: dict):
 
 @app.get("/api/projects/{pid}/import/status")
 def import_status(pid: int):
-    return importer.job_status(pid)
+    st = importer.job_status(pid)
+    return st if st.get("status") != "idle" else jobs.get("import", pid)
 
 
 # ---------- 외부 모델 임포트 ----------
@@ -884,7 +898,8 @@ def run_qa(pid: int, background: bool = False):
 def qa_status(pid: int):
     from server import qa
 
-    return qa.job_status(pid)
+    st = qa.job_status(pid)
+    return st if st.get("status") != "idle" else jobs.get("qa", pid)
 
 
 @app.get("/api/images/{iid}/suggestions")
