@@ -584,6 +584,46 @@ def export_zip(pid: int, fmt: str = "yolo"):
                  f"attachment; filename={proj['name']}_{fmt}.zip"})
 
 
+# ---------- 통계적 배치 검수 ----------
+
+@app.post("/api/projects/{pid}/acceptance-plan")
+def acceptance_plan(pid: int, body: dict | None = None):
+    """리뷰 대기 배치를 몇 장 검사하면 되는지 계산하고 표본을 뽑아준다."""
+    from server import sampling
+
+    b = body or {}
+    status = b.get("status", "prelabeled")
+    conn = get_db()
+    ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM images WHERE project_id=? AND status=?", (pid, status))]
+    conn.close()
+    p = sampling.plan(len(ids), float(b.get("target_error_rate", 0.05)),
+                      float(b.get("confidence", 0.95)), b.get("max_defects"))
+    p["sample_image_ids"] = sampling.pick_sample(ids, p["sample_size"])
+    return p
+
+
+@app.post("/api/projects/{pid}/acceptance-result")
+def acceptance_result(pid: int, body: dict):
+    """검사 결과로 배치 승인/반려를 판정하고, 승인 시 일괄 승인까지 수행."""
+    from server import sampling
+
+    v = sampling.verdict(
+        int(body["sample_size"]), int(body["defects"]), int(body["max_defects"]),
+        float(body.get("target_error_rate", 0.05)), float(body.get("confidence", 0.95)))
+    if v["accepted"] and body.get("apply", True):
+        conn = get_db()
+        conn.execute(
+            "UPDATE images SET status='approved' WHERE project_id=? AND status='prelabeled'",
+            (pid,))
+        n = conn.total_changes
+        conn.commit()
+        conn.close()
+        v["approved_images"] = n
+        v["train"] = train.maybe_start_training(pid, debounce=True)
+    return v
+
+
 # ---------- 클라우드 학습 레인 ----------
 
 @app.get("/api/projects/{pid}/colab-notebook")

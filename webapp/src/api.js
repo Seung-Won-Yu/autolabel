@@ -82,6 +82,16 @@ export const api = {
   runQa: (pid, background = false) =>
     fetch(`/api/projects/${pid}/qa?background=${background}`, { method: 'POST' }).then(j),
   qaStatus: (pid) => fetch(`/api/projects/${pid}/qa/status`).then(j),
+  acceptancePlan: (pid, body = {}) =>
+    fetch(`/api/projects/${pid}/acceptance-plan`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
+  acceptanceResult: (pid, body) =>
+    fetch(`/api/projects/${pid}/acceptance-result`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
   autoApprove: (pid, body) =>
     fetch(`/api/projects/${pid}/auto-approve`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },

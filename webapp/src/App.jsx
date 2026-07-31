@@ -22,6 +22,7 @@ export default function App() {
   const [lastQa, setLastQa] = useState(null)
   const [qaJob, setQaJob] = useState(null)
   const [suggest, setSuggest] = useState([]) // 현재 이미지의 누락 라벨 제안
+  const [sampling, setSampling] = useState(null) // 진행 중인 통계 검수 계획
   const dirty = useRef(false)
   const undoStack = useRef([])
 
@@ -306,6 +307,16 @@ export default function App() {
                   setImages(await api.listImages(project.id))
                   setMsg(`${r.approved}장 자동 승인 (커버리지 ${(r.coverage * 100).toFixed(0)}%) — 나머지만 리뷰하세요`)
                 }}>⚡ 고신뢰 자동 승인</button>
+              <button title="전수 검사 대신 통계적으로 필요한 만큼만 검사해 배치를 승인합니다"
+                onClick={async () => {
+                  const p = await api.acceptancePlan(project.id)
+                  if (!p.sample_size) return setMsg('리뷰 대기 이미지 없음')
+                  setSampling(p)
+                  setFilter('prelabeled')
+                  setMsg(`검수 계획: ${p.lot_size}장 중 ${p.sample_size}장만 검사 ` +
+                    `(불량 ${p.max_defects}개까지 허용, 검수 ${(p.saving * 100).toFixed(0)}% 절감). ` +
+                    `표본을 확인한 뒤 결과를 입력하세요`)
+                }}>📊 배치 검수</button>
               <button title="모델이 헷갈리는 이미지를 먼저 보여줍니다 (라벨 예산 최적화)"
                 onClick={async () => {
                   const r = await api.nextToLabel(project.id, 1)
@@ -331,6 +342,20 @@ export default function App() {
                 </button></a>
             </div>
           </div>
+          {sampling && (
+            <SamplingPanel plan={sampling} onClose={() => setSampling(null)}
+              onSubmit={async (defects) => {
+                const r = await api.acceptanceResult(project.id, {
+                  sample_size: sampling.sample_size, defects,
+                  max_defects: sampling.max_defects,
+                  target_error_rate: sampling.target_error_rate,
+                  confidence: sampling.confidence,
+                })
+                setImages(await api.listImages(project.id))
+                setMsg(r.message + (r.approved_images ? ` · ${r.approved_images}장 승인됨` : ''))
+                if (r.accepted) setSampling(null)
+              }} />
+          )}
           <TrainPanel trainInfo={trainInfo} approved={approved} pid={project.id} onMsg={setMsg}
             onTrigger={async () => {
             setTrainInfo({ ...trainInfo, job: await api.triggerTrain(project.id) })
@@ -766,6 +791,32 @@ function TrainPanel({ trainInfo, onTrigger, approved = 0, pid, onMsg = () => {} 
         )}
       </div>
       <ModelHistory pid={pid} refreshKey={job.status} onMsg={onMsg} />
+    </div>
+  )
+}
+
+// 통계적 배치 검수 — 표본만 보고 배치 전체를 판정
+function SamplingPanel({ plan, onSubmit, onClose }) {
+  const [defects, setDefects] = useState(0)
+  return (
+    <div className="card" style={{ borderColor: 'var(--accent)' }}>
+      <div className="panel-title">📊 배치 검수 진행 중</div>
+      <div className="hint">
+        대기 <b>{plan.lot_size}</b>장 중 <b>{plan.sample_size}</b>장만 검사하면 됩니다
+        (검수 {(plan.saving * 100).toFixed(0)}% 절감).<br />
+        표본을 보고 <b>라벨이 틀린 이미지 수</b>를 세어 입력하세요.
+        불량 <b>{plan.max_defects}개 이하</b>면 배치 전체가 승인됩니다.
+      </div>
+      <div className="row">
+        <input type="number" min="0" value={defects} style={{ width: 70 }}
+          onChange={(e) => setDefects(+e.target.value)} />
+        <button className="primary" onClick={() => onSubmit(defects)}>판정</button>
+        <button onClick={onClose}>취소</button>
+      </div>
+      <div className="hint">
+        표본 이미지 id: {plan.sample_image_ids?.slice(0, 12).join(', ')}
+        {plan.sample_image_ids?.length > 12 ? ' …' : ''}
+      </div>
     </div>
   )
 }
