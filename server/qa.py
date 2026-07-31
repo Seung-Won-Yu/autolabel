@@ -30,6 +30,37 @@ def _iou(a, b):
     return inter / (aw * ah + bw * bh - inter + 1e-6)
 
 
+def _overlap(a, b):
+    """겹침 정도 — IoU와 양방향 포함률 중 최대.
+
+    IoU만 보면 큰 라벨 안에 작은 예측이 통째로 들어가도 값이 낮게 나온다
+    (예: 라벨 면적의 1/4을 차지하며 완전히 포함 → IoU 0.25). 그건 새 객체가
+    아니라 같은 객체를 좁게 잡은 것이다.
+    """
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return max(inter / (union + 1e-6),
+               inter / (aw * ah + 1e-6), inter / (bw * bh + 1e-6))
+
+
+def filter_new_objects(spurious, labels, overlap_thr=0.3):
+    """'누락 라벨' 후보에서 기존 라벨과 겹치는 것을 걷어낸다.
+
+    _match는 mAP 관례대로 IoU 0.5로 정탐/오탐을 가른다. 오류율 추정에는 맞지만
+    "라벨에 없는 새 객체냐"를 묻는 데 그대로 쓰면 안 된다 — IoU 0.4로 겹친
+    같은 객체가 '누락'으로 나가 원클릭 반영 시 중복 라벨이 박힌다
+    (실측: 서명 데이터셋에서 IoU 0.406짜리 중복 생성).
+    """
+    return [p for p in spurious
+            if all(_overlap(p["bbox"], l["bbox"]) < overlap_thr for l in labels)]
+
+
 def _match(preds, labels, iou_thr=0.5):
     """예측↔라벨 그리디 매칭. 반환: (매칭쌍, 미매칭 예측, 미매칭 라벨)."""
     used = set()
@@ -78,7 +109,7 @@ def analyze(pid: int, progress: dict | None = None) -> dict:
     if progress is not None:
         progress.update(total=len(images), done=0)
 
-    n_labels = n_mismatch = n_spurious = n_missing = 0
+    n_labels = n_mismatch = n_spurious = n_loose = n_missing = 0
     for n, im in enumerate(images, 1):
         labels = [row_to_dict(a) for a in conn.execute(
             "SELECT * FROM annotations WHERE image_id=?", (im["id"],))]
@@ -93,19 +124,27 @@ def analyze(pid: int, progress: dict | None = None) -> dict:
         matched, spurious, missing = _match(preds, labels)
         mismatch = [(p, l) for p, l in matched if p["class_name"] != l["class_name"]]
         spurious_hi = [p for p in spurious if p["confidence"] >= 0.5]
+        # 라벨에 아예 없는 새 객체와, 같은 객체를 다르게 잡은 것은 다른 문제다.
+        # 전자는 진짜 누락, 후자는 박스가 헐거운 것 — 섞으면 오류율이 부풀려진다.
+        new_hi = filter_new_objects(spurious_hi, labels)
+        new_ids = {id(p) for p in new_hi}
+        loose_hi = [p for p in spurious_hi if id(p) not in new_ids]
         # 확신도 가중: 모델이 "확신하며" 라벨과 싸울수록 라벨 오류 가능성↑.
         # 저확신 불일치는 모델 오류일 가능성이 높아 자연히 감쇠 — 약한 모델의 노이즈 억제
         score = (4.0 * sum(p["confidence"] for p, _ in mismatch)
-                 + 2.0 * sum(p["confidence"] for p in spurious_hi)
+                 + 2.0 * sum(p["confidence"] for p in new_hi)
+                 + 0.8 * sum(p["confidence"] for p in loose_hi)
                  + 0.3 * len(missing))
         conn.execute("UPDATE images SET qa_score=? WHERE id=?", (round(score, 2), im["id"]))
         scored.append({"image_id": im["id"], "file_name": im["file_name"],
                        "score": round(score, 2), "mismatch": len(mismatch),
-                       "possible_missing_label": len(spurious_hi),
+                       "possible_missing_label": len(new_hi),
+                       "loose_box": len(loose_hi),
                        "model_missed": len(missing)})
         n_labels += len(labels)
         n_mismatch += len(mismatch)
-        n_spurious += len(spurious_hi)
+        n_spurious += len(new_hi)
+        n_loose += len(loose_hi)
         n_missing += len(missing)
         if progress is not None and n % 20 == 0:
             progress.update(done=n)
@@ -139,7 +178,9 @@ def analyze(pid: int, progress: dict | None = None) -> dict:
 
     scored.sort(key=lambda s: -s["score"])
     flagged = [s for s in scored if s["score"] > 0]
-    # 라벨 오류율 추정: 모델이 라벨과 다투는 비율 (클래스 불일치 + 누락 의심)
+    # 라벨 오류율 추정: 모델이 라벨과 다투는 비율 (클래스 불일치 + 진짜 누락).
+    # 박스가 헐거운 것(loose)은 객체 자체는 라벨돼 있으므로 오류율에 안 넣는다 —
+    # 넣으면 같은 객체를 두 번 세어 오류율이 부풀려진다.
     est_rate = (n_mismatch + n_spurious) / max(n_labels, 1)
     return {
         "images_analyzed": len(scored),
@@ -148,6 +189,7 @@ def analyze(pid: int, progress: dict | None = None) -> dict:
         "estimated_label_error_rate": round(est_rate, 4),
         "breakdown": {"class_mismatch": n_mismatch,
                       "possible_missing_label": n_spurious,
+                      "loose_box": n_loose,
                       "model_missed": n_missing},
         "top_suspects": scored[:20],
         "recommended_thresholds": thresholds,

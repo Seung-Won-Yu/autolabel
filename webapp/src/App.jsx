@@ -486,8 +486,10 @@ function qaSummary(r) {
   const rate = (r.estimated_label_error_rate * 100).toFixed(1)
   const taus = Object.entries(r.recommended_thresholds || {})
     .filter(([, v]) => v.tau != null).map(([c, v]) => `${c}≥${v.tau}`).join(' ')
+  // 박스 헐거움은 객체 자체는 라벨돼 있어 오류율에 안 들어간다 — 따로 보여준다
+  const loose = r.breakdown.loose_box ? `, 박스어긋남 ${r.breakdown.loose_box}` : ''
   return `심판 완료 · 라벨 ${r.labels_checked}개 검사 · 추정 오류율 ${rate}% ` +
-    `(불일치 ${r.breakdown.class_mismatch}, 누락의심 ${r.breakdown.possible_missing_label}) ` +
+    `(불일치 ${r.breakdown.class_mismatch}, 누락의심 ${r.breakdown.possible_missing_label}${loose}) ` +
     `→ "의심" 정렬로 상위부터 수정하세요` + (taus ? ` · 권장 임계값 ${taus}` : '')
 }
 

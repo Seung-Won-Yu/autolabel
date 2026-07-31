@@ -113,3 +113,28 @@ def test_qa_match_finds_missing_and_spurious():
     assert len(matched) == 1
     assert len(spurious) == 1 and spurious[0]["bbox"][0] == 300
     assert len(missing) == 1 and missing[0]["bbox"][0] == 500
+
+
+def test_missing_label_suggestion_rejects_overlapping_boxes():
+    """'누락'은 새 객체여야 한다 — 기존 라벨과 겹친 박스를 반영하면 중복이 된다.
+
+    실측 사고: 서명 데이터셋에서 IoU 0.406짜리 예측이 _match의 mAP 임계값
+    0.5를 못 넘어 '누락'으로 나갔고, 원클릭 반영이 같은 서명에 박스를 하나 더
+    박았다. 정탐 판정(IoU 0.5)과 신규 객체 판정은 다른 질문이다.
+    """
+    from server.qa import filter_new_objects
+
+    labels = [{"class_name": "signature", "bbox": [653, 398, 198, 362]}]
+    preds = [
+        # 실제로 중복을 만들었던 박스 (IoU 0.406)
+        {"class_name": "signature", "bbox": [641.9, 400.6, 156.1, 207.1], "confidence": 0.92},
+        # 큰 라벨 안에 완전히 들어간 작은 박스 — IoU는 낮지만 새 객체가 아니다
+        {"class_name": "signature", "bbox": [700, 450, 60, 60], "confidence": 0.8},
+        # 진짜 새 객체 (겹침 없음)
+        {"class_name": "signature", "bbox": [1200, 800, 150, 120], "confidence": 0.7},
+    ]
+    kept = filter_new_objects(preds, labels)
+    assert [p["bbox"][0] for p in kept] == [1200], kept
+
+    # 라벨이 없으면 전부 신규 — 걸러내면 안 된다
+    assert len(filter_new_objects(preds, [])) == 3

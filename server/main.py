@@ -739,6 +739,7 @@ def qa_status(pid: int):
 @app.get("/api/images/{iid}/suggestions")
 def suggestions(iid: int, min_conf: float = 0.4):
     """활성 모델 예측 중 기존 라벨과 겹치지 않는 것 = 누락 의심 제안."""
+    from server import qa
     from server.qa import _match
 
     conn = get_db()
@@ -754,9 +755,13 @@ def suggestions(iid: int, min_conf: float = 0.4):
     ontology = [{**c, "threshold": min_conf} for c in json.loads(proj["ontology"])]
     preds = ml.detect_student(Image.open(_image_path(iid)).convert("RGB"), student, ontology)
     _matched, spurious, missing = _match(preds, labels)
+    # 겹치는 건 새 객체가 아니라 같은 객체를 다르게 잡은 것 — 반영하면 중복 라벨이 된다
+    new_objects = qa.filter_new_objects(spurious, labels)
     return {
         # 모델은 찾았는데 라벨에 없음 → 추가 제안
-        "missing_labels": spurious,
+        "missing_labels": new_objects,
+        # 기존 라벨과 겹쳐서 제외된 수 (박스가 어긋난 것이지 누락은 아님)
+        "overlapping_skipped": len(spurious) - len(new_objects),
         # 라벨에 있는데 모델이 못 찾음 → 오라벨 의심(참고용)
         "model_missed": [{"class_name": a["class_name"], "bbox": a["bbox"]} for a in missing],
     }
