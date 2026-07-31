@@ -8,7 +8,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://127.0.0.1:8899',
+      // e2e는 실제 DB를 안 건드리게 별도 포트의 백엔드로 붙는다
+      '/api': `http://127.0.0.1:${process.env.VITE_API_PORT || 8899}`,
     },
   },
 })

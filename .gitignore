@@ -23,5 +23,9 @@ autolabel.db
 output/
 runs/
 
+# Playwright e2e 산출물
+webapp/test-results/
+webapp/playwright-report/
+
 # OS
 .DS_Store

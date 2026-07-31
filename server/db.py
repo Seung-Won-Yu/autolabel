@@ -7,6 +7,8 @@ from pathlib import Path
 # 테스트는 AUTOLABEL_DB로 임시 경로를 지정해 실제 데이터를 건드리지 않는다
 DB_PATH = Path(os.environ.get("AUTOLABEL_DB")
                or Path(__file__).parent.parent / "autolabel.db")
+# 없는 디렉터리를 가리켜도 떠야 한다 — 안 그러면 서버가 조용히 기동에 실패한다
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 DDL = """
 CREATE TABLE IF NOT EXISTS projects (
