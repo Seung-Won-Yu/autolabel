@@ -12,6 +12,21 @@ ROOT = Path(__file__).parent.parent
 RUNS = ROOT / "data" / "runs"
 
 
+def pick_arch(n_images: int, override: str | None = None) -> str:
+    """데이터 규모별 학생 모델 크기 자동 선택.
+
+    소량에 큰 모델은 과적합·시간 낭비, 대량에 작은 모델은 성능 손해.
+    프로젝트에서 override를 지정하면 그것을 따른다.
+    """
+    if override:
+        return override
+    if n_images < 150:
+        return "yolo11n"
+    if n_images < 800:
+        return "yolo11s"
+    return "yolo11m"
+
+
 def write_status(pid: int, **kw):
     RUNS.mkdir(parents=True, exist_ok=True)
     path = RUNS / f"train_status_{pid}.json"
@@ -36,14 +51,31 @@ def main(pid: int):
         from ultralytics import YOLO
 
         small = n_images < 100
-        model = YOLO("yolo11n.pt")
+        # 데이터가 많을수록 큰 모델이 이득 — 승인 장수로 자동 승급
+        # (n=2.6M · s=9.4M · m=20M 파라미터. 로컬 MPS 학습 시간과 정확도의 균형)
+        # 프로젝트 설정에 arch 지정이 있으면 우선
+        from server.db import get_db as _gdb
+
+        _c = _gdb()
+        _p = _c.execute("SELECT ontology FROM projects WHERE id=?", (pid,)).fetchone()
+        _c.close()
+        override = None
+        try:
+            _o = json.loads(_p["ontology"])
+            if isinstance(_o, dict):
+                override = _o.get("arch")
+        except Exception:
+            pass
+        arch = pick_arch(n_images, override)
+        write_status(pid, arch=arch)
+        model = YOLO(f"{arch}.pt")
         model.train(
             data=str(run_dir / "dataset" / "data.yaml"),
             epochs=60 if small else 100,
             patience=10,
             freeze=10 if small else None,
             mosaic=0.0 if small else 1.0,
-            imgsz=640, device="mps", batch=8,
+            imgsz=640, device="mps", batch=8 if arch == "yolo11n" else 4,
             project=str(run_dir), name="train", verbose=False, plots=False,
         )
         best = run_dir / "train" / "weights" / "best.pt"
@@ -64,7 +96,7 @@ def main(pid: int):
             "INSERT INTO models (project_id, path, map50, train_images, active, meta) "
             "VALUES (?,?,?,?,?,?)",
             (pid, str(best), map50, n_images, int(promote),
-             json.dumps({"arch": "yolo11n", "names": names})))
+             json.dumps({"arch": arch, "names": names})))
         conn.commit()
         conn.close()
         write_status(pid, status="completed", promoted=promote)

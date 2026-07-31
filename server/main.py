@@ -186,11 +186,30 @@ def embed(iid: int):
 # ---------- 오토라벨 ----------
 
 def _detect_auto(pid: int, image: Image.Image, ontology: list, engine: str = "auto"):
-    """엔진 라우팅: 활성 학생 모델 우선, 없으면 파운데이션(GDINO). 반환: (검출, 사용 엔진)."""
+    """엔진 라우팅: 활성 학생 모델 우선, 없으면 파운데이션(GDINO).
+
+    온톨로지에 '부모.자식' 표기가 있으면 part 캐스케이드까지 수행한다.
+    반환: (검출, 사용 엔진)
+    """
+    from server import parts
+
+    parent_onto, parts_by_parent = parts.parse_ontology(ontology)
     student = train.active_model(pid) if engine in ("auto", "student") else None
     if student:
-        return ml.detect_student(image, student, ontology), f"student(mAP50 {student['map50']})"
-    return ml.detect(image, ontology), "foundation"
+        dets = ml.detect_student(image, student, ontology)
+        used = f"student(mAP50 {student['map50']})"
+        # 학생 모델이 part까지 학습했으면 캐스케이드 불필요
+        if parts_by_parent and not any("." in d["class_name"] for d in dets):
+            dets = dets + parts.detect_with_parts(image, ontology, dets)
+            used += "+parts"
+        return dets, used
+
+    dets = ml.detect(image, parent_onto or ontology)
+    used = "foundation"
+    if parts_by_parent:
+        dets = dets + parts.detect_with_parts(image, ontology, dets)
+        used += "+parts"
+    return dets, used
 
 
 @app.post("/api/images/{iid}/autolabel")
@@ -223,14 +242,20 @@ def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool
             rles = ml.boxes_to_masks(image, [d["bbox"] for d in dets]) if masks else []
             conn.execute(
                 "DELETE FROM annotations WHERE image_id=? AND source='model'", (iid,))
+            # 부모 먼저 저장하고 그 id를 part에 연결 (계층 라벨)
+            parent_ids: dict[int, int] = {}
             for i, d in enumerate(dets):
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO annotations (image_id, class_name, bbox, segmentation, "
-                    "confidence, source, meta) VALUES (?,?,?,?,?,?,?)",
+                    "confidence, parent_annotation_id, source, meta) VALUES (?,?,?,?,?,?,?,?)",
                     (iid, d["class_name"], json.dumps(d["bbox"]),
                      json.dumps(rles[i]) if i < len(rles) else None,
-                     d["confidence"], "model",
+                     d["confidence"],
+                     parent_ids.get(d.get("_parent_index")) if "_parent_index" in d else None,
+                     "model",
                      json.dumps({"model": ml.DINO_MODEL, "ontology": ontology})))
+                if "_parent_index" not in d:
+                    parent_ids[i] = cur.lastrowid
             conn.execute(
                 "UPDATE images SET status='prelabeled' WHERE id=? AND status='unlabeled'",
                 (iid,))
@@ -499,6 +524,79 @@ def export_zip(pid: int, fmt: str = "yolo"):
         buf, media_type="application/zip",
         headers={"Content-Disposition":
                  f"attachment; filename={proj['name']}_{fmt}.zip"})
+
+
+# ---------- 클라우드 학습 레인 ----------
+
+@app.get("/api/projects/{pid}/colab-notebook")
+def colab_notebook(pid: int, arch: str = "yolo11m", epochs: int = 100):
+    """대규모 학습용 Colab 노트북 생성 — 로컬 MPS로 감당 안 될 때의 탈출구.
+
+    노트북은 (1) 도구에서 받은 zip 업로드 → (2) GPU 학습 → (3) best.pt 다운로드
+    → (4) 도구에 모델 임포트 안내까지 담는다.
+    """
+    from fastapi.responses import Response
+
+    conn = get_db()
+    proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    n_approved = conn.execute(
+        "SELECT COUNT(*) c FROM images WHERE project_id=? AND status='approved'",
+        (pid,)).fetchone()["c"]
+    conn.close()
+    names = [c["name"] for c in json.loads(proj["ontology"])]
+
+    cells = [
+        {"cell_type": "markdown", "metadata": {}, "source": [
+            f"# {proj['name']} — 클라우드 학습\n\n",
+            f"승인 라벨 **{n_approved}장** · 클래스 {', '.join(names)}\n\n",
+            "1. 런타임 → 런타임 유형 변경 → **T4 GPU**\n",
+            "2. 아래 셀 순서대로 실행 (2번째 셀에서 도구의 `YOLO.zip` 업로드)\n",
+            "3. 마지막 셀에서 `best.pt` 다운로드 → 도구의 **외부 모델 등록**에 경로 입력\n"]},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+         "source": ["!nvidia-smi -L\n", "%pip install -q ultralytics"]},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+         "source": ["from google.colab import files\n",
+                    "up = files.upload()   # 도구에서 받은 YOLO.zip 선택\n",
+                    "import zipfile, glob\n",
+                    "zipfile.ZipFile(list(up)[0]).extractall('ds')\n",
+                    "print(glob.glob('ds/*'))"]},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+         "source": [
+            "# data.yaml의 경로를 Colab 기준으로 교정\n",
+            "import yaml, pathlib\n",
+            "p = pathlib.Path('ds/data.yaml')\n",
+            "d = yaml.safe_load(p.read_text())\n",
+            "d['path'] = str(pathlib.Path('ds').resolve())\n",
+            "d.setdefault('train', 'images'); d.setdefault('val', 'images')\n",
+            "p.write_text(yaml.safe_dump(d))\n",
+            "print(d)"]},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+         "source": [
+            "from ultralytics import YOLO\n",
+            f"model = YOLO('{arch}.pt')\n",
+            f"model.train(data='ds/data.yaml', epochs={epochs}, imgsz=640, batch=16,\n",
+            "            patience=20, device=0, project='out', name='train')"]},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+         "source": [
+            "m = YOLO('out/train/weights/best.pt')\n",
+            "res = m.val(data='ds/data.yaml', device=0)\n",
+            "print('mAP50:', res.box.map50, '| mAP50-95:', res.box.map)\n",
+            "from google.colab import files\n",
+            "files.download('out/train/weights/best.pt')"]},
+        {"cell_type": "markdown", "metadata": {}, "source": [
+            "## 도구로 되돌리기\n\n",
+            "받은 `best.pt`를 로컬에 두고, 오토라벨 도구의 **기존 데이터셋 연결 →",
+            " 외부 학습 모델 등록**에 그 경로를 입력하면 즉시 오토라벨 엔진으로 쓰입니다.\n"]},
+    ]
+    nb = {"cells": cells, "metadata": {"accelerator": "GPU",
+          "colab": {"provenance": []},
+          "kernelspec": {"display_name": "Python 3", "name": "python3"}},
+          "nbformat": 4, "nbformat_minor": 0}
+    return Response(
+        content=json.dumps(nb, ensure_ascii=False, indent=1),
+        media_type="application/x-ipynb+json",
+        headers={"Content-Disposition":
+                 f"attachment; filename={proj['name']}_colab_train.ipynb"})
 
 
 # ---------- QA ----------

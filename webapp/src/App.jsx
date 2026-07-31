@@ -325,6 +325,10 @@ export default function App() {
                 <a href={api.modelUrl(project.id)}>
                   <button title="현재 활성 전용 모델 가중치 (.pt) — 다른 곳에서 바로 추론 가능">모델 .pt</button></a>
               )}
+              <a href={`/api/projects/${project.id}/colab-notebook`}>
+                <button title="로컬로 감당 안 되는 대규모 학습용 — Colab 노트북을 받아 GPU에서 학습 후 .pt를 다시 등록">
+                  ☁ Colab 학습
+                </button></a>
             </div>
           </div>
           <TrainPanel trainInfo={trainInfo} approved={approved} pid={project.id} onMsg={setMsg}
