@@ -21,6 +21,7 @@ RUNS = ROOT / "data" / "runs"
 MIN_APPROVED = 8        # 자동 트리거 최소 승인 이미지 수
 RETRAIN_DELTA = 5       # 마지막 학습 이후 신규 승인 N장마다 재학습
 VAL_RATIO = 0.2
+MIN_VAL = 30   # 이보다 작은 val은 모델 품질을 가리지 못한다 (실측: 12장 val이 오판)
 
 _lock = threading.Lock()
 _procs: dict[int, subprocess.Popen] = {}
@@ -66,16 +67,19 @@ def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
         conn.close()
         return 0, names
 
-    # 고정 골드 val: 최초 학습 시점에 승인 이미지의 20%를 영구 마킹.
-    # 이후 재학습은 항상 같은 val로 평가 — 게이트 비교 기준이 라운드 간 흔들리지 않게.
+    # 고정 골드 val: 한 번 val로 뽑힌 이미지는 계속 val로 남겨 라운드 간 비교
+    # 기준을 유지한다. 단 데이터가 늘면 val도 키워야 한다 — 12장짜리 val이
+    # 홀드아웃 0.96짜리 모델을 0.57로 오판해 승격을 막은 사고가 있었다.
     val_ids = {r[0]["id"] for r in rows if r[0]["is_val"]}
-    if not val_ids:
-        shuffled = list(rows)
-        random.Random(42).shuffle(shuffled)
-        n_val = max(1, int(len(shuffled) * VAL_RATIO))
-        val_ids = {r[0]["id"] for r in shuffled[:n_val]}
-        conn.executemany("UPDATE images SET is_val=1 WHERE id=?", [(i,) for i in val_ids])
-        conn.commit()
+    need = max(MIN_VAL, int(len(rows) * VAL_RATIO))
+    if len(val_ids) < need:
+        pool = [r[0]["id"] for r in rows if r[0]["id"] not in val_ids]
+        random.Random(42).shuffle(pool)
+        add = pool[: need - len(val_ids)]
+        if add:
+            conn.executemany("UPDATE images SET is_val=1 WHERE id=?", [(i,) for i in add])
+            conn.commit()
+            val_ids |= set(add)
     conn.close()
 
     splits = {

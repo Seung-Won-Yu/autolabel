@@ -20,9 +20,12 @@ def pick_arch(n_images: int, override: str | None = None) -> str:
     """
     if override:
         return override
-    if n_images < 150:
-        return "yolo11n"
+    # 실측(PCB 300장): yolo11n·640이 yolo11s·960보다 홀드아웃에서 크게 우세했다.
+    # 로컬 학습에서는 큰 모델·고해상도가 배치와 수렴을 희생시켜 손해인 경우가 많아
+    # 승급 기준을 보수적으로 잡는다. 확신이 있으면 프로젝트 설정으로 올릴 것.
     if n_images < 800:
+        return "yolo11n"
+    if n_images < 3000:
         return "yolo11s"
     return "yolo11m"
 
@@ -38,8 +41,10 @@ def pick_imgsz(dataset_dir, n_images: int = 0, default: int = 640) -> int:
     import statistics
     from pathlib import Path as _P
 
-    if n_images < 200:
-        return default  # 소량에서는 해상도보다 데이터가 병목
+    # 실측에서 해상도 상향이 일관되게 손해였다 (60장 0.74→0.44, 300장에서도 열세).
+    # 데이터가 아주 많을 때만, 그것도 객체가 극히 작을 때만 올린다.
+    if n_images < 1000:
+        return default
     ratios = []
     for txt in list((_P(dataset_dir) / "labels" / "train").glob("*.txt"))[:300]:
         for line in txt.read_text().splitlines():
