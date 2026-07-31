@@ -95,6 +95,12 @@ def test_linked_import_reads_yolo_labels_without_copying(client, make_image, tmp
     assert any(n.startswith("images/") for n in names), names
     assert any(n.startswith("labels/") for n in names), names
 
+    # 프로젝트 삭제는 uploads만 정리한다. 연결 임포트 원본까지 지우면 사용자
+    # 데이터셋이 통째로 날아간다 — 파괴적 경로라 회귀를 테스트로 못박는다.
+    assert client.delete(f"/api/projects/{pid}").json()["ok"]
+    assert (imgs / "x.jpg").exists(), "프로젝트 삭제가 원본 이미지를 지웠다"
+    assert (labels / "x.txt").exists(), "프로젝트 삭제가 원본 라벨을 지웠다"
+
 
 def test_auto_approve_respects_threshold(client, make_image, tmp_path):
     """고신뢰만 승인하고 저신뢰는 남겨야 한다."""
