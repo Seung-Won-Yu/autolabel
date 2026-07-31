@@ -164,6 +164,51 @@ def test_acceptance_plan_and_result(client, make_image, tmp_path):
     assert res["accepted"] and res["approved_images"] == 40
 
 
+def test_model_import_and_rollback(client, tmp_path):
+    """외부 .pt 등록 → 두 번째 등록으로 교체 → 첫 모델로 롤백."""
+    pid = _project(client, "models")
+    a, b = tmp_path / "a.pt", tmp_path / "b.pt"
+    a.write_bytes(b"fake-weights-a")
+    b.write_bytes(b"fake-weights-b")
+
+    r1 = client.post(f"/api/projects/{pid}/models/import", json={
+        "path": str(a), "names": ["person"], "map50": 0.5}).json()
+    assert client.get(f"/api/projects/{pid}/train/status").json()["active_model"]["id"] == r1["id"]
+
+    # 두 번째 등록이 챔피언을 교체해야 한다 (활성은 항상 하나)
+    r2 = client.post(f"/api/projects/{pid}/models/import", json={
+        "path": str(b), "names": ["person"], "map50": 0.7}).json()
+    models = client.get(f"/api/projects/{pid}/models").json()
+    assert [m["id"] for m in models if m["active"]] == [r2["id"]], models
+
+    # 롤백
+    assert client.post(f"/api/projects/{pid}/models/{r1['id']}/activate").json()["ok"]
+    assert client.get(f"/api/projects/{pid}/train/status").json()["active_model"]["id"] == r1["id"]
+
+
+def test_rollback_to_unknown_model_is_rejected(client, tmp_path):
+    """없는 모델로 롤백하면 거부해야 한다.
+
+    예전에는 전부 비활성화만 하고 아무것도 활성화하지 않은 채 ok를 반환해,
+    클릭 한 번으로 전용 모델이 사라지고 오토라벨이 조용히 파운데이션으로
+    강등됐다.
+    """
+    pid = _project(client, "rollback")
+    w = tmp_path / "w.pt"
+    w.write_bytes(b"fake-weights")
+    client.post(f"/api/projects/{pid}/models/import", json={
+        "path": str(w), "names": ["person"], "map50": 0.5})
+    before = client.get(f"/api/projects/{pid}/train/status").json()["active_model"]
+
+    assert client.post(f"/api/projects/{pid}/models/999999/activate").status_code == 404
+    after = client.get(f"/api/projects/{pid}/train/status").json()["active_model"]
+    assert after and after["id"] == before["id"], "실패한 롤백이 활성 모델을 날렸다"
+
+    # 남의 프로젝트 모델도 마찬가지로 거부
+    other = _project(client, "rollback-other")
+    assert client.post(f"/api/projects/{other}/models/{before['id']}/activate").status_code == 404
+
+
 def test_capabilities_reports_model_availability(client):
     cap = client.get("/api/capabilities").json()
     assert set(cap) >= {"sam3", "sam_encoder", "device"}

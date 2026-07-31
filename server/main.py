@@ -417,16 +417,17 @@ def import_model(pid: int, body: dict):
     conn = get_db()
     if body.get("activate", True):
         conn.execute("UPDATE models SET active=0 WHERE project_id=?", (pid,))
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO models (project_id, path, map50, train_images, active, meta) "
         "VALUES (?,?,?,?,?,?)",
         (pid, str(path), body.get("map50"), body.get("train_images", 0),
          int(body.get("activate", True)),
          json.dumps({"arch": body.get("arch", "external"), "names": names,
                      "imported": True})))
+    mid = cur.lastrowid  # 롤백하려면 id가 필요하다
     conn.commit()
     conn.close()
-    return {"ok": True, "names": names}
+    return {"ok": True, "id": mid, "names": names}
 
 
 # ---------- 자동 승인 (TBAL) / 일괄 작업 ----------
@@ -838,11 +839,18 @@ def list_models(pid: int):
 def activate_model(pid: int, mid: int):
     """이전 모델로 롤백 (성능 회귀 시)."""
     conn = get_db()
+    # 대상 확인이 먼저다. 없는 id로 들어오면 전부 비활성화만 되고 아무것도
+    # 활성화되지 않아, ok를 받고도 전용 모델이 사라진다 (오토라벨이 조용히 강등).
+    target = conn.execute(
+        "SELECT id FROM models WHERE id=? AND project_id=?", (mid, pid)).fetchone()
+    if not target:
+        conn.close()
+        raise HTTPException(404, f"모델 {mid}이 프로젝트 {pid}에 없음")
     conn.execute("UPDATE models SET active=0 WHERE project_id=?", (pid,))
-    conn.execute("UPDATE models SET active=1 WHERE id=? AND project_id=?", (mid, pid))
+    conn.execute("UPDATE models SET active=1 WHERE id=?", (mid,))
     conn.commit()
     conn.close()
-    return {"ok": True}
+    return {"ok": True, "active_model_id": mid}
 
 
 # ---------- 파인튜닝 ----------
