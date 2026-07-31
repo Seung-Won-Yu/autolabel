@@ -164,6 +164,28 @@ def test_acceptance_plan_and_result(client, make_image, tmp_path):
     assert res["accepted"] and res["approved_images"] == 40
 
 
+def test_prompt_lab_rejects_empty_input(client, make_image, tmp_path):
+    """프롬프트 실험은 비교 대상이 있어야 한다."""
+    pid = _project(client, "lab")
+    assert client.post(f"/api/projects/{pid}/prompt-lab",
+                       json={"prompts": []}).status_code == 400
+    assert client.post(f"/api/projects/{pid}/prompt-lab",
+                       json={"prompts": ["  ", ""]}).status_code == 400
+    # 프롬프트는 있지만 이미지가 없으면 그것도 알려야 한다
+    assert client.post(f"/api/projects/{pid}/prompt-lab",
+                       json={"prompts": ["person"]}).status_code == 400
+
+
+def test_prompt_lab_dedupes_candidates():
+    """같은 프롬프트를 두 번 돌리면 추론 시간만 쓰고 결과표에 같은 줄이 두 개 뜬다."""
+    from server.main import MAX_LAB_PROMPTS, _unique_prompts
+
+    assert _unique_prompts([" person ", "person", "dog", "", "person", "dog"]) \
+        == ["person", "dog"]
+    assert _unique_prompts([None, 3, "  ", "cat"]) == ["cat"]  # 잘못된 입력도 흘리지 않는다
+    assert len(_unique_prompts([f"p{i}" for i in range(50)])) == MAX_LAB_PROMPTS
+
+
 def test_export_works_with_non_ascii_project_name(client, make_image, tmp_path):
     """한글 프로젝트명으로도 익스포트가 되어야 한다.
 

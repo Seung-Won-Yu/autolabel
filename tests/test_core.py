@@ -96,6 +96,17 @@ def test_merge_nms_dedupes_same_class_overlap():
     assert out[0]["confidence"] == 0.9  # 높은 신뢰도가 살아남음
 
 
+def test_batch_verdict_routes_by_detection_rate():
+    """제로샷이 약한 건 정상이다. 문제는 그때 아무 안내가 없던 것."""
+    from server.main import _batch_verdict
+
+    assert _batch_verdict({"hit": 9, "found": 20}, 10)["verdict"] == "good"
+    assert _batch_verdict({"hit": 2, "found": 3}, 10)["verdict"] == "weak"
+    empty = _batch_verdict({"hit": 0, "found": 0}, 10)
+    assert empty["verdict"] == "empty"
+    assert "프롬프트" in empty["advice"]  # 다음 수를 반드시 제시해야 한다
+
+
 def test_drop_frame_filling_removes_degenerate_boxes():
     """프레임을 통째로 덮는 퇴화 검출은 버려야 한다.
 

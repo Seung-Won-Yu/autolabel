@@ -92,6 +92,11 @@ export const api = {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }).then(j),
+  promptLab: (pid, body) =>
+    fetch(`/api/projects/${pid}/prompt-lab`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
   autoApprove: (pid, body) =>
     fetch(`/api/projects/${pid}/auto-approve`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },

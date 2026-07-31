@@ -283,6 +283,29 @@ def autolabel_one(iid: int, body: dict | None = None):
     return {"detections": dets, "engine": engine}
 
 
+def _batch_verdict(job: dict, total: int) -> dict:
+    """배치 결과를 읽고 다음에 뭘 해야 하는지 정한다.
+
+    제로샷이 특수 도메인에서 거의 못 잡는 건 정상이다(README 참조). 문제는
+    그때 앱이 아무 말도 안 해서, 사용자가 빈 캔버스를 보며 도구가 고장난
+    줄 안다는 것이다. 검출률을 근거로 다음 수를 지정해준다.
+    """
+    hit, found = job.get("hit", 0), job.get("found", 0)
+    rate = hit / max(total, 1)
+    if rate >= 0.7:
+        return {"verdict": "good",
+                "advice": f"{total}장 중 {hit}장에서 검출 · 박스 {found}개. 리뷰를 시작하세요."}
+    if hit == 0:
+        return {"verdict": "empty", "advice":
+                "한 장도 못 찾았습니다. 검출 프롬프트를 영어로 바꾸거나 "
+                "'프롬프트 실험'으로 후보를 비교해 보세요. 그래도 안 되면 직접 "
+                "몇 장 그린 뒤 전용 모델을 학습시키는 편이 빠릅니다."}
+    return {"verdict": "weak", "advice":
+            f"{total}장 중 {hit}장에서만 검출({found}개). 이 도메인은 제로샷이 약합니다 — "
+            "'프롬프트 실험'으로 프롬프트를 고르거나, 직접 라벨 수십 장으로 "
+            "전용 모델을 학습시키면 급격히 좋아집니다."}
+
+
 def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool):
     job = _jobs[pid]
     conn = get_db()
@@ -311,8 +334,9 @@ def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool
                 "UPDATE images SET status='prelabeled' WHERE id=? AND status='unlabeled'",
                 (iid,))
             conn.commit()
-            job.update(done=n, total=len(image_ids))
-        job["status"] = "completed"
+            job.update(done=n, total=len(image_ids), found=job.get("found", 0) + len(dets),
+                       hit=job.get("hit", 0) + (1 if dets else 0))
+        job.update(status="completed", **_batch_verdict(job, len(image_ids)))
     except Exception as e:  # 잡 실패를 상태로 노출
         job.update(status="failed", error=str(e))
     finally:
@@ -341,6 +365,74 @@ def autolabel_batch(pid: int, body: dict):
 @app.get("/api/projects/{pid}/autolabel/status")
 def autolabel_status(pid: int):
     return _jobs.get(pid, {"status": "idle"})
+
+
+MAX_LAB_PROMPTS = 8  # 표본 5장 기준 이 이상은 대기가 너무 길어진다
+
+
+def _unique_prompts(raw: list, limit: int = MAX_LAB_PROMPTS) -> list[str]:
+    """후보 프롬프트 정리 — 공백 제거·중복 제거·상한. 입력 순서는 유지.
+
+    같은 프롬프트를 두 번 돌리는 건 추론 시간 낭비고, 결과표에 똑같은 줄이
+    두 개 뜨면 어느 쪽을 고르라는 건지 알 수 없다.
+    """
+    seen = dict.fromkeys(p.strip() for p in raw if isinstance(p, str) and p.strip())
+    return list(seen)[:limit]
+
+
+@app.post("/api/projects/{pid}/prompt-lab")
+def prompt_lab(pid: int, body: dict):
+    """후보 프롬프트들을 표본 이미지에 돌려 비교한다.
+
+    제로샷 품질은 프롬프트가 좌우하는데, 지금까지는 프롬프트를 바꿔 전체를
+    다시 돌려보는 것 말고 비교할 방법이 없었다. 몇 장만으로 후보를 견주면
+    전체 배치 전에 고를 수 있다.
+    """
+    prompts = _unique_prompts(body.get("prompts", []))
+    if not prompts:
+        raise HTTPException(400, "비교할 프롬프트가 없음")
+    conn = get_db()
+    proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    if not proj:
+        conn.close()
+        raise HTTPException(404, "프로젝트 없음")
+    onto = json.loads(proj["ontology"])
+    cls = body.get("class_name") or (onto[0]["name"] if onto else "object")
+    thr = float(body.get("threshold", 0.25))
+    n = max(1, min(int(body.get("n_images", 5)), 20))
+    # 라벨이 이미 있는 이미지를 우선 표본으로 — 정답과 대조할 수 있다
+    rows = conn.execute(
+        "SELECT i.*, (SELECT COUNT(*) FROM annotations a WHERE a.image_id=i.id) AS ann_count "
+        "FROM images i WHERE i.project_id=? ORDER BY ann_count DESC, i.id LIMIT ?",
+        (pid, n)).fetchall()
+    conn.close()
+    if not rows:
+        raise HTTPException(400, "이미지가 없음")
+
+    images = [(r, Image.open(_row_image_path(r)).convert("RGB")) for r in rows
+              if _row_image_path(r).exists()]
+    results = []
+    for p in prompts:
+        one = [{"name": cls, "prompt": p, "threshold": thr}]
+        hit = found = 0
+        confs = []
+        for _row, img in images:
+            dets = ml.detect(img, one)
+            found += len(dets)
+            hit += 1 if dets else 0
+            confs += [d["confidence"] for d in dets]
+        results.append({
+            "prompt": p,
+            "images_with_detection": hit,
+            "detections": found,
+            "avg_confidence": round(sum(confs) / len(confs), 3) if confs else 0.0,
+            # 장당 박스가 지나치게 많으면 과검출 — 개수만 보고 고르면 속는다
+            "per_image": round(found / max(len(images), 1), 2),
+        })
+    # 커버리지 우선, 같으면 확신도. 과검출은 per_image로 사용자가 판단한다
+    results.sort(key=lambda r: (-r["images_with_detection"], -r["avg_confidence"]))
+    return {"class_name": cls, "sampled_images": len(images),
+            "threshold": thr, "results": results, "best": results[0]["prompt"]}
 
 
 # ---------- 시각 예시 검출 ----------

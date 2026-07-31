@@ -158,4 +158,11 @@ kbd {
 .help table { border-collapse: collapse; margin-bottom: 12px; }
 .help td { padding: 5px 12px 5px 0; font-size: 13px; }
 
+/* 프롬프트 실험 결과 — 1위를 눈에 띄게 */
+table.lab { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 12px; }
+table.lab th { text-align: left; color: var(--dim); font-weight: 600; padding: 4px 6px 4px 0; }
+table.lab td { padding: 4px 6px 4px 0; border-top: 1px solid var(--border); }
+table.lab tr.win td { color: var(--ok, #7ddc9a); font-weight: 600; }
+table.lab button { padding: 2px 8px; font-size: 11px; }
+
 details summary { cursor: pointer; color: var(--dim); font-size: 13px; font-weight: 600; }

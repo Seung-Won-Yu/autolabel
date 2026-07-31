@@ -218,7 +218,9 @@ export default function App() {
           setAnns(list.map((a) => ({ ...a, _key: `db-${a.id}` })))
           dirty.current = false
         }
-        setMsg(s.status === 'failed' ? `배치 실패: ${s.error}` : `배치 오토라벨 완료: ${s.done}/${s.total}장`)
+        // 검출률이 낮으면 결과만 던지지 말고 다음 수를 알려준다
+        setMsg(s.status === 'failed' ? `배치 실패: ${s.error}`
+          : s.advice || `배치 오토라벨 완료: ${s.done}/${s.total}장`)
       }
     }, 1500)
     return () => clearInterval(t)
@@ -267,6 +269,8 @@ export default function App() {
           <UploadBox project={project} onUploaded={async () => setImages(await api.listImages(project.id))} />
           <LinkImport project={project} setProject={setProject} onMsg={setMsg}
             onDone={async () => setImages(await api.listImages(project.id))} />
+          <PromptLab project={project} setProject={setProject} onMsg={setMsg}
+            hasImages={images.length > 0} />
           <div className="card">
             <div className="panel-title">일괄 작업</div>
             <div className="row">
@@ -676,6 +680,93 @@ function UploadBox({ project, onUploaded }) {
           onUploaded()
         }} />
     </label>
+  )
+}
+
+// 프롬프트 실험 — 후보를 표본 몇 장에 돌려 비교하고 이긴 것을 클래스에 적용.
+// 제로샷 품질은 프롬프트가 좌우하는데, 예전엔 프롬프트를 바꿔 전체를 다시
+// 돌려보는 것 말고 비교할 방법이 없었다.
+function PromptLab({ project, setProject, onMsg, hasImages }) {
+  const [open, setOpen] = useState(false)
+  const [cls, setCls] = useState(project.ontology[0]?.name || '')
+  const [text, setText] = useState('')
+  const [res, setRes] = useState(null)
+  const [busy, setBusy] = useState(false)
+
+  const target = project.ontology.find((c) => c.name === cls) || project.ontology[0]
+
+  const run = async () => {
+    const prompts = text.split('\n').map((s) => s.trim()).filter(Boolean)
+    if (!prompts.length) return onMsg('후보 프롬프트를 한 줄에 하나씩 적어주세요')
+    setBusy(true)
+    try {
+      const r = await api.promptLab(project.id, { class_name: cls, prompts, n_images: 5 })
+      setRes(r)
+      onMsg(`표본 ${r.sampled_images}장 비교 완료 — 1위 "${r.best}"`)
+    } catch (e) { onMsg(`프롬프트 실험 실패: ${e.message}`) } finally { setBusy(false) }
+  }
+
+  const apply = async (prompt) => {
+    const onto = project.ontology.map((c) => (c.name === cls ? { ...c, prompt } : c))
+    await api.saveOntology(project.id, onto)
+    setProject({ ...project, ontology: onto })
+    onMsg(`"${prompt}" 적용됨 — 전체 오토라벨을 다시 실행하세요`)
+  }
+
+  if (!project.ontology.length) return null
+  return (
+    <div className="card">
+      <div className="panel-title" style={{ cursor: 'pointer' }} onClick={() => {
+        setOpen(!open)
+        if (!open && !text) {
+          // 현재 프롬프트를 첫 줄에 두어 "지금보다 나은가"를 바로 볼 수 있게
+          const cur = target?.prompt || target?.name || ''
+          setText([cur, target?.name, `a photo of ${target?.name}`]
+            .filter((v, i, a) => v && a.indexOf(v) === i).join('\n'))
+        }
+      }}>
+        {open ? '▾' : '▶'} 프롬프트 실험 (어떤 표현이 잘 잡히나)
+      </div>
+      {open && (
+        <>
+          <p className="hint">
+            후보를 표본 5장에 돌려 비교합니다. 검출된 장수가 많고 확신도가 높은 쪽이 낫습니다.
+            장당 박스가 지나치게 많으면 과검출이니 주의하세요.
+          </p>
+          {project.ontology.length > 1 && (
+            <select value={cls} onChange={(e) => { setCls(e.target.value); setRes(null) }}>
+              {project.ontology.map((c) => <option key={c.name} value={c.name}>{c.name}</option>)}
+            </select>
+          )}
+          <textarea rows={4} value={text} onChange={(e) => setText(e.target.value)}
+            placeholder={'후보를 한 줄에 하나씩\nhandwritten signature\nautograph'}
+            style={{ width: '100%', marginTop: 6 }} />
+          <div className="row">
+            <button className="primary" disabled={busy || !hasImages} onClick={run}>
+              {busy ? '비교 중…' : '비교 실행'}
+            </button>
+            {!hasImages && <span className="hint">이미지를 먼저 넣어주세요</span>}
+          </div>
+          {res && (
+            <table className="lab">
+              <thead><tr><th>프롬프트</th><th>검출 장수</th><th>평균 conf</th><th>장당</th><th /></tr></thead>
+              <tbody>
+                {res.results.map((r) => (
+                  <tr key={r.prompt} className={r.prompt === res.best ? 'win' : undefined}>
+                    <td>{r.prompt}</td>
+                    <td>{r.images_with_detection}/{res.sampled_images}</td>
+                    <td>{r.avg_confidence}</td>
+                    <td>{r.per_image}</td>
+                    <td><button onClick={() => apply(r.prompt)}
+                      disabled={r.prompt === target?.prompt}>적용</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
+      )}
+    </div>
   )
 }
 
