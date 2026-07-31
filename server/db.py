@@ -1,9 +1,12 @@
 """SQLite 스키마 + 커넥션. MVP는 단일 사용자 로컬 — 마이그레이션 도구 없이 idempotent DDL."""
 import json
+import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "autolabel.db"
+# 테스트는 AUTOLABEL_DB로 임시 경로를 지정해 실제 데이터를 건드리지 않는다
+DB_PATH = Path(os.environ.get("AUTOLABEL_DB")
+               or Path(__file__).parent.parent / "autolabel.db")
 
 DDL = """
 CREATE TABLE IF NOT EXISTS projects (

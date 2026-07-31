@@ -16,7 +16,9 @@ from pathlib import Path
 
 from server.db import get_db, row_to_dict
 
-ROOT = Path(__file__).parent.parent
+import os as _os
+
+ROOT = Path(_os.environ.get("AUTOLABEL_DATA_ROOT") or Path(__file__).parent.parent)
 RUNS = ROOT / "data" / "runs"
 MIN_APPROVED = 8        # 자동 트리거 최소 승인 이미지 수
 RETRAIN_DELTA = 5       # 마지막 학습 이후 신규 승인 N장마다 재학습

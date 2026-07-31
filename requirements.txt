@@ -15,3 +15,5 @@ requests
 onnx
 onnxscript
 onnxruntime
+pytest
+httpx

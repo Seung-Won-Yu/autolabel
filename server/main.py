@@ -4,6 +4,7 @@
 """
 import io
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -16,7 +17,8 @@ from PIL import Image
 from server import importer, ml, train
 from server.db import get_db, init_db, row_to_dict
 
-DATA_DIR = Path(__file__).parent.parent / "data" / "uploads"
+DATA_DIR = Path(os.environ.get("AUTOLABEL_DATA")
+                or Path(__file__).parent.parent / "data") / "uploads"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="autolabel")
