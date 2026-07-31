@@ -832,17 +832,26 @@ function ModelHistory({ pid, refreshKey, onMsg }) {
     return <button style={{ marginTop: 6, fontSize: 12, padding: '2px 8px' }}
       onClick={() => setOpen(true)}>학습 이력 보기</button>
   }
-  const best = Math.max(...models.map((m) => m.map50 || 0), 0.001)
+  const best = Math.max(...models.map((m) => m.test_map50 || m.map50 || 0), 0.001)
+  const curve = models.filter((m) => m.test_map50 != null)
+    .sort((a, b) => a.train_images - b.train_images)
   return (
     <div style={{ marginTop: 8 }}>
       <div className="panel-title">학습 이력 ({models.length})</div>
+      <div className="hint">막대 = 홀드아웃 성능(학습·게이트에 안 쓴 데이터 기준)</div>
       {models.map((m) => (
         <div key={m.id} className="row" style={{ fontSize: 12, gap: 8 }}>
-          <div style={{ width: 60, height: 8, background: 'var(--bg3)', borderRadius: 4 }}>
-            <div style={{ width: `${((m.map50 || 0) / best) * 100}%`, height: '100%',
-              background: m.active ? 'var(--ok)' : '#4a5560', borderRadius: 4 }} />
+          <div style={{ width: 56, height: 8, background: 'var(--bg3)', borderRadius: 4 }}>
+            <div style={{ width: `${((m.test_map50 ?? m.map50 ?? 0) / best) * 100}%`,
+              height: '100%', background: m.active ? 'var(--ok)' : '#4a5560',
+              borderRadius: 4 }} />
           </div>
-          <span style={{ minWidth: 44 }}>{m.map50?.toFixed(3) ?? '—'}</span>
+          <span style={{ minWidth: 40 }} title="홀드아웃 mAP50">
+            {m.test_map50?.toFixed(3) ?? '—'}
+          </span>
+          <span className="hint" style={{ margin: 0 }} title="게이트용 val mAP50">
+            (val {m.map50?.toFixed(2) ?? '—'})
+          </span>
           <span className="hint" style={{ margin: 0 }}>{m.train_images}장</span>
           {m.meta?.imported && <span className="hint" style={{ margin: 0 }}>임포트</span>}
           {m.active
@@ -851,10 +860,23 @@ function ModelHistory({ pid, refreshKey, onMsg }) {
                 onClick={async () => {
                   await api.activateModel(pid, m.id)
                   setModels(await api.listModels(pid))
-                  onMsg(`모델 #${m.id}로 전환 (mAP50 ${m.map50?.toFixed(3)})`)
+                  onMsg(`모델 #${m.id}로 전환 (홀드아웃 ${m.test_map50?.toFixed(3) ?? '—'})`)
                 }}>사용</button>}
         </div>
       ))}
+      {curve.length >= 2 && (
+        <div className="hint" style={{ marginTop: 6 }}>
+          데이터 효율: {curve.map((m) => `${m.train_images}장→${m.test_map50.toFixed(2)}`).join(' · ')}
+          <br />
+          {(() => {
+            const a = curve[curve.length - 2], b = curve[curve.length - 1]
+            const gain = (b.test_map50 - a.test_map50) / Math.max(b.train_images - a.train_images, 1) * 100
+            return gain > 0.05
+              ? `100장 추가당 약 +${(gain * 100).toFixed(1)}%p — 더 라벨할 가치가 있습니다`
+              : '최근 구간에서 이득이 작습니다 — 라벨 양보다 품질·다양성을 보세요'
+          })()}
+        </div>
+      )}
       <button style={{ marginTop: 4, fontSize: 12, padding: '2px 8px' }}
         onClick={() => setOpen(false)}>닫기</button>
     </div>

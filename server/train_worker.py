@@ -116,10 +116,19 @@ def main(pid: int):
             project=str(run_dir), name="train", verbose=False, plots=False,
         )
         best = run_dir / "train" / "weights" / "best.pt"
-        metrics = YOLO(str(best)).val(
-            data=str(run_dir / "dataset" / "data.yaml"), device="mps", verbose=False)
+        trained = YOLO(str(best))
+        data_yaml = str(run_dir / "dataset" / "data.yaml")
+        metrics = trained.val(data=data_yaml, device="mps", verbose=False)
         map50 = float(metrics.box.map50)
-        write_status(pid, phase="gating", map50=round(map50, 4))
+        # 홀드아웃(test)은 학습·게이트 어디에도 안 쓴 데이터 — 진짜 성능
+        test_map50 = None
+        try:
+            if list((run_dir / "dataset" / "images" / "test").glob("*")):
+                t = trained.val(data=data_yaml, split="test", device="mps", verbose=False)
+                test_map50 = round(float(t.box.map50), 4)
+        except Exception:
+            pass
+        write_status(pid, phase="gating", map50=round(map50, 4), test_map50=test_map50)
 
         # champion/challenger + 품질 하한선 (콜드스타트 쓰레기 모델 승격 방지)
         QUALITY_FLOOR = 0.3
@@ -130,10 +139,10 @@ def main(pid: int):
         if promote:
             conn.execute("UPDATE models SET active=0 WHERE project_id=?", (pid,))
         conn.execute(
-            "INSERT INTO models (project_id, path, map50, train_images, active, meta) "
-            "VALUES (?,?,?,?,?,?)",
-            (pid, str(best), map50, n_images, int(promote),
-             json.dumps({"arch": arch, "names": names})))
+            "INSERT INTO models (project_id, path, map50, test_map50, train_images, "
+            "active, meta) VALUES (?,?,?,?,?,?,?)",
+            (pid, str(best), map50, test_map50, n_images, int(promote),
+             json.dumps({"arch": arch, "names": names, "imgsz": imgsz})))
         conn.commit()
         conn.close()
         write_status(pid, status="completed", promoted=promote)

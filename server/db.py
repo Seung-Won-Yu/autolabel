@@ -76,6 +76,10 @@ def init_db():
         "ALTER TABLE images ADD COLUMN qa_score REAL",  # 라벨 의심 점수 (높을수록 의심)
         # 외부 폴더 연결: 복사 없이 원본 경로 참조 (대용량 데이터셋용)
         "ALTER TABLE images ADD COLUMN src_path TEXT",
+        # 3분할: train | val(게이트) | test(홀드아웃 — 학습·게이트에서 완전 배제)
+        "ALTER TABLE images ADD COLUMN split TEXT",
+        # 라운드별 실성능 기록 (게이트용 val이 아니라 홀드아웃 기준)
+        "ALTER TABLE models ADD COLUMN test_map50 REAL",
     ):
         try:
             conn.execute(stmt)

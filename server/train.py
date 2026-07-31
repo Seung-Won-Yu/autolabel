@@ -22,6 +22,8 @@ MIN_APPROVED = 8        # 자동 트리거 최소 승인 이미지 수
 RETRAIN_DELTA = 5       # 마지막 학습 이후 신규 승인 N장마다 재학습
 VAL_RATIO = 0.2
 MIN_VAL = 30   # 이보다 작은 val은 모델 품질을 가리지 못한다 (실측: 12장 val이 오판)
+TEST_RATIO = 0.15
+MIN_TEST = 20  # 홀드아웃 — 학습·게이트에서 완전 배제, 진짜 성능 보고 전용
 
 _lock = threading.Lock()
 _procs: dict[int, subprocess.Popen] = {}
@@ -67,24 +69,39 @@ def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
         conn.close()
         return 0, names
 
-    # 고정 골드 val: 한 번 val로 뽑힌 이미지는 계속 val로 남겨 라운드 간 비교
-    # 기준을 유지한다. 단 데이터가 늘면 val도 키워야 한다 — 12장짜리 val이
-    # 홀드아웃 0.96짜리 모델을 0.57로 오판해 승격을 막은 사고가 있었다.
-    val_ids = {r[0]["id"] for r in rows if r[0]["is_val"]}
-    need = max(MIN_VAL, int(len(rows) * VAL_RATIO))
-    if len(val_ids) < need:
-        pool = [r[0]["id"] for r in rows if r[0]["id"] not in val_ids]
-        random.Random(42).shuffle(pool)
-        add = pool[: need - len(val_ids)]
-        if add:
-            conn.executemany("UPDATE images SET is_val=1 WHERE id=?", [(i,) for i in add])
-            conn.commit()
-            val_ids |= set(add)
+    # 3분할 고정: train(학습) / val(게이트 판정) / test(홀드아웃 — 학습·게이트 모두 배제).
+    # 한 번 정해진 소속은 유지해 라운드 간 비교 기준이 흔들리지 않게 하고,
+    # 데이터가 늘면 val·test도 함께 키운다 — 12장짜리 val이 홀드아웃 0.96짜리
+    # 모델을 0.57로 오판해 승격을 막은 사고에서 나온 규칙.
+    assigned = {r[0]["id"]: (r[0]["split"] or ("val" if r[0]["is_val"] else None))
+                for r in rows}
+    val_ids = {i for i, s in assigned.items() if s == "val"}
+    test_ids = {i for i, s in assigned.items() if s == "test"}
+    need_val = max(MIN_VAL, int(len(rows) * VAL_RATIO))
+    need_test = max(MIN_TEST, int(len(rows) * TEST_RATIO))
+    pool = [i for i, s in assigned.items() if s is None]
+    random.Random(42).shuffle(pool)
+
+    updates = []
+    for target, ids, need in (("val", val_ids, need_val), ("test", test_ids, need_test)):
+        while len(ids) < need and pool:
+            i = pool.pop()
+            ids.add(i)
+            updates.append((target, i))
+    # 기존 is_val 기반 멤버도 split 컬럼에 반영 (표시·조회 일관성)
+    updates += [("val", i) for i in val_ids] + [("test", i) for i in test_ids]
+    updates += [("train", i) for i in pool]
+    if updates:
+        conn.executemany("UPDATE images SET split=? WHERE id=?", updates)
+        conn.execute("UPDATE images SET is_val=1 WHERE split='val' AND project_id=?", (pid,))
+        conn.commit()
     conn.close()
 
     splits = {
         "val": [r for r in rows if r[0]["id"] in val_ids],
-        "train": [r for r in rows if r[0]["id"] not in val_ids],
+        # test는 학습 데이터에서 제외 — 진짜 성능 측정용으로만 남긴다
+        "train": [r for r in rows if r[0]["id"] not in val_ids and r[0]["id"] not in test_ids],
+        "test": [r for r in rows if r[0]["id"] in test_ids],
     }
 
     for split, items in splits.items():
@@ -110,9 +127,9 @@ def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
             (out / "labels" / split / f"{Path(dst.name).stem}.txt").write_text("\n".join(lines))
 
     (out / "data.yaml").write_text(
-        f"path: {out}\ntrain: images/train\nval: images/val\n"
+        f"path: {out}\ntrain: images/train\nval: images/val\ntest: images/test\n"
         f"names: {json.dumps(names)}\n")
-    return len(rows), names
+    return len(splits["train"]) + len(splits["val"]), names
 
 
 def maybe_start_training(pid: int, force: bool = False, debounce: bool = False) -> dict:
