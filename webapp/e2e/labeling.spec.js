@@ -313,6 +313,37 @@ test('선택한 박스는 화살표로 1px씩 옮긴다', async ({ page }) => {
   }, { timeout: 10_000 }).toEqual([21, 21, 30, 40])  // x +1 +10, y +1
 })
 
+test('저장이 실패하면 알리고 서버가 돌아오면 스스로 복구한다', async ({ page }) => {
+  // 자동 저장에 catch가 없어서, 서버가 죽으면 콘솔에 "Failed to fetch"만 남고
+  // 화면은 조용했다. 라벨러는 계속 작업하다 전부 잃는다.
+  const { id, name } = await newProject(page, 'savefail', ONE_CLASS)
+  const iid = await uploadImage(page, id)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+
+  let failing = true
+  await page.route('**/api/images/*/annotations', (route) => (
+    failing && route.request().method() === 'PUT' ? route.abort('failed') : route.continue()))
+
+  const box = await canvasBox(page)
+  await page.mouse.move(box.x + 40, box.y + 40)
+  await page.mouse.down()
+  await page.mouse.move(box.x + 120, box.y + 110, { steps: 8 })
+  await page.mouse.up()
+
+  // 저장 안 됨을 반드시 보여줘야 한다
+  await expect(page.locator('.chip.danger')).toBeVisible({ timeout: 10_000 })
+
+  failing = false                                   // 서버 복구
+  await expect(page.locator('.chip.danger')).toHaveCount(0, { timeout: 15_000 })
+  await expect.poll(async () => {
+    const r = await page.request.get(`${API}/images/${iid}/annotations`)
+    return (await r.json()).length
+  }, { timeout: 15_000 }).toBe(1)                   // 재시도로 실제 저장됨
+})
+
 test('A를 연타해도 승인이 유실되지 않는다', async ({ page }) => {
   // 리뷰 핵심 루프의 조용한 데이터 유실이었다. setStatus가 비동기인데 각
   // 호출이 낡은 클로저의 current를 읽어 같은 이미지를 두 번 처리하고 나머지를

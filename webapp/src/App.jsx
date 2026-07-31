@@ -27,6 +27,8 @@ export default function App() {
   const [setupOpen, setSetupOpen] = useState(true)
   // 캔버스에서 숨긴 클래스 — 밀집 장면에서 한 종류만 보며 고칠 수 있게
   const [hidden, setHidden] = useState(new Set())
+  // 저장 실패 상태 — 헤더에 계속 띄우고 스스로 재시도한다
+  const [saveError, setSaveError] = useState(false)
   const dirty = useRef(false)
   const undoStack = useRef([])
   // 캔버스 크기는 컨테이너를 실측한다. 예전엔 window.innerWidth에서 상수를 뺀
@@ -204,14 +206,51 @@ export default function App() {
     return next ? openImage(next) : Promise.resolve()
   }, [openImage])
 
-  // 자동 저장 — 수정 후 2초 조용하면 저장 (S 강제도 여전히 가능)
+  // 자동 저장 — 수정 후 2초 조용하면 저장 (S 강제도 여전히 가능).
+  // 실패를 반드시 알린다. 예전엔 catch가 없어 서버가 죽으면 콘솔에
+  // "Failed to fetch"만 남고 화면은 조용했다 — 계속 작업하다 전부 잃는다.
   useEffect(() => {
     if (!dirty.current || !current) return
-    const t = setTimeout(() => {
-      if (dirty.current) saveAnns(current.id, anns)
+    const t = setTimeout(async () => {
+      if (!dirty.current) return
+      try {
+        await saveAnns(current.id, anns)
+        setSaveError(false)
+      } catch (e) {
+        setSaveError(true)
+        // dirty는 유지 — 다음 편집이나 재시도에서 다시 저장을 시도한다
+        setMsg(`저장 실패: ${e.message} · 서버 연결을 확인하세요 (5초마다 재시도)`, true)
+      }
     }, 2000)
     return () => clearTimeout(t)
-  }, [anns, current, saveAnns])
+  }, [anns, current, saveAnns, setMsg])
+
+  // 저장이 실패한 동안은 스스로 재시도한다 — 사용자가 다시 편집하지 않아도
+  // 서버가 돌아오면 저절로 복구되어야 한다
+  useEffect(() => {
+    if (!saveError) return
+    const t = setInterval(async () => {
+      const cur = currentRef.current
+      if (!dirty.current || !cur) return setSaveError(false)
+      try {
+        await saveAnns(cur.id, annsRef.current)
+        setSaveError(false)
+        setMsg('저장 복구됨')
+      } catch { /* 다음 주기에 다시 */ }
+    }, 5000)
+    return () => clearInterval(t)
+  }, [saveError, saveAnns, setMsg])
+
+  // 저장 안 된 변경이 있으면 이탈을 막는다
+  useEffect(() => {
+    const h = (e) => {
+      if (!dirty.current) return
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', h)
+    return () => window.removeEventListener('beforeunload', h)
+  }, [])
 
   // 연타해도 한 건도 잃지 않게 프라미스 체인으로 직렬화한다.
   // 예전엔 각 호출이 낡은 클로저의 current를 읽어 같은 이미지를 두 번
@@ -361,6 +400,11 @@ export default function App() {
           <span>{approved}/{images.length} 승인</span>
         </div>
         <span className="spacer" />
+        {saveError && (
+          <span className="chip danger" title="서버에 저장하지 못했습니다. 5초마다 재시도합니다 — 창을 닫으면 변경이 사라집니다">
+            ⚠ 저장 안 됨 — 재시도 중
+          </span>
+        )}
         {trainInfo.active_model && (
           <span className="chip" title="오토라벨이 이 전용 모델을 사용 중">
             전용 모델 mAP50 {trainInfo.active_model.map50?.toFixed(2)}

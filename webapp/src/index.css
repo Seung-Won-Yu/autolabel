@@ -50,6 +50,8 @@ kbd {
   font-size: 12px; padding: 3px 10px; border-radius: 12px;
   background: #1e3a5e; border: 1px solid var(--accent);
 }
+/* 저장 실패 — 눈에 걸려야 한다. 놓치면 작업을 잃는다 */
+.chip.danger { background: #4a1d1d; border-color: var(--bad); color: #ffd7d7; }
 
 .layout { display: flex; flex: 1; min-height: 0; }
 /* 사이드바는 스스로 스크롤하지 않는다. 설정 영역과 이미지 목록이 각자
