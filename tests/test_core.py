@@ -96,6 +96,25 @@ def test_merge_nms_dedupes_same_class_overlap():
     assert out[0]["confidence"] == 0.9  # 높은 신뢰도가 살아남음
 
 
+def test_drop_frame_filling_removes_degenerate_boxes():
+    """프레임을 통째로 덮는 퇴화 검출은 버려야 한다.
+
+    실측 사고: GDINO는 프롬프트에 맞는 것을 못 찾으면 입력 전체를 박스로
+    뱉는다. 타일마다 하나씩 나오니 서명 12장 제로샷에서 박스 78개 중 69개가
+    타일 격자 모양 쓰레기였고, 첫 오토라벨 화면이 격자로 덮였다.
+    """
+    from server.tiling import drop_frame_filling
+
+    dets = [
+        {"class_name": "a", "bbox": [0, 0, 800, 800]},        # 타일 전체
+        {"class_name": "a", "bbox": [0, 80, 800, 720]},       # 면적비 0.90 — 면적 기준을 빠져나갔던 실측 케이스
+        {"class_name": "a", "bbox": [10, 10, 80, 80]},        # 진짜 검출
+        {"class_name": "a", "bbox": [0, 300, 800, 100]},      # 가로로 길고 납작 — 한 축만 커서 살아야 한다
+    ]
+    kept = drop_frame_filling(dets, 800, 800)
+    assert [d["bbox"] for d in kept] == [[10, 10, 80, 80], [0, 300, 800, 100]], kept
+
+
 # ---------- QA 매칭 ----------
 
 def test_qa_match_finds_missing_and_spurious():

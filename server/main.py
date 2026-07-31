@@ -131,6 +131,19 @@ def list_images(pid: int, status: str | None = None):
     return rows
 
 
+def _attachment(filename: str) -> str:
+    """다운로드 파일명을 Content-Disposition 헤더로 안전하게 만든다.
+
+    HTTP 헤더는 latin-1만 담을 수 있어 한글 프로젝트명을 그대로 넣으면
+    UnicodeEncodeError로 500이 난다 — 한글 이름 프로젝트는 익스포트가 통째로
+    막혔다. RFC 6266대로 ASCII 대체본과 UTF-8 원본을 함께 보낸다.
+    """
+    from urllib.parse import quote
+
+    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    return f"attachment; filename={ascii_name}; filename*=UTF-8''{quote(filename)}"
+
+
 def _row_image_path(row) -> Path:
     """이미지 행 하나의 실제 디스크 경로.
 
@@ -599,8 +612,7 @@ def export_zip(pid: int, fmt: str = "yolo"):
     buf.seek(0)
     return StreamingResponse(
         buf, media_type="application/zip",
-        headers={"Content-Disposition":
-                 f"attachment; filename={proj['name']}_{fmt}.zip",
+        headers={"Content-Disposition": _attachment(f"{proj['name']}_{fmt}.zip"),
                  "X-Images-Exported": str(len(images) - missing),
                  "X-Images-Missing": str(missing)})
 
@@ -715,7 +727,7 @@ def colab_notebook(pid: int, arch: str = "yolo11m", epochs: int = 100):
         content=json.dumps(nb, ensure_ascii=False, indent=1),
         media_type="application/x-ipynb+json",
         headers={"Content-Disposition":
-                 f"attachment; filename={proj['name']}_colab_train.ipynb"})
+                 _attachment(f"{proj['name']}_colab_train.ipynb")})
 
 
 # ---------- QA ----------

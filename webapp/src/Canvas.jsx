@@ -47,10 +47,21 @@ export default function Canvas({
   }
 
   // ---------- SAM 모드 ----------
+  // 프레임을 거의 다 덮는 마스크는 배경(종이·벽·하늘)을 클릭한 것이다.
+  // 라벨링에서 그건 언제나 오클릭인데, 예전엔 다음 클릭이 그걸 조용히 확정해
+  // 이미지 전체 크기 어노테이션이 학습 데이터에 들어갔다 (실측: 1920x1079).
+  // server/tiling.py의 MAX_FRAME_COVERAGE와 같은 기준.
+  const MAX_FRAME_COVERAGE = 0.85
+
   const commitSam = (points, mask) => {
     if (!mask || !img) return []
     const bbox = maskToBbox(mask, img.width, img.height)
     if (!bbox) return []
+    if (bbox[2] >= img.width * MAX_FRAME_COVERAGE
+        && bbox[3] >= img.height * MAX_FRAME_COVERAGE) {
+      onMsg('배경을 클릭한 것 같습니다 — 객체 위를 클릭하세요 (확정 안 함)')
+      return []
+    }
     return [{
       _key: `sam-${Date.now()}`,
       class_name: activeClass,

@@ -164,6 +164,33 @@ def test_acceptance_plan_and_result(client, make_image, tmp_path):
     assert res["accepted"] and res["approved_images"] == 40
 
 
+def test_export_works_with_non_ascii_project_name(client, make_image, tmp_path):
+    """한글 프로젝트명으로도 익스포트가 되어야 한다.
+
+    HTTP 헤더는 latin-1만 담는다. Content-Disposition에 프로젝트명을 그대로
+    넣던 탓에 한글 이름이면 UnicodeEncodeError로 500이 났다 — 한국어 사용자는
+    익스포트가 통째로 막혀 있었고, QA 프로젝트가 전부 ASCII 이름이라 놓쳤다.
+    """
+    pid = _project(client, "한글 프로젝트 테스트")
+    img = make_image(tmp_path / "ko", "a.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("a.jpg", f, "image/jpeg"))]).json()["saved"][0]
+    client.put(f"/api/images/{iid}/annotations", json={"annotations": [
+        {"class_name": "person", "bbox": [1, 2, 3, 4], "source": "human"}]})
+
+    for fmt in ("yolo", "coco"):
+        r = client.get(f"/api/projects/{pid}/export.zip?fmt={fmt}")
+        assert r.status_code == 200, (fmt, r.status_code)
+        cd = r.headers["content-disposition"]
+        cd.encode("latin-1")  # 헤더가 실제로 전송 가능해야 한다
+        assert "filename*=UTF-8''" in cd, cd
+
+    nb = client.get(f"/api/projects/{pid}/colab-notebook")
+    assert nb.status_code == 200
+    nb.headers["content-disposition"].encode("latin-1")
+
+
 def test_model_import_and_rollback(client, tmp_path):
     """외부 .pt 등록 → 두 번째 등록으로 교체 → 첫 모델로 롤백."""
     pid = _project(client, "models")

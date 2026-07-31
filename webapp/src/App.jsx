@@ -91,6 +91,16 @@ export default function App() {
     ensureEmbed(im.id).catch(() => {})
   }, [current, anns, saveAnns])
 
+  // 이미지가 처음 생기면 자동으로 연다. 프로젝트를 열 때만 열면, 임포트나
+  // 업로드로 이미지를 넣은 직후 "좌측에서 이미지를 선택하세요"에 멈춰 있고
+  // 썸네일 목록은 좌측 패널 아래라 화면 밖이다 — 리뷰할 게 눈앞에 없다.
+  useEffect(() => {
+    if (current || !images.length) return
+    const first = images.find((im) => im.status === 'prelabeled')
+      || images.find((im) => im.status === 'unlabeled') || images[0]
+    openImage(first)
+  }, [images, current, openImage])
+
   // 모든 어노테이션 변경은 이 함수로 — 언두 스택 자동 축적
   const setAnnsDirty = useCallback((next) => {
     undoStack.current.push(anns)

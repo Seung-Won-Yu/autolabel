@@ -15,6 +15,7 @@ from PIL import Image
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 SAM_CKPT = "models/sam_vit_l_0b3195.pth"
 DINO_MODEL = "IDEA-Research/grounding-dino-base"
+from server.tiling import drop_frame_filling  # noqa: E402
 
 _lock = threading.Lock()
 _sam_predictor = None
@@ -296,7 +297,11 @@ def detect_student(image: Image.Image, model_row: dict, ontology: list[dict]) ->
 
 @torch.no_grad()
 def detect(image: Image.Image, ontology: list[dict]) -> list[dict]:
-    """온톨로지 기반 검출: 클래스별 프롬프트·임계값 적용."""
+    """온톨로지 기반 검출: 클래스별 프롬프트·임계값 적용.
+
+    프레임을 거의 다 덮는 박스는 버린다 (MAX_FRAME_COVERAGE). 프레임을 꽉
+    채우는 객체를 찾는 용도라면 이 상수를 올릴 것.
+    """
     proc, dino = get_dino()
     prompts = {c["name"]: c.get("prompt") or c["name"] for c in ontology}
     thresholds = {c["name"]: float(c.get("threshold", 0.35)) for c in ontology}
@@ -323,7 +328,11 @@ def detect(image: Image.Image, ontology: list[dict]) -> list[dict]:
             "bbox": [round(x1, 1), round(y1, 1), round(x2 - x1, 1), round(y2 - y1, 1)],
             "confidence": round(score.item(), 4),
         })
-    return detections
+    # 프롬프트에 맞는 것을 못 찾으면 GDINO는 입력 전체를 박스로 뱉는다.
+    # 타일링과 만나면 이미지가 타일 격자 모양 박스로 덮인다 (실측: 서명 12장
+    # 제로샷에서 박스 78개 중 69개). 학습된 학생 모델은 이 실패 모드가 없어
+    # 여기, 즉 GDINO 경로에서만 막는다. 타일 검출이면 image가 곧 타일이다.
+    return drop_frame_filling(detections, image.width, image.height)
 
 
 @torch.no_grad()
