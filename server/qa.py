@@ -4,6 +4,7 @@
 모델과 라벨이 싸우는 이미지 = 라벨 오류이거나 모델 약점 — 둘 다 리뷰 가치 최상.
 """
 import json
+import threading
 from pathlib import Path
 
 from PIL import Image
@@ -12,6 +13,12 @@ from server import ml, train
 from server.db import get_db, row_to_dict
 
 ROOT = Path(__file__).parent.parent
+
+_jobs: dict[int, dict] = {}
+
+
+def job_status(pid: int) -> dict:
+    return _jobs.get(pid, {"status": "idle"})
 
 
 def _iou(a, b):
@@ -46,11 +53,14 @@ def _match(preds, labels, iou_thr=0.5):
     return matched, spurious, unmatched_labels
 
 
-def analyze(pid: int) -> dict:
-    """전체 라벨 이미지에 학생 모델 실행 → 이미지별 의심 점수 저장 + 임계값 추천."""
+def analyze(pid: int, progress: dict | None = None) -> dict:
+    """전체 라벨 이미지에 학생 모델 실행 → 이미지별 의심 점수 저장 + 임계값 추천.
+
+    progress dict를 넘기면 done/total을 갱신한다 (대규모 심판 잡용).
+    """
     student = train.active_model(pid)
     if not student:
-        return {"error": "활성 학생 모델 없음 — 먼저 파인튜닝 필요"}
+        return {"error": "활성 학생 모델 없음 — 먼저 파인튜닝하거나 외부 모델을 등록하세요"}
 
     conn = get_db()
     proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
@@ -65,10 +75,19 @@ def analyze(pid: int) -> dict:
     # 낮은 임계값으로 예측 뽑아 매칭 (평가용이라 관대하게)
     loose_ontology = [{**c, "threshold": 0.1} for c in ontology]
 
-    for im in images:
+    if progress is not None:
+        progress.update(total=len(images), done=0)
+
+    n_labels = n_mismatch = n_spurious = n_missing = 0
+    for n, im in enumerate(images, 1):
         labels = [row_to_dict(a) for a in conn.execute(
             "SELECT * FROM annotations WHERE image_id=?", (im["id"],))]
-        img_path = ROOT / "data" / "uploads" / str(pid) / f"{im['id']}_{im['file_name']}"
+        # 연결 임포트 이미지는 원본 경로, 업로드 이미지는 복사본 경로
+        src = im["src_path"] if "src_path" in im.keys() and im["src_path"] else None
+        img_path = Path(src) if src else (
+            ROOT / "data" / "uploads" / str(pid) / f"{im['id']}_{im['file_name']}")
+        if not img_path.exists():
+            continue
         preds = ml.detect_student(Image.open(img_path).convert("RGB"), student, loose_ontology)
 
         matched, spurious, missing = _match(preds, labels)
@@ -84,6 +103,13 @@ def analyze(pid: int) -> dict:
                        "score": round(score, 2), "mismatch": len(mismatch),
                        "possible_missing_label": len(spurious_hi),
                        "model_missed": len(missing)})
+        n_labels += len(labels)
+        n_mismatch += len(mismatch)
+        n_spurious += len(spurious_hi)
+        n_missing += len(missing)
+        if progress is not None and n % 20 == 0:
+            progress.update(done=n)
+            conn.commit()
 
         if im["is_val"]:  # 골드 val에서만 캘리브레이션 수집 (라벨=정답 가정)
             for p, l in matched:
@@ -112,5 +138,38 @@ def analyze(pid: int) -> dict:
         thresholds[cls] = best or {"tau": None, "note": "정밀도 95% 달성 불가 — 더 학습 필요"}
 
     scored.sort(key=lambda s: -s["score"])
-    return {"images_analyzed": len(scored), "top_suspects": scored[:10],
-            "recommended_thresholds": thresholds}
+    flagged = [s for s in scored if s["score"] > 0]
+    # 라벨 오류율 추정: 모델이 라벨과 다투는 비율 (클래스 불일치 + 누락 의심)
+    est_rate = (n_mismatch + n_spurious) / max(n_labels, 1)
+    return {
+        "images_analyzed": len(scored),
+        "labels_checked": n_labels,
+        "flagged_images": len(flagged),
+        "estimated_label_error_rate": round(est_rate, 4),
+        "breakdown": {"class_mismatch": n_mismatch,
+                      "possible_missing_label": n_spurious,
+                      "model_missed": n_missing},
+        "top_suspects": scored[:20],
+        "recommended_thresholds": thresholds,
+    }
+
+
+def _run_judge(pid: int):
+    job = _jobs[pid]
+    try:
+        result = analyze(pid, progress=job)
+        if result.get("error"):
+            job.update(status="failed", error=result["error"])
+        else:
+            job.update(status="completed", result=result, done=job.get("total", 0))
+    except Exception as e:
+        job.update(status="failed", error=str(e))
+
+
+def start_judge(pid: int) -> dict:
+    """대규모 심판 — 백그라운드 실행 (수만 장 대응)."""
+    if _jobs.get(pid, {}).get("status") == "running":
+        return _jobs[pid]
+    _jobs[pid] = {"status": "running", "done": 0, "total": 0}
+    threading.Thread(target=_run_judge, args=(pid,), daemon=True).start()
+    return _jobs[pid]

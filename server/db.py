@@ -74,6 +74,8 @@ def init_db():
     for stmt in (
         "ALTER TABLE images ADD COLUMN is_val INTEGER NOT NULL DEFAULT 0",  # 고정 골드 val
         "ALTER TABLE images ADD COLUMN qa_score REAL",  # 라벨 의심 점수 (높을수록 의심)
+        # 외부 폴더 연결: 복사 없이 원본 경로 참조 (대용량 데이터셋용)
+        "ALTER TABLE images ADD COLUMN src_path TEXT",
     ):
         try:
             conn.execute(stmt)

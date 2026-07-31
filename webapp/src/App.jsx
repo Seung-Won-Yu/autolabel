@@ -20,6 +20,7 @@ export default function App() {
   const [filter, setFilter] = useState('all')
   const [sortMode, setSortMode] = useState('none')
   const [lastQa, setLastQa] = useState(null)
+  const [qaJob, setQaJob] = useState(null)
   const dirty = useRef(false)
   const undoStack = useRef([])
 
@@ -156,6 +157,22 @@ export default function App() {
     return () => window.removeEventListener('keydown', h)
   })
 
+  // 백그라운드 심판 잡 폴링
+  useEffect(() => {
+    if (qaJob?.status !== 'running' || !project) return
+    const t = setInterval(async () => {
+      const s = await api.qaStatus(project.id)
+      setQaJob(s)
+      if (s.status !== 'running') {
+        clearInterval(t)
+        setImages(await api.listImages(project.id))
+        if (s.result) { setLastQa(s.result); setMsg(qaSummary(s.result)) }
+        else setMsg(`심판 실패: ${s.error}`)
+      }
+    }, 2000)
+    return () => clearInterval(t)
+  }, [qaJob?.status, project?.id]) // eslint-disable-line
+
   // 드래그앤드롭 업로드 — 창 어디에 놓아도 됨
   useEffect(() => {
     if (!project) return
@@ -235,6 +252,8 @@ export default function App() {
           />
           <OntologyEditor project={project} setProject={setProject} />
           <UploadBox project={project} onUploaded={async () => setImages(await api.listImages(project.id))} />
+          <LinkImport project={project} setProject={setProject} onMsg={setMsg}
+            onDone={async () => setImages(await api.listImages(project.id))} />
           <div className="card">
             <div className="panel-title">일괄 작업</div>
             <div className="row">
@@ -246,17 +265,20 @@ export default function App() {
                 }}>
                 {job.status === 'running' ? `오토라벨 ${job.done ?? 0}/${job.total}` : '▶ 전체 오토라벨'}
               </button>
-              <button title="전용 모델과 저장된 라벨을 대조해 의심 라벨을 찾고, 클래스별 권장 임계값을 계산합니다 (전용 모델 필요)"
+              <button title="전용 모델과 저장된 라벨을 대조해 의심 라벨을 찾고, 클래스별 권장 임계값을 계산합니다 (전용 모델 필요). 이미지가 많으면 백그라운드로 실행됩니다."
+                disabled={qaJob?.status === 'running'}
                 onClick={async () => {
-                  setMsg('QA 분석 중…')
-                  const r = await api.runQa(project.id)
+                  const big = images.length > 200
+                  setMsg(big ? '라벨 심판 시작 (백그라운드)…' : 'QA 분석 중…')
+                  const r = await api.runQa(project.id, big)
                   if (r.error) return setMsg(r.error)
+                  if (big) return setQaJob(r)
                   setImages(await api.listImages(project.id))
                   setLastQa(r)
-                  const taus = Object.entries(r.recommended_thresholds || {})
-                    .filter(([, v]) => v.tau != null).map(([c, v]) => `${c}≥${v.tau}`).join(' ')
-                  setMsg(`QA 완료 — "의심" 정렬 사용 가능. 권장 임계값: ${taus || '표본 부족'}`)
-                }}>QA 분석</button>
+                  setMsg(qaSummary(r))
+                }}>
+                {qaJob?.status === 'running' ? `심판 중 ${qaJob.done}/${qaJob.total}` : 'QA 분석'}
+              </button>
             </div>
             {lastQa?.recommended_thresholds && Object.values(lastQa.recommended_thresholds).some((v) => v.tau != null) && (
               <div className="row">
@@ -386,6 +408,16 @@ export default function App() {
 }
 
 const MIN_APPROVED = 8
+
+// 심판 결과 한 줄 요약 — 라벨 오류율과 다음 행동
+function qaSummary(r) {
+  const rate = (r.estimated_label_error_rate * 100).toFixed(1)
+  const taus = Object.entries(r.recommended_thresholds || {})
+    .filter(([, v]) => v.tau != null).map(([c, v]) => `${c}≥${v.tau}`).join(' ')
+  return `심판 완료 · 라벨 ${r.labels_checked}개 검사 · 추정 오류율 ${rate}% ` +
+    `(불일치 ${r.breakdown.class_mismatch}, 누락의심 ${r.breakdown.possible_missing_label}) ` +
+    `→ "의심" 정렬로 상위부터 수정하세요` + (taus ? ` · 권장 임계값 ${taus}` : '')
+}
 
 // 현재 상태에서 "지금 해야 할 일" 하나만 크게 안내 — 순서를 외우지 않게
 function NextStep({ project, images, trainInfo, job, onAutolabel }) {
@@ -560,6 +592,101 @@ function UploadBox({ project, onUploaded }) {
           onUploaded()
         }} />
     </label>
+  )
+}
+
+// 대용량 데이터셋 연결 — 복사 없이 폴더 참조 + 기존 라벨 임포트
+function LinkImport({ project, setProject, onMsg, onDone }) {
+  const [open, setOpen] = useState(false)
+  const [imagesDir, setImagesDir] = useState('')
+  const [labelsDir, setLabelsDir] = useState('')
+  const [cocoJson, setCocoJson] = useState('')
+  const [limit, setLimit] = useState('')
+  const [requireClass, setRequireClass] = useState('')
+  const [info, setInfo] = useState(null)
+  const [job, setJob] = useState(null)
+
+  useEffect(() => {
+    if (job?.status !== 'running') return
+    const t = setInterval(async () => {
+      const s = await api.importStatus(project.id)
+      setJob(s)
+      if (s.status !== 'running') {
+        clearInterval(t)
+        onDone()
+        onMsg(s.status === 'failed' ? `임포트 실패: ${s.error}` : `임포트 완료: ${s.done}장 연결됨`)
+      }
+    }, 1000)
+    return () => clearInterval(t)
+  }, [job?.status]) // eslint-disable-line
+
+  return (
+    <details className="card" open={open} onToggle={(e) => setOpen(e.target.open)}>
+      <summary>기존 데이터셋 연결 (복사 없음)</summary>
+      <div className="hint">이미 라벨이 있는 폴더를 그대로 연결합니다. 이미지는 복사되지 않아 디스크를 쓰지 않습니다.</div>
+      <input placeholder="이미지 폴더 경로 (필수)" value={imagesDir}
+        onChange={(e) => setImagesDir(e.target.value)} style={{ width: '100%' }} />
+      <input placeholder="YOLO 라벨 폴더 (선택)" value={labelsDir}
+        onChange={(e) => setLabelsDir(e.target.value)} style={{ width: '100%', marginTop: 4 }} />
+      <input placeholder="또는 COCO json 경로 (선택)" value={cocoJson}
+        onChange={(e) => setCocoJson(e.target.value)} style={{ width: '100%', marginTop: 4 }} />
+      <div className="row">
+        <input placeholder="최대 장수" value={limit} onChange={(e) => setLimit(e.target.value)} style={{ width: 80 }} />
+        <input placeholder="이 클래스 포함만" value={requireClass}
+          onChange={(e) => setRequireClass(e.target.value)} style={{ flex: 1, minWidth: 80 }} />
+      </div>
+      <div className="row">
+        <button onClick={async () => {
+          const r = await api.importPreview({
+            images_dir: imagesDir, labels_dir: labelsDir || undefined,
+            coco_json: cocoJson || undefined,
+          })
+          setInfo(r)
+          if (r.error) onMsg(r.error)
+        }}>미리보기</button>
+        <button className="primary" disabled={!imagesDir || job?.status === 'running'}
+          onClick={async () => {
+            const body = {
+              images_dir: imagesDir, labels_dir: labelsDir || undefined,
+              coco_json: cocoJson || undefined,
+              class_names: project.ontology.map((c) => c.name),
+              limit: limit ? +limit : undefined,
+              require_class: requireClass || undefined,
+            }
+            setJob(await api.importDataset(project.id, body))
+            onMsg('임포트 시작 — 진행률은 아래에 표시됩니다')
+          }}>
+          {job?.status === 'running' ? `연결 중 ${job.done}/${job.total}` : '연결 임포트'}
+        </button>
+      </div>
+      {info && !info.error && (
+        <div className="hint">
+          이미지 <b>{info.images}</b>장 · 형식 <b>{info.format}</b>
+          {info.classes && <> · 클래스 {info.classes.join(', ')}</>}
+          {info.class_ids && <> · 클래스 id {info.class_ids.slice(0, 12).join(',')}{info.class_ids.length > 12 ? '…' : ''}</>}
+          {info.format === 'yolo' && <><br />YOLO 라벨은 <b>왼쪽 클래스 목록 순서</b>대로 id가 매핑됩니다 (0번=첫 클래스)</>}
+        </div>
+      )}
+      <ModelImport project={project} onMsg={onMsg} />
+    </details>
+  )
+}
+
+// 외부에서 학습한 .pt를 전용 모델로 등록
+function ModelImport({ project, onMsg }) {
+  const [path, setPath] = useState('')
+  return (
+    <div style={{ marginTop: 10, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
+      <div className="hint">외부 학습 모델 등록 (.pt) — 클래스명은 자동 추출</div>
+      <div className="row">
+        <input placeholder="/path/to/best.pt" value={path}
+          onChange={(e) => setPath(e.target.value)} style={{ flex: 1, minWidth: 100 }} />
+        <button disabled={!path} onClick={async () => {
+          const r = await api.importModel(project.id, { path })
+          onMsg(r.names ? `모델 등록됨 · 클래스: ${r.names.join(', ')}` : '등록 실패')
+        }}>등록</button>
+      </div>
+    </div>
   )
 }
 

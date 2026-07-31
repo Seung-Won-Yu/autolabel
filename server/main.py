@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from server import ml, train
+from server import importer, ml, train
 from server.db import get_db, init_db, row_to_dict
 
 DATA_DIR = Path(__file__).parent.parent / "data" / "uploads"
@@ -121,6 +121,10 @@ def _image_path(iid: int) -> Path:
     conn.close()
     if not row:
         raise HTTPException(404)
+    # 연결 임포트된 이미지는 원본 경로 참조 (복사본 없음)
+    src = row["src_path"] if "src_path" in row.keys() else None
+    if src:
+        return Path(src)
     return DATA_DIR / str(row["project_id"]) / f"{iid}_{row['file_name']}"
 
 
@@ -281,6 +285,57 @@ def exemplar(iid: int, body: dict):
     return {"detections": dets}
 
 
+# ---------- 데이터셋 연결 임포트 ----------
+
+@app.post("/api/import/preview")
+def import_preview(body: dict):
+    """폴더 경로만 주면 이미지 수·라벨 형식·클래스를 미리 알려준다."""
+    return importer.preview(body["images_dir"], body.get("labels_dir"), body.get("coco_json"))
+
+
+@app.post("/api/projects/{pid}/import")
+def import_dataset(pid: int, body: dict):
+    """복사 없이 폴더를 연결하고 기존 라벨을 가져온다 (대용량 데이터셋용)."""
+    return importer.start_import(pid, body)
+
+
+@app.get("/api/projects/{pid}/import/status")
+def import_status(pid: int):
+    return importer.job_status(pid)
+
+
+# ---------- 외부 모델 임포트 ----------
+
+@app.post("/api/projects/{pid}/models/import")
+def import_model(pid: int, body: dict):
+    """도구 밖에서 학습한 YOLO .pt를 전용 모델로 등록."""
+    path = Path(body["path"]).expanduser()
+    if not path.exists():
+        raise HTTPException(400, f"모델 파일 없음: {path}")
+    names = body.get("names")
+    if not names:
+        try:
+            from ultralytics import YOLO
+
+            m = YOLO(str(path))
+            names = [m.names[i] for i in sorted(m.names)]
+        except Exception as e:
+            raise HTTPException(400, f"클래스명 자동 추출 실패 — names를 넘겨주세요 ({e})")
+    conn = get_db()
+    if body.get("activate", True):
+        conn.execute("UPDATE models SET active=0 WHERE project_id=?", (pid,))
+    conn.execute(
+        "INSERT INTO models (project_id, path, map50, train_images, active, meta) "
+        "VALUES (?,?,?,?,?,?)",
+        (pid, str(path), body.get("map50"), body.get("train_images", 0),
+         int(body.get("activate", True)),
+         json.dumps({"arch": body.get("arch", "external"), "names": names,
+                     "imported": True})))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "names": names}
+
+
 # ---------- 삭제 ----------
 
 @app.delete("/api/images/{iid}")
@@ -379,10 +434,20 @@ def export_zip(pid: int, fmt: str = "yolo"):
 # ---------- QA ----------
 
 @app.post("/api/projects/{pid}/qa")
-def run_qa(pid: int):
+def run_qa(pid: int, background: bool = False):
     from server import qa
 
+    # 대규모(수천 장+)는 백그라운드 심판 잡으로
+    if background:
+        return qa.start_judge(pid)
     return qa.analyze(pid)
+
+
+@app.get("/api/projects/{pid}/qa/status")
+def qa_status(pid: int):
+    from server import qa
+
+    return qa.job_status(pid)
 
 
 # ---------- 파인튜닝 ----------

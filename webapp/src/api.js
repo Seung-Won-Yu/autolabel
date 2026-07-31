@@ -63,7 +63,25 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bbox, class_name: className }),
     }).then(j),
-  runQa: (pid) => fetch(`/api/projects/${pid}/qa`, { method: 'POST' }).then(j),
+  importPreview: (body) =>
+    fetch('/api/import/preview', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
+  importDataset: (pid, body) =>
+    fetch(`/api/projects/${pid}/import`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
+  importStatus: (pid) => fetch(`/api/projects/${pid}/import/status`).then(j),
+  importModel: (pid, body) =>
+    fetch(`/api/projects/${pid}/models/import`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
+  runQa: (pid, background = false) =>
+    fetch(`/api/projects/${pid}/qa?background=${background}`, { method: 'POST' }).then(j),
+  qaStatus: (pid) => fetch(`/api/projects/${pid}/qa/status`).then(j),
   triggerTrain: (pid) => fetch(`/api/projects/${pid}/train`, { method: 'POST' }).then(j),
   trainStatus: (pid) => fetch(`/api/projects/${pid}/train/status`).then(j),
 }
