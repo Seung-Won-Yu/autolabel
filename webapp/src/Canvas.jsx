@@ -9,6 +9,7 @@ import { decodeMask, maskToBbox, maskToRLE, rleToMask, maskToCanvas } from './sa
 export default function Canvas({
   imageUrl, imageId, tool, anns, setAnns, ontology, activeClass,
   selectedId, setSelectedId, hoverId = null, onMsg = () => {}, onExemplar = null,
+  suggestions = [], onAcceptSuggestion = null,
   size = { w: 900, h: 640 },
 }) {
   const [img] = useImage(imageUrl, 'anonymous')
@@ -187,6 +188,29 @@ export default function Canvas({
             stroke="#fff" strokeWidth={1.5 / view.scale} dash={[6 / view.scale, 4 / view.scale]}
           />
         )}
+        {/* 누락 의심 제안 — 점선 박스, 클릭하면 라벨로 승격 */}
+        {suggestions.map((s, i) => {
+          const [sx, sy, sw2, sh2] = s.bbox
+          const c = classColor(ontology, s.class_name)
+          return (
+            <Group key={`sug-${i}`}>
+              <Rect
+                x={sx} y={sy} width={sw2} height={sh2}
+                stroke={c} strokeWidth={2.5 / view.scale}
+                dash={[8 / view.scale, 5 / view.scale]}
+                fill={c + '18'}
+                onClick={() => onAcceptSuggestion?.(s, i)}
+                onMouseEnter={(e) => (e.target.getStage().container().style.cursor = 'copy')}
+                onMouseLeave={(e) => (e.target.getStage().container().style.cursor = 'crosshair')}
+              />
+              <Text
+                x={sx} y={sy - 17 / view.scale}
+                text={`+ ${s.class_name} ${s.confidence?.toFixed(2) ?? ''} (클릭하여 추가)`}
+                fill={c} fontSize={12 / view.scale} fontStyle="bold" listening={false}
+              />
+            </Group>
+          )
+        })}
         {tool === 'sam' && sam.mask && img && (
           <LiveMask mask={sam.mask} W={img.width} H={img.height} color={activeColor} />
         )}

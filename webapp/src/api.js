@@ -82,6 +82,23 @@ export const api = {
   runQa: (pid, background = false) =>
     fetch(`/api/projects/${pid}/qa?background=${background}`, { method: 'POST' }).then(j),
   qaStatus: (pid) => fetch(`/api/projects/${pid}/qa/status`).then(j),
+  autoApprove: (pid, body) =>
+    fetch(`/api/projects/${pid}/auto-approve`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
+  suggestions: (iid, minConf = 0.4) =>
+    fetch(`/api/images/${iid}/suggestions?min_conf=${minConf}`).then(j),
+  applySuggestions: (iid, boxes) =>
+    fetch(`/api/images/${iid}/apply-suggestions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ boxes }),
+    }).then(j),
+  nextToLabel: (pid, n = 20) =>
+    fetch(`/api/projects/${pid}/next-to-label?n=${n}`).then(j),
+  listModels: (pid) => fetch(`/api/projects/${pid}/models`).then(j),
+  activateModel: (pid, mid) =>
+    fetch(`/api/projects/${pid}/models/${mid}/activate`, { method: 'POST' }).then(j),
   triggerTrain: (pid) => fetch(`/api/projects/${pid}/train`, { method: 'POST' }).then(j),
   trainStatus: (pid) => fetch(`/api/projects/${pid}/train/status`).then(j),
 }

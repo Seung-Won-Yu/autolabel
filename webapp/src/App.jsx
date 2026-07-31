@@ -21,6 +21,7 @@ export default function App() {
   const [sortMode, setSortMode] = useState('none')
   const [lastQa, setLastQa] = useState(null)
   const [qaJob, setQaJob] = useState(null)
+  const [suggest, setSuggest] = useState([]) // 현재 이미지의 누락 라벨 제안
   const dirty = useRef(false)
   const undoStack = useRef([])
 
@@ -83,6 +84,7 @@ export default function App() {
     const list = await api.getAnnotations(im.id)
     setAnns(list.map((a) => ({ ...a, _key: `db-${a.id}` })))
     setSelectedId(null)
+    setSuggest([])
     dirty.current = false
     undoStack.current = []
     ensureEmbed(im.id).catch(() => {})
@@ -294,6 +296,25 @@ export default function App() {
                   }}>✓ 권장 임계값 적용</button>
               </div>
             )}
+            <div className="row">
+              <button className="ok" title="모든 박스가 임계값 이상인 리뷰 대기 이미지를 한 번에 승인합니다"
+                onClick={async () => {
+                  const dry = await api.autoApprove(project.id, { min_conf: 0.7, dry_run: true })
+                  if (!dry.approved) return setMsg(`자동 승인 대상 없음 (대기 ${dry.pending}장)`)
+                  if (!confirm(`리뷰 대기 ${dry.pending}장 중 ${dry.approved}장이 고신뢰(≥0.7)입니다. 승인할까요?\n(저신뢰 ${dry.skipped_low_confidence}장은 남겨둡니다)`)) return
+                  const r = await api.autoApprove(project.id, { min_conf: 0.7 })
+                  setImages(await api.listImages(project.id))
+                  setMsg(`${r.approved}장 자동 승인 (커버리지 ${(r.coverage * 100).toFixed(0)}%) — 나머지만 리뷰하세요`)
+                }}>⚡ 고신뢰 자동 승인</button>
+              <button title="모델이 헷갈리는 이미지를 먼저 보여줍니다 (라벨 예산 최적화)"
+                onClick={async () => {
+                  const r = await api.nextToLabel(project.id, 1)
+                  if (!r.recommended.length) return setMsg('추천할 이미지 없음')
+                  const top = r.recommended[0]
+                  const im = images.find((x) => x.id === top.image_id)
+                  if (im) { openImage(im); setMsg(`추천: ${top.file_name} (라벨 가치 ${top.score})`) }
+                }}>🎯 다음 라벨 추천</button>
+            </div>
             <div className="hint">내보내기 (zip — 바로 학습 가능한 구조)</div>
             <div className="row">
               <a href={api.exportUrl(project.id, 'coco')}>
@@ -306,7 +327,8 @@ export default function App() {
               )}
             </div>
           </div>
-          <TrainPanel trainInfo={trainInfo} approved={approved} onTrigger={async () => {
+          <TrainPanel trainInfo={trainInfo} approved={approved} pid={project.id} onMsg={setMsg}
+            onTrigger={async () => {
             setTrainInfo({ ...trainInfo, job: await api.triggerTrain(project.id) })
           }} />
           <ImageList
@@ -354,6 +376,18 @@ export default function App() {
                 ...d, _key: `auto-${Date.now()}-${i}`, source: 'model' }))])
               setMsg(`오토라벨 ${r.detections.length}개 (${r.engine.split('(')[0]})`)
             }}>이 이미지 오토라벨</button>
+            {trainInfo.active_model && (
+              <button title="전용 모델이 찾았는데 라벨에 없는 박스를 점선으로 보여줍니다 (누락 라벨 찾기)"
+                onClick={async () => {
+                  if (!current) return
+                  setMsg('모델 제안 확인 중…')
+                  const r = await api.suggestions(current.id)
+                  setSuggest(r.missing_labels)
+                  setMsg(r.missing_labels.length
+                    ? `누락 의심 ${r.missing_labels.length}개 — 점선 박스 클릭하면 라벨로 추가됩니다`
+                    : '누락 의심 없음 — 라벨이 모델과 일치합니다')
+                }}>🔍 누락 찾기</button>
+            )}
             <button className="ok" onClick={() => setStatus('approved')} title="승인 후 다음 (A)">✓ 승인</button>
             <button className="bad" onClick={() => setStatus('rejected')} title="거부 후 다음 (X)">✗ 거부</button>
           </div>
@@ -373,6 +407,15 @@ export default function App() {
                 activeClass={activeClass}
                 selectedId={selectedId} setSelectedId={setSelectedId}
                 hoverId={hoverId}
+                suggestions={suggest}
+                onAcceptSuggestion={(s, i) => {
+                  setAnnsDirty([...anns, {
+                    ...s, _key: `sug-${Date.now()}-${i}`, source: 'model',
+                    meta: { applied_from: 'suggestion' },
+                  }])
+                  setSuggest(suggest.filter((_, j) => j !== i))
+                  setMsg('제안 수락 — 라벨로 추가됨')
+                }}
                 onExemplar={async (bbox) => {
                   setMsg('예시로 유사 객체 검색 중…')
                   const r = await api.exemplar(current.id, bbox, activeClass)
@@ -690,7 +733,7 @@ function ModelImport({ project, onMsg }) {
   )
 }
 
-function TrainPanel({ trainInfo, onTrigger, approved = 0 }) {
+function TrainPanel({ trainInfo, onTrigger, approved = 0, pid, onMsg = () => {} }) {
   const { job, active_model } = trainInfo
   const running = job.status === 'running'
   const pct = Math.min(100, (approved / MIN_APPROVED) * 100)
@@ -718,6 +761,47 @@ function TrainPanel({ trainInfo, onTrigger, approved = 0 }) {
           </small>
         )}
       </div>
+      <ModelHistory pid={pid} refreshKey={job.status} onMsg={onMsg} />
+    </div>
+  )
+}
+
+// 학습 라운드별 성능 추이 + 롤백
+function ModelHistory({ pid, refreshKey, onMsg }) {
+  const [models, setModels] = useState([])
+  const [open, setOpen] = useState(false)
+  useEffect(() => {
+    if (open) api.listModels(pid).then(setModels).catch(() => {})
+  }, [open, pid, refreshKey])
+  if (!open) {
+    return <button style={{ marginTop: 6, fontSize: 12, padding: '2px 8px' }}
+      onClick={() => setOpen(true)}>학습 이력 보기</button>
+  }
+  const best = Math.max(...models.map((m) => m.map50 || 0), 0.001)
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="panel-title">학습 이력 ({models.length})</div>
+      {models.map((m) => (
+        <div key={m.id} className="row" style={{ fontSize: 12, gap: 8 }}>
+          <div style={{ width: 60, height: 8, background: 'var(--bg3)', borderRadius: 4 }}>
+            <div style={{ width: `${((m.map50 || 0) / best) * 100}%`, height: '100%',
+              background: m.active ? 'var(--ok)' : '#4a5560', borderRadius: 4 }} />
+          </div>
+          <span style={{ minWidth: 44 }}>{m.map50?.toFixed(3) ?? '—'}</span>
+          <span className="hint" style={{ margin: 0 }}>{m.train_images}장</span>
+          {m.meta?.imported && <span className="hint" style={{ margin: 0 }}>임포트</span>}
+          {m.active
+            ? <span className="ok-text">● 사용 중</span>
+            : <button style={{ padding: '1px 6px', fontSize: 11 }}
+                onClick={async () => {
+                  await api.activateModel(pid, m.id)
+                  setModels(await api.listModels(pid))
+                  onMsg(`모델 #${m.id}로 전환 (mAP50 ${m.map50?.toFixed(3)})`)
+                }}>사용</button>}
+        </div>
+      ))}
+      <button style={{ marginTop: 4, fontSize: 12, padding: '2px 8px' }}
+        onClick={() => setOpen(false)}>닫기</button>
     </div>
   )
 }

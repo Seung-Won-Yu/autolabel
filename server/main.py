@@ -336,6 +336,76 @@ def import_model(pid: int, body: dict):
     return {"ok": True, "names": names}
 
 
+# ---------- 자동 승인 (TBAL) / 일괄 작업 ----------
+
+@app.post("/api/projects/{pid}/auto-approve")
+def auto_approve(pid: int, body: dict):
+    """모든 박스가 임계값 이상인 리뷰 대기 이미지를 자동 승인.
+
+    dry_run=true면 대상만 세어 돌려준다 (승인 전 미리보기).
+    thresholds: {클래스: 최소 confidence} — 없으면 min_conf 일괄 적용.
+    """
+    min_conf = float(body.get("min_conf", 0.7))
+    thresholds = body.get("thresholds") or {}
+    dry = bool(body.get("dry_run", False))
+    require_labeled = bool(body.get("require_labeled", True))
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM images WHERE project_id=? AND status='prelabeled'", (pid,)).fetchall()
+    targets, skipped_lowconf, skipped_empty = [], 0, 0
+    for im in rows:
+        anns = [row_to_dict(a) for a in conn.execute(
+            "SELECT * FROM annotations WHERE image_id=?", (im["id"],))]
+        if not anns:
+            skipped_empty += 1
+            if require_labeled:
+                continue
+        ok = True
+        for a in anns:
+            need = float(thresholds.get(a["class_name"], min_conf))
+            # 사람이 만든 라벨(confidence None)은 통과, 모델 라벨만 임계값 검사
+            if a["confidence"] is not None and a["confidence"] < need:
+                ok = False
+                break
+        if ok:
+            targets.append(im["id"])
+        else:
+            skipped_lowconf += 1
+
+    if not dry and targets:
+        conn.executemany("UPDATE images SET status='approved' WHERE id=?",
+                         [(i,) for i in targets])
+        conn.commit()
+    total = len(rows)
+    conn.close()
+    result = {
+        "pending": total, "approved": len(targets),
+        "skipped_low_confidence": skipped_lowconf, "skipped_no_label": skipped_empty,
+        "coverage": round(len(targets) / total, 3) if total else 0,
+        "dry_run": dry,
+    }
+    if not dry and targets:
+        result["train"] = train.maybe_start_training(pid)
+    return result
+
+
+@app.post("/api/images/bulk-status")
+def bulk_status(body: dict):
+    """선택한 이미지들의 상태를 한 번에 변경."""
+    ids = body["image_ids"]
+    conn = get_db()
+    conn.executemany("UPDATE images SET status=? WHERE id=?",
+                     [(body["status"], i) for i in ids])
+    conn.commit()
+    pid = conn.execute("SELECT project_id FROM images WHERE id=?", (ids[0],)).fetchone()
+    conn.close()
+    trained = None
+    if body["status"] == "approved" and pid:
+        trained = train.maybe_start_training(pid["project_id"])
+    return {"ok": True, "count": len(ids), "train": trained}
+
+
 # ---------- 삭제 ----------
 
 @app.delete("/api/images/{iid}")
@@ -448,6 +518,110 @@ def qa_status(pid: int):
     from server import qa
 
     return qa.job_status(pid)
+
+
+@app.get("/api/images/{iid}/suggestions")
+def suggestions(iid: int, min_conf: float = 0.4):
+    """활성 모델 예측 중 기존 라벨과 겹치지 않는 것 = 누락 의심 제안."""
+    from server.qa import _match
+
+    conn = get_db()
+    im = conn.execute("SELECT * FROM images WHERE id=?", (iid,)).fetchone()
+    proj = conn.execute("SELECT * FROM projects WHERE id=?", (im["project_id"],)).fetchone()
+    labels = [row_to_dict(a) for a in conn.execute(
+        "SELECT * FROM annotations WHERE image_id=?", (iid,))]
+    conn.close()
+
+    student = train.active_model(im["project_id"])
+    if not student:
+        raise HTTPException(400, "활성 전용 모델 없음")
+    ontology = [{**c, "threshold": min_conf} for c in json.loads(proj["ontology"])]
+    preds = ml.detect_student(Image.open(_image_path(iid)).convert("RGB"), student, ontology)
+    _matched, spurious, missing = _match(preds, labels)
+    return {
+        # 모델은 찾았는데 라벨에 없음 → 추가 제안
+        "missing_labels": spurious,
+        # 라벨에 있는데 모델이 못 찾음 → 오라벨 의심(참고용)
+        "model_missed": [{"class_name": a["class_name"], "bbox": a["bbox"]} for a in missing],
+    }
+
+
+@app.post("/api/images/{iid}/apply-suggestions")
+def apply_suggestions(iid: int, body: dict):
+    """제안된 박스들을 실제 라벨로 추가 (라벨 세탁 원클릭)."""
+    conn = get_db()
+    n = 0
+    for s in body["boxes"]:
+        conn.execute(
+            "INSERT INTO annotations (image_id, class_name, bbox, confidence, source, meta) "
+            "VALUES (?,?,?,?,?,?)",
+            (iid, s["class_name"], json.dumps(s["bbox"]), s.get("confidence"),
+             "model", json.dumps({"applied_from": "suggestion"})))
+        n += 1
+    conn.commit()
+    conn.close()
+    return {"ok": True, "added": n}
+
+
+# ---------- 능동 샘플 선별 ----------
+
+@app.get("/api/projects/{pid}/next-to-label")
+def next_to_label(pid: int, n: int = 20):
+    """다음에 라벨할 가치가 높은 이미지 추천.
+
+    점수 = 불확실성(임계값 근처 예측 비율) + 검출 희소성 + 미라벨 우선.
+    모델이 헷갈리는 이미지를 먼저 사람에게 보내 라벨 예산 효율을 높인다.
+    """
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT i.*, "
+        "(SELECT COUNT(*) FROM annotations a WHERE a.image_id=i.id) AS ann_count, "
+        "(SELECT AVG(a.confidence) FROM annotations a WHERE a.image_id=i.id) AS avg_conf, "
+        "(SELECT MIN(a.confidence) FROM annotations a WHERE a.image_id=i.id) AS min_conf "
+        "FROM images i WHERE i.project_id=? AND i.status IN ('unlabeled','prelabeled')",
+        (pid,)).fetchall()
+    conn.close()
+
+    scored = []
+    for r in rows:
+        d = dict(r)
+        score = 0.0
+        if d["ann_count"] == 0:
+            score += 1.0  # 라벨 없는 이미지는 정보량 미지 — 우선
+        if d["min_conf"] is not None:
+            # 0.5 근처가 가장 불확실 (모델이 갈팡질팡)
+            score += 1.5 * (1 - abs(d["min_conf"] - 0.5) * 2)
+        if d["avg_conf"] is not None and d["avg_conf"] < 0.6:
+            score += 0.5
+        if d["qa_score"]:
+            score += min(d["qa_score"] / 5, 1.0)  # 심판 의심도 반영
+        scored.append({"image_id": d["id"], "file_name": d["file_name"],
+                       "score": round(score, 3), "ann_count": d["ann_count"],
+                       "min_conf": d["min_conf"], "status": d["status"]})
+    scored.sort(key=lambda s: -s["score"])
+    return {"total_candidates": len(scored), "recommended": scored[:n]}
+
+
+# ---------- 모델 히스토리 ----------
+
+@app.get("/api/projects/{pid}/models")
+def list_models(pid: int):
+    conn = get_db()
+    rows = [row_to_dict(r) for r in conn.execute(
+        "SELECT * FROM models WHERE project_id=? ORDER BY id DESC", (pid,))]
+    conn.close()
+    return rows
+
+
+@app.post("/api/projects/{pid}/models/{mid}/activate")
+def activate_model(pid: int, mid: int):
+    """이전 모델로 롤백 (성능 회귀 시)."""
+    conn = get_db()
+    conn.execute("UPDATE models SET active=0 WHERE project_id=?", (pid,))
+    conn.execute("UPDATE models SET active=1 WHERE id=? AND project_id=?", (mid, pid))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 # ---------- 파인튜닝 ----------
