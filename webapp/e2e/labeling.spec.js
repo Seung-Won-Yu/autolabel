@@ -235,6 +235,106 @@ test('Shift/⌘ 다중 선택으로 일괄 승인한다', async ({ page }) => {
   await expect(page.locator('.ilist li.picked')).toHaveCount(0)
 })
 
+test('목록은 보이는 구간만 DOM에 올린다 (창 렌더링)', async ({ page }) => {
+  // 예전엔 전부 올려서 310장이면 노드 2364개(행당 7개)였다. 1만 장이면
+  // 7만 개가 되어 못 버틴다. 스크롤바 높이와 구간 계산이 맞아야 한다.
+  const N = 60
+  const { id, name } = await newProject(page, 'window', ONE_CLASS)
+  for (let i = 0; i < N; i++) await uploadImage(page, id, `w${i}.png`)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+
+  const rows = page.locator('.ilist li')
+  const rendered = await rows.count()
+  expect(rendered, '전부 올리면 창 렌더링이 아니다').toBeLessThan(N)
+  expect(rendered, '화면을 채울 만큼은 있어야 한다').toBeGreaterThan(5)
+
+  // 스크롤 가능 높이는 전체 장수 × 행 높이여야 한다 (스크롤바가 정직해야 한다)
+  const geom = await page.evaluate(() => {
+    const sc = document.querySelector('.ilist')
+    return { scrollHeight: sc.scrollHeight, rowH: sc.querySelector('li').offsetHeight }
+  })
+  expect(geom.scrollHeight).toBe(N * geom.rowH)
+
+  // 끝까지 스크롤하면 마지막 이미지가 렌더돼야 한다
+  await page.evaluate(() => {
+    const sc = document.querySelector('.ilist')
+    sc.scrollTop = sc.scrollHeight
+  })
+  await expect(page.locator('.ilist li').last()).toContainText(`w${N - 1}.png`)
+})
+
+test('창 렌더링에서도 현재 이미지가 목록에 남는다', async ({ page }) => {
+  // 화면 밖 행은 DOM에 없으므로 scrollIntoView를 쓸 수 없다 — 위치를 직접
+  // 계산해 스크롤하고 상태도 같이 맞춰야, 연속 이동에서 창이 뒤처지지 않는다.
+  const { id, name } = await newProject(page, 'follow-window', ONE_CLASS)
+  for (let i = 0; i < 40; i++) await uploadImage(page, id, `f${i}.png`)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+  for (let i = 0; i < 30; i++) await page.keyboard.press('ArrowRight')
+
+  await expect(page.locator('.imagelist .hint')).toContainText('31 / 40')
+  await expect(page.locator('.ilist li.active')).toHaveCount(1)
+  const visible = await page.evaluate(() => {
+    const sc = document.querySelector('.ilist')
+    const b = sc.querySelector('li.active').getBoundingClientRect()
+    const box = sc.getBoundingClientRect()
+    return b.top >= box.top - 1 && b.bottom <= box.bottom + 1
+  })
+  expect(visible, '현재 이미지가 목록 안에 보여야 한다').toBe(true)
+})
+
+test('선택한 박스는 화살표로 1px씩 옮긴다', async ({ page }) => {
+  // 마우스로는 1px을 맞출 수 없어 박스가 늘 어긋난다. 박스를 고른 동안만
+  // 화살표가 미세조정이 되고, Escape로 다시 이미지 이동으로 돌아간다.
+  const { id, name } = await newProject(page, 'nudge', ONE_CLASS)
+  const iid = await uploadImage(page, id)
+  await page.request.put(`${API}/images/${iid}/annotations`, {
+    data: { annotations: [{ class_name: 'sig', bbox: [10, 20, 30, 40], source: 'human' }] },
+  })
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  // 행 가운데는 클래스 드롭다운이다 — 번호를 눌러 박스만 선택한다
+  await page.locator('.annrow .annidx').first().click()
+  await expect(page.locator('.annrow.active')).toHaveCount(1)
+
+  await page.keyboard.press('ArrowRight')
+  await page.keyboard.press('ArrowDown')
+  await page.keyboard.press('Shift+ArrowRight')
+
+  await expect.poll(async () => {
+    const r = await page.request.get(`${API}/images/${iid}/annotations`)
+    return (await r.json())[0].bbox
+  }, { timeout: 10_000 }).toEqual([21, 21, 30, 40])  // x +1 +10, y +1
+})
+
+test('거부한 이미지는 익스포트에서 빠지고 필터로 찾을 수 있다', async ({ page }) => {
+  const { id, name } = await newProject(page, 'reject', ONE_CLASS)
+  const keep = await uploadImage(page, id, 'keep.png')
+  const drop = await uploadImage(page, id, 'drop.png')
+  for (const iid of [keep, drop]) {
+    await page.request.put(`${API}/images/${iid}/annotations`, {
+      data: { annotations: [{ class_name: 'sig', bbox: [1, 2, 3, 4], source: 'human' }] },
+    })
+  }
+  await page.request.post(`${API}/images/bulk-status`,
+    { data: { image_ids: [drop], status: 'rejected' } })
+
+  const coco = await (await page.request.get(`${API}/projects/${id}/export?fmt=coco`)).json()
+  expect(coco.images.map((i) => i.id)).toEqual([keep])
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await page.locator('.filters button', { hasText: '거부' }).click()
+  await expect(page.locator('.ilist li')).toHaveCount(1)
+  await expect(page.locator('.ilist li').first()).toContainText('drop.png')
+})
+
 test('목록 썸네일은 원본이 아니라 축소본을 받는다', async ({ page }) => {
   // 예전엔 원본을 그대로 받아 44x44로 줄여 그렸다 (143장 = 9.3MB)
   const { id, name } = await newProject(page, 'thumb', ONE_CLASS)

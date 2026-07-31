@@ -681,8 +681,21 @@ def download_model(pid: int):
 
 # ---------- zip 익스포트 (바로 학습 가능한 구조) ----------
 
+def _exportable_images(conn, pid: int, include_rejected: bool):
+    """익스포트 대상 이미지.
+
+    거부(rejected)는 "이 데이터는 쓰지 말라"는 표시다. 그런데 익스포트가
+    상태를 보지 않아 거부한 이미지가 학습셋에 그대로 실려 나갔다.
+    되살릴 필요가 있으면 include_rejected=1로 명시해야 한다.
+    """
+    if include_rejected:
+        return conn.execute("SELECT * FROM images WHERE project_id=?", (pid,)).fetchall()
+    return conn.execute(
+        "SELECT * FROM images WHERE project_id=? AND status!='rejected'", (pid,)).fetchall()
+
+
 @app.get("/api/projects/{pid}/export.zip")
-def export_zip(pid: int, fmt: str = "yolo"):
+def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
     import io as _io
     import zipfile
 
@@ -693,7 +706,7 @@ def export_zip(pid: int, fmt: str = "yolo"):
     ontology = json.loads(proj["ontology"])
     names = [c["name"] for c in ontology]
     cls_id = {n: i for i, n in enumerate(names)}
-    images = conn.execute("SELECT * FROM images WHERE project_id=?", (pid,)).fetchall()
+    images = _exportable_images(conn, pid, include_rejected)
 
     buf = _io.BytesIO()
     missing = 0  # 원본이 사라진 이미지 — 헤더로 알린다 (조용한 빈 zip 방지)
@@ -721,7 +734,7 @@ def export_zip(pid: int, fmt: str = "yolo"):
                         f"{w / im['width']:.6f} {h / im['height']:.6f}")
                 z.writestr(f"labels/{Path(fname).stem}.txt", "\n".join(lines))
         else:  # coco
-            coco = export(pid, fmt="coco")
+            coco = export(pid, fmt="coco", include_rejected=include_rejected)
             # 여러 폴더를 한 프로젝트로 임포트하면 동명 파일이 생긴다. zip 안에서
             # 덮어쓰이지 않게 id를 붙이고, json의 file_name도 같이 맞춘다.
             for entry in coco.get("images", []):
@@ -1005,12 +1018,12 @@ def train_status(pid: int):
 # ---------- 익스포트 ----------
 
 @app.get("/api/projects/{pid}/export")
-def export(pid: int, fmt: str = "coco"):
+def export(pid: int, fmt: str = "coco", include_rejected: bool = False):
     conn = get_db()
     proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
     ontology = json.loads(proj["ontology"])
     cat_id = {c["name"]: i + 1 for i, c in enumerate(ontology)}
-    images = conn.execute("SELECT * FROM images WHERE project_id=?", (pid,)).fetchall()
+    images = _exportable_images(conn, pid, include_rejected)
 
     if fmt == "coco":
         out = {

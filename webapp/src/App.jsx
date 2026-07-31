@@ -167,9 +167,28 @@ export default function App() {
   // 전역 핫키
   useEffect(() => {
     const h = (e) => {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+      // SELECT도 제외한다 — 클래스 드롭다운을 열고 화살표로 고르는 중이면
+      // 그 입력이지 박스 미세조정이 아니다
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return
       if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) { e.preventDefault(); undo(); return }
-      if (e.key === 'Escape' && showHelp) { setShowHelp(false); return }
+      if (e.key === 'Escape') {
+        if (showHelp) setShowHelp(false)
+        else if (selectedId) setSelectedId(null)  // 선택 해제 = 화살표를 이미지 이동으로 되돌림
+        return
+      }
+      // 박스를 선택한 상태의 화살표는 박스 미세조정이다 (Shift로 10px).
+      // 마우스로는 1px을 맞출 수 없어 박스가 늘 어긋난다.
+      const NUDGE = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }
+      if (selectedId && NUDGE[e.key]) {
+        e.preventDefault()
+        const [dx, dy] = NUDGE[e.key]
+        const step = e.shiftKey ? 10 : 1
+        setAnnsDirty(anns.map((a) => (a._key === selectedId
+          ? { ...a, bbox: [a.bbox[0] + dx * step, a.bbox[1] + dy * step, a.bbox[2], a.bbox[3]],
+            source: 'human' }
+          : a)))
+        return
+      }
       if (e.key === 'ArrowRight') moveImage(1)
       else if (e.key === 'ArrowLeft') moveImage(-1)
       else if (e.key === 'a' || e.key === 'A') setStatus('approved')
@@ -645,7 +664,12 @@ function AnnPanel({ anns, ontology, selectedId, setSelectedId, hoverId, setHover
       {shown.map((a, i) => (
         <div key={a._key} data-key={a._key}
           className={`annrow ${selectedId === a._key ? 'active' : ''} ${hoverId === a._key ? 'hovered' : ''}`}
-          onClick={() => setSelectedId(a._key)}
+          // 행을 누르면 클래스 드롭다운에 포커스가 남아 화살표를 그쪽이 먹는다.
+          // 박스를 고른 뒤 바로 화살표로 미세조정할 수 있어야 한다.
+          onClick={(e) => {
+            setSelectedId(a._key)
+            if (e.target.tagName === 'SELECT') e.target.blur()
+          }}
           onMouseEnter={() => setHoverId(a._key)}
           onMouseLeave={() => setHoverId(null)}>
           <span className="annidx">{i + 1}</span>
@@ -667,6 +691,7 @@ function HelpOverlay({ onClose }) {
     ['A / X', '승인 / 거부 후 다음 이미지'], ['← →', '이미지 이동'],
     ['B / M / E', '박스 / SAM 클릭 / 예시 찾기'], ['1~9', '클래스 선택 (박스 선택 중이면 재할당)'],
     ['Del', '선택 박스 삭제'], ['Cmd+Z', '실행 취소'], ['S', '저장'],
+    ['박스 선택 중 ← →↑↓', '박스 1px 이동 (Shift로 10px)'], ['Esc', '선택 해제'],
     ['SAM: 클릭', '새 객체 (이전 자동 확정)'], ['SAM: Shift+클릭', '현재 객체 정제(포함)'],
     ['SAM: 우클릭', '제외 포인트'], ['SAM: Enter / Esc', '확정 / 취소'],
     ['휠 / Alt+드래그', '줌 / 팬'], ['+ / − / 0', '확대 / 축소 / 화면에 맞춤'],
@@ -1067,11 +1092,47 @@ function ModelHistory({ pid, refreshKey, onMsg }) {
   )
 }
 
+// 목록 행 높이 — 창 렌더링이 스크롤 위치로 구간을 계산하므로 CSS의
+// `.ilist li` 높이와 반드시 같아야 한다 (index.css 참조).
+const ROW_H = 54
+
 function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setSortMode,
   onDelete, onBulk }) {
   const badge = { unlabeled: '·', prelabeled: '◐', approved: '✓', rejected: '✗' }
-  const activeRow = useRef(null)
   const pos = visible.findIndex((im) => im.id === current?.id)
+
+  // 창 렌더링 — 보이는 구간만 DOM에 올린다. 예전엔 전부 올려서 310장이면
+  // 노드 2364개(행당 7개)였고, 1만 장이면 7만 개가 되어 못 버틴다.
+  // 행 높이가 CSS로 고정(ROW_H)이라 스크롤 위치만으로 구간을 계산할 수 있다.
+  const listRef = useRef(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewH, setViewH] = useState(600)
+  useEffect(() => {
+    const el = listRef.current
+    if (!el) return
+    const ro = new ResizeObserver(([e]) => setViewH(e.contentRect.height))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  const OVERSCAN = 6  // 위아래 여유 — 빠르게 스크롤할 때 빈칸이 보이지 않게
+  const start = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN)
+  const end = Math.min(visible.length, Math.ceil((scrollTop + viewH) / ROW_H) + OVERSCAN)
+  const window_ = visible.slice(start, end)
+
+  // 현재 이미지를 보이게 스크롤. 창 렌더링에서는 scrollIntoView를 쓸 수 없다 —
+  // 화면 밖 행은 DOM에 없기 때문이다. 위치를 직접 계산한다.
+  useEffect(() => {
+    const el = listRef.current
+    if (!el || pos < 0) return
+    const top = pos * ROW_H
+    if (top < el.scrollTop) el.scrollTop = top
+    else if (top + ROW_H > el.scrollTop + el.clientHeight) {
+      el.scrollTop = top + ROW_H - el.clientHeight
+    }
+    // 상태도 직접 맞춘다. scroll 이벤트만 믿으면 연속 이동에서 상태가 뒤처져
+    // 창이 원래 자리에 머물고 현재 행이 DOM에 없는 일이 생긴다.
+    setScrollTop(el.scrollTop)
+  }, [pos])
   // 다중 선택 — Shift=범위, Cmd/Ctrl=토글 (파일 목록의 표준 관례)
   const [picked, setPicked] = useState(new Set())
   const anchor = useRef(null)
@@ -1102,18 +1163,16 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
     setPicked(new Set())
   }
 
-  // A/X·←→로 넘어갈 때 목록이 따라오게 한다. 안 그러면 143장을 리뷰하는 동안
-  // 현재 이미지가 목록 밖으로 밀려나 내가 어디쯤인지 알 수 없다.
-  useEffect(() => {
-    activeRow.current?.scrollIntoView({ block: 'nearest' })
-  }, [current?.id])
 
   return (
     <div className="imagelist">
       <div className="row filters">
-        {['all', 'prelabeled', 'approved', 'unlabeled'].map((f) => (
-          <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}>
-            {{ all: '전체', prelabeled: '리뷰 대기', approved: '승인', unlabeled: '미라벨' }[f]}
+        {/* 거부도 필터에 둔다 — 예전엔 '전체'에서만 보여 되살릴 방법이 없었다 */}
+        {['all', 'prelabeled', 'approved', 'unlabeled', 'rejected'].map((f) => (
+          <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}
+            title={f === 'rejected' ? '거부한 이미지 — 익스포트에서 제외됩니다' : undefined}>
+            {{ all: '전체', prelabeled: '리뷰 대기', approved: '승인',
+              unlabeled: '미라벨', rejected: '거부' }[f]}
           </button>
         ))}
         <button className={sortMode === 'conf' ? 'active' : ''}
@@ -1134,11 +1193,17 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
           {' · ←→ 이동 · Shift/⌘+클릭 다중 선택'}
         </div>
       )}
-      <ul className="ilist">
-        {visible.map((im, i) => (
-          <li key={im.id}
+      {/* 스크롤러(div) 안에 전체 높이만큼의 ul을 두고 보이는 행만 절대 위치로
+          얹는다. 스크롤 컨테이너에 패딩을 주는 방식은 패딩 변화가 다시 스크롤
+          위치를 흔들어 구간 계산이 어긋났다. */}
+      <div className="ilist" ref={listRef}
+        onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}>
+        <ul className="ilist-inner" style={{ height: visible.length * ROW_H }}>
+        {window_.map((im, wi) => {
+          const i = start + wi
+          return (
+          <li key={im.id} style={{ top: i * ROW_H }}
             className={`${current?.id === im.id ? 'active' : ''}${picked.has(im.id) ? ' picked' : ''}`}
-            ref={current?.id === im.id ? activeRow : null}
             onClick={(e) => onRowClick(im, i, e)}>
             <img src={api.thumbUrl(im.id)} loading="lazy" alt="" width="44" height="44" />
             <div className="meta">
@@ -1153,8 +1218,10 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
             <button className="x rowdel" title="이미지 삭제"
               onClick={(e) => { e.stopPropagation(); onDelete(im) }}>×</button>
           </li>
-        ))}
-      </ul>
+          )
+        })}
+        </ul>
+      </div>
     </div>
   )
 }

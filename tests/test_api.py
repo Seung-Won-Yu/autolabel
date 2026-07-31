@@ -164,6 +164,41 @@ def test_acceptance_plan_and_result(client, make_image, tmp_path):
     assert res["accepted"] and res["approved_images"] == 40
 
 
+def test_rejected_images_are_excluded_from_export(client, make_image, tmp_path):
+    """거부 = "이 데이터는 쓰지 말라". 그런데 익스포트가 상태를 안 봤다.
+
+    학습은 status='approved'만 쓰므로 안전했지만, 익스포트한 zip에는 거부한
+    이미지와 라벨이 그대로 실려 나갔다.
+    """
+    pid = _project(client, "reject")
+    ids = []
+    for i in range(2):
+        img = make_image(tmp_path / "rej", f"{i}.jpg")
+        with open(img, "rb") as f:
+            iid = client.post(f"/api/projects/{pid}/images",
+                              files=[("files", (f"{i}.jpg", f, "image/jpeg"))]).json()["saved"][0]
+        client.put(f"/api/images/{iid}/annotations", json={"annotations": [
+            {"class_name": "person", "bbox": [1, 2, 3, 4], "source": "human"}]})
+        ids.append(iid)
+
+    client.post("/api/images/bulk-status", json={"image_ids": [ids[0]], "status": "rejected"})
+
+    coco = client.get(f"/api/projects/{pid}/export?fmt=coco").json()
+    assert [i["id"] for i in coco["images"]] == [ids[1]], coco["images"]
+    assert len(coco["annotations"]) == 1
+
+    z = zipfile.ZipFile(io.BytesIO(
+        client.get(f"/api/projects/{pid}/export.zip?fmt=yolo").content))
+    names = z.namelist()
+    assert not any(f"{ids[0]}_" in n for n in names), names
+    assert any(f"{ids[1]}_" in n for n in names), names
+
+    # 되살릴 필요가 있으면 명시해서 포함할 수 있다
+    all_coco = client.get(
+        f"/api/projects/{pid}/export?fmt=coco&include_rejected=true").json()
+    assert len(all_coco["images"]) == 2
+
+
 def test_thumb_is_small_and_cached(client, make_image, tmp_path):
     """목록 썸네일은 원본보다 훨씬 작아야 한다.
 
