@@ -34,11 +34,23 @@ export default function App() {
   // 갱신되지 않았다.
   const canvasHost = useRef(null)
   const [canvasSize, setCanvasSize] = useState({ w: 900, h: 640 })
+  // 승인/거부는 비동기라 연타하면 다음 호출이 낡은 클로저의 current를 읽어
+  // 같은 이미지를 두 번 처리하고 나머지를 건너뛴다 (실측: a 5연타 → 2장만
+  // 승인). 최신 값을 ref로 들고, 작업을 프라미스 체인으로 직렬화한다.
+  const currentRef = useRef(null)
+  const annsRef = useRef([])
+  const visibleRef = useRef([])
+  const imagesRef = useRef([])
+  const queue = useRef(Promise.resolve())
 
   // 화면에 보이는 목록(필터·정렬 적용) — 이동(←→)도 이 순서를 따른다
   let visible = filter === 'all' ? images : images.filter((im) => im.status === filter)
   if (sortMode === 'conf') visible = [...visible].sort((a, b) => (a.min_conf ?? 2) - (b.min_conf ?? 2))
   else if (sortMode === 'qa') visible = [...visible].sort((a, b) => (b.qa_score ?? -1) - (a.qa_score ?? -1))
+  visibleRef.current = visible
+  imagesRef.current = images
+  currentRef.current = current
+  annsRef.current = anns
 
   // 읽고 판단해야 하는 안내(배치 진단·심판 결과)는 3초 만에 사라지면 안 된다.
   // sticky는 사용자가 닫을 때까지 남는다.
@@ -92,17 +104,23 @@ export default function App() {
   }, [setMsg])
 
   const openImage = useCallback(async (im) => {
-    if (dirty.current && current) await saveAnns(current.id, anns)
+    const cur = currentRef.current
+    if (dirty.current && cur) await saveAnns(cur.id, annsRef.current)
     resetEmbed()
+    // ref를 즉시 갱신한다 — 리렌더를 기다리면 연속 처리에서 다음 호출이
+    // 아직 이전 이미지를 현재로 보고 같은 것을 또 처리한다
+    currentRef.current = im
     setCurrent(im)
     const list = await api.getAnnotations(im.id)
-    setAnns(list.map((a) => ({ ...a, _key: `db-${a.id}` })))
+    const mapped = list.map((a) => ({ ...a, _key: `db-${a.id}` }))
+    annsRef.current = mapped
+    setAnns(mapped)
     setSelectedId(null)
     setSuggest([])
     dirty.current = false
-    undoStack.current = []
+    // 이력은 지우지 않는다 — 이미지를 넘긴 뒤에도 되돌릴 수 있어야 한다
     ensureEmbed(im.id).catch(() => {})
-  }, [current, anns, saveAnns])
+  }, [saveAnns])
 
   // 이미지가 처음 생기면 자동으로 연다. 프로젝트를 열 때만 열면, 임포트나
   // 업로드로 이미지를 넣은 직후 "좌측에서 이미지를 선택하세요"에 멈춰 있고
@@ -126,25 +144,65 @@ export default function App() {
     return () => ro.disconnect()
   }, [current?.id])
 
-  // 모든 어노테이션 변경은 이 함수로 — 언두 스택 자동 축적
+  // 되돌리기 이력은 이미지별이 아니라 프로젝트 단위 액션 로그다.
+  // 예전엔 이미지를 넘기면 초기화돼서, A로 빠르게 리뷰하다 오승인하면
+  // 복구할 방법이 아예 없었다 (되돌릴 수 없는 유일한 파괴적 동작).
+  const pushHistory = useCallback((entry) => {
+    undoStack.current.push(entry)
+    if (undoStack.current.length > 100) undoStack.current.shift()
+  }, [])
+
   const setAnnsDirty = useCallback((next) => {
-    undoStack.current.push(anns)
-    if (undoStack.current.length > 50) undoStack.current.shift()
+    const cur = currentRef.current
+    if (cur) pushHistory({ kind: 'anns', imageId: cur.id, before: annsRef.current })
     dirty.current = true
+    annsRef.current = next
     setAnns(next)
-  }, [anns])
+  }, [pushHistory])
 
+  const undoOnce = useCallback(async () => {
+    const entry = undoStack.current.pop()
+    if (!entry) return setMsg('되돌릴 작업이 없습니다')
+    const target = imagesRef.current.find((im) => im.id === entry.imageId)
+    const label = target?.file_name ? ` (${target.file_name})` : ''
+
+    if (entry.kind === 'status') {
+      await api.setImageStatus(entry.imageId, entry.before)
+      setImages((imgs) => imgs.map((im) => (
+        im.id === entry.imageId ? { ...im, status: entry.before } : im)))
+      if (target && currentRef.current?.id !== entry.imageId) await openImage(target)
+      return setMsg(`${entry.was === 'approved' ? '승인' : '거부'} 취소${label}`)
+    }
+    // 어노테이션 되돌리기 — 다른 이미지 것이면 그 이미지로 이동한 뒤 적용한다
+    if (currentRef.current?.id !== entry.imageId) {
+      if (!target) return setMsg('되돌릴 이미지를 찾을 수 없습니다')
+      await openImage(target)
+    }
+    dirty.current = true
+    annsRef.current = entry.before
+    setAnns(entry.before)
+    setSelectedId(null)
+    await saveAnns(entry.imageId, entry.before)
+    setMsg(`실행 취소${label}`)
+  }, [openImage, saveAnns, setMsg])
+
+  // 되돌리기도 승인과 같은 큐에 태운다 — 처리 중에 끼어들면 이력과 실제
+  // 상태가 어긋난다
   const undo = useCallback(() => {
-    const prev = undoStack.current.pop()
-    if (prev) { dirty.current = true; setAnns(prev); setSelectedId(null); setMsg('실행 취소') }
-  }, [setMsg])
+    queue.current = queue.current.then(undoOnce).catch(
+      (e) => setMsg(`되돌리기 실패: ${e.message}`))
+    return queue.current
+  }, [undoOnce, setMsg])
 
+  // ref로 최신 목록·현재 이미지를 읽는다 — 연타 중 낡은 클로저를 보지 않게
   const moveImage = useCallback((delta) => {
-    if (!current || !visible.length) return
-    const i = visible.findIndex((im) => im.id === current.id)
-    const next = visible[i + delta] || (i === -1 ? visible[0] : null)
-    if (next) openImage(next)
-  }, [current, visible, openImage])
+    const list = visibleRef.current
+    const cur = currentRef.current
+    if (!cur || !list.length) return Promise.resolve()
+    const i = list.findIndex((im) => im.id === cur.id)
+    const next = list[i + delta] || (i === -1 ? list[0] : null)
+    return next ? openImage(next) : Promise.resolve()
+  }, [openImage])
 
   // 자동 저장 — 수정 후 2초 조용하면 저장 (S 강제도 여전히 가능)
   useEffect(() => {
@@ -155,14 +213,23 @@ export default function App() {
     return () => clearTimeout(t)
   }, [anns, current, saveAnns])
 
-  const setStatus = useCallback(async (status) => {
-    if (!current) return
-    await saveAnns(current.id, anns)
-    await api.setImageStatus(current.id, status)
-    setImages((imgs) => imgs.map((im) => (im.id === current.id ? { ...im, status } : im)))
-    setMsg(status === 'approved' ? '승인 → 다음 이미지' : '거부 → 다음 이미지')
-    moveImage(1)
-  }, [current, anns, saveAnns, moveImage, setMsg])
+  // 연타해도 한 건도 잃지 않게 프라미스 체인으로 직렬화한다.
+  // 예전엔 각 호출이 낡은 클로저의 current를 읽어 같은 이미지를 두 번
+  // 처리하고 나머지를 건너뛰었다 (실측: a 5연타 → 2장만 승인).
+  const setStatus = useCallback((status) => {
+    queue.current = queue.current.then(async () => {
+      const cur = currentRef.current
+      if (!cur) return
+      await saveAnns(cur.id, annsRef.current)
+      // 되돌릴 수 있게 이전 상태를 남긴다 — 오승인 복구의 유일한 경로
+      pushHistory({ kind: 'status', imageId: cur.id, before: cur.status, was: status })
+      await api.setImageStatus(cur.id, status)
+      setImages((imgs) => imgs.map((im) => (im.id === cur.id ? { ...im, status } : im)))
+      setMsg(`${status === 'approved' ? '승인' : '거부'} → 다음 이미지 · Cmd+Z로 취소`)
+      await moveImage(1)
+    }).catch((e) => setMsg(`상태 변경 실패: ${e.message}`))
+    return queue.current
+  }, [saveAnns, moveImage, setMsg, pushHistory])
 
   // 전역 핫키
   useEffect(() => {

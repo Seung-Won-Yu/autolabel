@@ -313,6 +313,80 @@ test('선택한 박스는 화살표로 1px씩 옮긴다', async ({ page }) => {
   }, { timeout: 10_000 }).toEqual([21, 21, 30, 40])  // x +1 +10, y +1
 })
 
+test('A를 연타해도 승인이 유실되지 않는다', async ({ page }) => {
+  // 리뷰 핵심 루프의 조용한 데이터 유실이었다. setStatus가 비동기인데 각
+  // 호출이 낡은 클로저의 current를 읽어 같은 이미지를 두 번 처리하고 나머지를
+  // 건너뛰었다 (실측: a 5연타 → 2장만 승인, 400ms 간격 10회에도 7장).
+  const N = 8
+  const { id, name } = await newProject(page, 'rapid', ONE_CLASS)
+  for (let i = 0; i < N; i++) await uploadImage(page, id, `r${i}.png`)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+
+  for (let i = 0; i < N; i++) await page.keyboard.press('a')   // 대기 없이 연타
+
+  await expect.poll(async () => {
+    const r = await page.request.get(`${API}/projects/${id}/images`)
+    return (await r.json()).filter((im) => im.status === 'approved').length
+  }, { timeout: 15_000 }).toBe(N)
+})
+
+test('승인을 되돌리면 그 이미지로 돌아가 상태가 복구된다', async ({ page }) => {
+  // 되돌릴 수 없는 유일한 파괴적 동작이었다. 이력이 이미지별이라 넘기면
+  // 초기화됐고, A로 빠르게 리뷰하다 오승인하면 복구 경로가 아예 없었다.
+  const { id, name } = await newProject(page, 'undo-status', ONE_CLASS)
+  for (let i = 0; i < 4; i++) await uploadImage(page, id, `u${i}.png`)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+
+  const firstName = await page.locator('.ilist li.active .name').innerText()
+  for (let i = 0; i < 3; i++) await page.keyboard.press('a')
+  await expect(page.getByText('3/4 승인')).toBeVisible()
+
+  await page.keyboard.press('ControlOrMeta+z')
+  await expect(page.getByText('2/4 승인')).toBeVisible()
+  await page.keyboard.press('ControlOrMeta+z')
+  await page.keyboard.press('ControlOrMeta+z')
+  await expect(page.getByText('0/4 승인')).toBeVisible()
+  // 마지막 되돌리기는 첫 이미지로 돌아가야 한다
+  await expect(page.locator('.ilist li.active .name')).toHaveText(firstName)
+
+  await page.keyboard.press('ControlOrMeta+z')
+  await expect(page.getByText('되돌릴 작업이 없습니다')).toBeVisible()
+})
+
+test('이미지를 넘긴 뒤에도 어노테이션을 되돌린다', async ({ page }) => {
+  const { id, name } = await newProject(page, 'undo-anns', ONE_CLASS)
+  const first = await uploadImage(page, id, 'a.png')
+  await uploadImage(page, id, 'b.png')
+  await uploadImage(page, id, 'c.png')
+  await page.request.put(`${API}/images/${first}/annotations`, {
+    data: { annotations: [
+      { class_name: 'sig', bbox: [1, 2, 3, 4], source: 'human' },
+      { class_name: 'sig', bbox: [5, 6, 7, 8], source: 'human' },
+    ] },
+  })
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('.annrow')).toHaveCount(2)
+
+  await page.locator('.annrow .x').first().click()   // 하나 삭제
+  await expect(page.locator('.annrow')).toHaveCount(1)
+  for (let i = 0; i < 2; i++) await page.keyboard.press('ArrowRight')  // 두 장 이동
+
+  await page.keyboard.press('ControlOrMeta+z')
+  await expect(page.locator('.annrow')).toHaveCount(2)   // 원래 이미지로 돌아와 복구
+  await expect.poll(async () => {
+    const r = await page.request.get(`${API}/images/${first}/annotations`)
+    return (await r.json()).length
+  }, { timeout: 10_000 }).toBe(2)                        // DB에도 반영
+})
+
 test('거부한 이미지는 익스포트에서 빠지고 필터로 찾을 수 있다', async ({ page }) => {
   const { id, name } = await newProject(page, 'reject', ONE_CLASS)
   const keep = await uploadImage(page, id, 'keep.png')
