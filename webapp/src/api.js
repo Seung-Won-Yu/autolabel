@@ -26,6 +26,8 @@ export const api = {
   },
   listImages: (id) => fetch(`/api/projects/${id}/images`).then(j),
   imageUrl: (iid) => `/api/images/${iid}/file`,
+  // 목록 썸네일은 원본을 받아 줄이면 안 된다 (143장 = 9.3MB)
+  thumbUrl: (iid, size = 96) => `/api/images/${iid}/thumb?size=${size}`,
   getAnnotations: (iid) => fetch(`/api/images/${iid}/annotations`).then(j),
   saveAnnotations: (iid, annotations) =>
     fetch(`/api/images/${iid}/annotations`, {
@@ -91,6 +93,11 @@ export const api = {
     fetch(`/api/projects/${pid}/acceptance-result`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+    }).then(j),
+  bulkStatus: (imageIds, status) =>
+    fetch('/api/images/bulk-status', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_ids: imageIds, status }),
     }).then(j),
   promptLab: (pid, body) =>
     fetch(`/api/projects/${pid}/prompt-lab`, {

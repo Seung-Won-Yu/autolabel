@@ -17,7 +17,7 @@ models/
 !release/*.pt
 !release/*.onnx
 
-# 데이터·DB·학습 산출물
+# 데이터·DB·학습 산출물 (썸네일 캐시 data/thumbs 포함)
 data/
 autolabel.db
 output/

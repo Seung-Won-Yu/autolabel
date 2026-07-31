@@ -171,6 +171,34 @@ def image_file(iid: int):
     return FileResponse(_image_path(iid))
 
 
+THUMB_DIR = DATA_DIR.parent / "thumbs"
+THUMB_MAX = 128  # 목록 썸네일은 44px로 표시 — 레티나 여유까지 이 정도면 충분
+
+
+@app.get("/api/images/{iid}/thumb")
+def image_thumb(iid: int, size: int = 96):
+    """목록용 축소 이미지. 디스크에 캐시한다.
+
+    예전엔 목록이 원본을 그대로 받아 44x44로 줄여 그렸다. signature 143장은
+    스크롤 한 번에 9.3MB, 2MB 사진 1만 장이면 20GB를 썸네일 표시에만 쓴다.
+    """
+    size = max(32, min(size, THUMB_MAX))
+    src = _image_path(iid)
+    if not src.exists():
+        raise HTTPException(404, "원본 이미지 없음")
+    THUMB_DIR.mkdir(parents=True, exist_ok=True)
+    out = THUMB_DIR / f"{iid}_{size}.jpg"
+    # 원본이 바뀌면(재임포트 등) 다시 만든다
+    if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+        im = Image.open(src)
+        im.draft("RGB", (size * 2, size * 2))  # JPEG는 디코딩부터 축소해 훨씬 빠르다
+        im = im.convert("RGB")
+        im.thumbnail((size, size))
+        im.save(out, "JPEG", quality=72)
+    return FileResponse(out, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.put("/api/images/{iid}/status")
 def set_image_status(iid: int, body: dict):
     conn = get_db()

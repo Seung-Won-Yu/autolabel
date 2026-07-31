@@ -164,6 +164,37 @@ def test_acceptance_plan_and_result(client, make_image, tmp_path):
     assert res["accepted"] and res["approved_images"] == 40
 
 
+def test_thumb_is_small_and_cached(client, make_image, tmp_path):
+    """목록 썸네일은 원본보다 훨씬 작아야 한다.
+
+    예전엔 목록이 원본을 그대로 받아 44x44로 줄여 그렸다 — signature 143장은
+    스크롤 한 번에 9.3MB, 2MB 사진 1만 장이면 20GB를 썸네일에만 쓴다.
+    """
+    pid = _project(client, "thumb")
+    img = make_image(tmp_path / "th", "big.jpg", size=(1600, 1200))
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("big.jpg", f, "image/jpeg"))]).json()["saved"][0]
+
+    r = client.get(f"/api/images/{iid}/thumb")
+    assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
+    full = client.get(f"/api/images/{iid}/file")
+    assert len(r.content) < len(full.content) / 4, (len(r.content), len(full.content))
+    assert "max-age" in r.headers.get("cache-control", "")
+
+    # 실제로 요청한 크기 안에 들어와야 한다
+    from PIL import Image as PILImage
+    w, h = PILImage.open(io.BytesIO(r.content)).size
+    assert max(w, h) <= 96, (w, h)
+    # 상한을 넘겨 요청해도 THUMB_MAX로 잘린다 (원본을 되돌려주면 의미가 없다)
+    big = client.get(f"/api/images/{iid}/thumb?size=9999")
+    w2, h2 = PILImage.open(io.BytesIO(big.content)).size
+    assert max(w2, h2) <= 128, (w2, h2)
+
+    # 두 번째 요청은 캐시 파일에서 나와야 한다 (내용 동일)
+    assert client.get(f"/api/images/{iid}/thumb").content == r.content
+
+
 def test_prompt_lab_rejects_empty_input(client, make_image, tmp_path):
     """프롬프트 실험은 비교 대상이 있어야 한다."""
     pid = _project(client, "lab")

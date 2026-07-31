@@ -145,6 +145,14 @@ kbd {
 .ilist li:hover .rowdel, .plist li:hover .rowdel { visibility: visible; }
 .plist li { display: flex; align-items: center; gap: 8px; }
 .ilist li.active { background: #2c3e50; }
+/* 다중 선택 — 현재 열린 이미지(active)와 구분되게 테두리로 표시 */
+.ilist li.picked { box-shadow: inset 0 0 0 1.5px var(--accent, #4c8dff); }
+.bulkbar {
+  flex-shrink: 0; align-items: center; gap: 6px; font-size: 12px;
+  background: var(--bg2); border: 1px solid var(--accent, #4c8dff);
+  border-radius: 8px; padding: 5px 8px;
+}
+.bulkbar button { padding: 2px 8px; font-size: 12px; }
 .ilist img {
   width: 44px; height: 44px; object-fit: cover; border-radius: 6px;
   background: var(--bg3); flex-shrink: 0;

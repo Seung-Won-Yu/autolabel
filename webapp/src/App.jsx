@@ -425,6 +425,13 @@ export default function App() {
               if (current?.id === im.id) { setCurrent(null); setAnns([]) }
               setMsg('이미지 삭제됨')
             }}
+            onBulk={async (ids, status) => {
+              if (!ids.length) return
+              const r = await api.bulkStatus(ids, status)
+              setImages(await api.listImages(project.id))
+              setMsg(`${r.count}장 ${status === 'approved' ? '승인' : '거부'}`
+                + (r.train?.started ? ' · 전용 모델 학습 시작' : ''))
+            }}
           />
         </aside>
 
@@ -663,6 +670,7 @@ function HelpOverlay({ onClose }) {
     ['SAM: 클릭', '새 객체 (이전 자동 확정)'], ['SAM: Shift+클릭', '현재 객체 정제(포함)'],
     ['SAM: 우클릭', '제외 포인트'], ['SAM: Enter / Esc', '확정 / 취소'],
     ['휠 / Alt+드래그', '줌 / 팬'], ['+ / − / 0', '확대 / 축소 / 화면에 맞춤'],
+    ['목록: Shift+클릭', '범위 선택'], ['목록: ⌘/Ctrl+클릭', '하나씩 추가·해제 → 일괄 승인'],
   ]
   return (
     <div className="overlay" onClick={onClose}>
@@ -1059,10 +1067,40 @@ function ModelHistory({ pid, refreshKey, onMsg }) {
   )
 }
 
-function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setSortMode, onDelete }) {
+function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setSortMode,
+  onDelete, onBulk }) {
   const badge = { unlabeled: '·', prelabeled: '◐', approved: '✓', rejected: '✗' }
   const activeRow = useRef(null)
   const pos = visible.findIndex((im) => im.id === current?.id)
+  // 다중 선택 — Shift=범위, Cmd/Ctrl=토글 (파일 목록의 표준 관례)
+  const [picked, setPicked] = useState(new Set())
+  const anchor = useRef(null)
+
+  const onRowClick = (im, i, e) => {
+    if (e.shiftKey && anchor.current != null) {
+      const [a, b] = [anchor.current, i].sort((x, y) => x - y)
+      setPicked(new Set(visible.slice(a, b + 1).map((x) => x.id)))
+      return
+    }
+    if (e.metaKey || e.ctrlKey) {
+      const next = new Set(picked)
+      if (next.has(im.id)) next.delete(im.id)
+      else next.add(im.id)
+      setPicked(next)
+      anchor.current = i
+      return
+    }
+    // 평소 클릭은 선택을 지우고 그 이미지를 연다 (기존 동작 유지)
+    setPicked(new Set())
+    anchor.current = i
+    onOpen(im)
+  }
+
+  const applyBulk = async (status) => {
+    const ids = [...picked]
+    await onBulk(ids, status)
+    setPicked(new Set())
+  }
 
   // A/X·←→로 넘어갈 때 목록이 따라오게 한다. 안 그러면 143장을 리뷰하는 동안
   // 현재 이미지가 목록 밖으로 밀려나 내가 어디쯤인지 알 수 없다.
@@ -1083,15 +1121,26 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
         <button className={sortMode === 'qa' ? 'active' : ''}
           onClick={() => setSortMode(sortMode === 'qa' ? 'none' : 'qa')} title="모델과 라벨이 싸우는 이미지 먼저 (QA 분석 후)">의심</button>
       </div>
-      <div className="hint">
-        {pos >= 0 ? <b>{pos + 1} / {visible.length}</b> : `${visible.length}장`}
-        {' · ←→ 이동도 이 순서를 따릅니다'}
-      </div>
+      {picked.size > 0 ? (
+        <div className="row bulkbar">
+          <b>{picked.size}장 선택</b>
+          <button className="ok" onClick={() => applyBulk('approved')}>✓ 일괄 승인</button>
+          <button className="bad" onClick={() => applyBulk('rejected')}>✗ 일괄 거부</button>
+          <button onClick={() => setPicked(new Set())}>해제</button>
+        </div>
+      ) : (
+        <div className="hint">
+          {pos >= 0 ? <b>{pos + 1} / {visible.length}</b> : `${visible.length}장`}
+          {' · ←→ 이동 · Shift/⌘+클릭 다중 선택'}
+        </div>
+      )}
       <ul className="ilist">
-        {visible.map((im) => (
-          <li key={im.id} className={current?.id === im.id ? 'active' : ''}
-            ref={current?.id === im.id ? activeRow : null} onClick={() => onOpen(im)}>
-            <img src={api.imageUrl(im.id)} loading="lazy" alt="" />
+        {visible.map((im, i) => (
+          <li key={im.id}
+            className={`${current?.id === im.id ? 'active' : ''}${picked.has(im.id) ? ' picked' : ''}`}
+            ref={current?.id === im.id ? activeRow : null}
+            onClick={(e) => onRowClick(im, i, e)}>
+            <img src={api.thumbUrl(im.id)} loading="lazy" alt="" width="44" height="44" />
             <div className="meta">
               <div className="name">{im.file_name}</div>
               <small>

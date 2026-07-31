@@ -141,7 +141,8 @@ test('이미지 목록이 스크롤 없이 보이고 캔버스가 컨테이너�
       sideOverflow: side.scrollHeight - side.clientHeight,
       listTop: list.getBoundingClientRect().top,
       vh: window.innerHeight,
-      fits: host.clientWidth === cv.width && host.clientHeight === cv.height,
+      // 백킹스토어(cv.width)는 레티나에서 2배가 된다 — CSS 크기로 비교해야 한다
+      fits: host.clientWidth === cv.offsetWidth && host.clientHeight === cv.offsetHeight,
     }
   })
   expect(m.sideOverflow, '사이드바 자체는 스크롤되지 않아야 한다').toBeLessThanOrEqual(0)
@@ -211,6 +212,41 @@ test('클래스 칩으로 캔버스에서 숨기고 다시 표시한다', async 
   await expect(page.locator('.annrow')).toHaveCount(1)   // b만 남는다
   await page.locator('.clschip', { hasText: 'a' }).first().click()
   await expect(page.locator('.annrow')).toHaveCount(3)
+})
+
+test('Shift/⌘ 다중 선택으로 일괄 승인한다', async ({ page }) => {
+  // 리뷰를 한 장씩만 처리하면 수백 장에서 손이 남지 않는다.
+  // 백엔드 bulk-status는 있었는데 프론트에서 쓰지 않고 있었다.
+  const { id, name } = await newProject(page, 'bulk', ONE_CLASS)
+  for (let i = 0; i < 6; i++) await uploadImage(page, id, `b${i}.png`)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.getByText('0/6 승인')).toBeVisible()
+
+  const rows = page.locator('.ilist li')
+  await rows.nth(1).click({ modifiers: ['ControlOrMeta'] })
+  await rows.nth(4).click({ modifiers: ['Shift'] })
+  await expect(page.locator('.ilist li.picked')).toHaveCount(4)
+  await expect(page.locator('.bulkbar')).toContainText('4장 선택')
+
+  await page.locator('.bulkbar button', { hasText: '일괄 승인' }).click()
+  await expect(page.getByText('4/6 승인')).toBeVisible()
+  await expect(page.locator('.ilist li.picked')).toHaveCount(0)
+})
+
+test('목록 썸네일은 원본이 아니라 축소본을 받는다', async ({ page }) => {
+  // 예전엔 원본을 그대로 받아 44x44로 줄여 그렸다 (143장 = 9.3MB)
+  const { id, name } = await newProject(page, 'thumb', ONE_CLASS)
+  await uploadImage(page, id)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  const src = await page.locator('.ilist img').first().getAttribute('src')
+  expect(src).toContain('/thumb')
+  const natural = await page.locator('.ilist img').first()
+    .evaluate((el) => el.naturalWidth)
+  expect(natural).toBeLessThanOrEqual(128)
 })
 
 test('한글 프로젝트명으로도 익스포트가 된다', async ({ page }) => {
