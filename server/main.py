@@ -43,6 +43,20 @@ def create_project(body: dict):
     return row_to_dict(row)
 
 
+@app.get("/api/capabilities")
+def capabilities():
+    """설치된 모델 역량 — UI가 SAM 3 유무 등을 안내하는 데 쓴다."""
+    from pathlib import Path
+
+    return {
+        "sam3": ml.sam3_available(),
+        "sam3_hint": "models/sam3.pt 를 두면 텍스트 검출이 SAM 3로 승급됩니다 "
+                     "(huggingface.co/facebook/sam3 접근 승인 후 다운로드)",
+        "sam_encoder": Path(ml.SAM_CKPT).exists(),
+        "device": ml.DEVICE,
+    }
+
+
 @app.get("/api/projects")
 def list_projects():
     conn = get_db()
@@ -143,7 +157,7 @@ def set_image_status(iid: int, body: dict):
     # 승인 누적 시 자동 파인튜닝 트리거 (조건 미달이면 no-op)
     trained = None
     if body["status"] == "approved" and row:
-        trained = train.maybe_start_training(row["project_id"])
+        trained = train.maybe_start_training(row["project_id"], debounce=True)
     return {"ok": True, "train": trained}
 
 
@@ -191,21 +205,35 @@ def _detect_auto(pid: int, image: Image.Image, ontology: list, engine: str = "au
     온톨로지에 '부모.자식' 표기가 있으면 part 캐스케이드까지 수행한다.
     반환: (검출, 사용 엔진)
     """
-    from server import parts
+    from server import parts, tiling
 
     parent_onto, parts_by_parent = parts.parse_ontology(ontology)
+    # 고해상도 이미지는 타일링으로 작은 객체 회수율을 올린다 (SAHI 패턴)
+    use_tiles = tiling.should_tile(image)
     student = train.active_model(pid) if engine in ("auto", "student") else None
     if student:
-        dets = ml.detect_student(image, student, ontology)
-        used = f"student(mAP50 {student['map50']})"
+        dets = (tiling.detect_tiled(image, lambda im: ml.detect_student(im, student, ontology))
+                if use_tiles else ml.detect_student(image, student, ontology))
+        used = f"student(mAP50 {student['map50']})" + ("+tiled" if use_tiles else "")
         # 학생 모델이 part까지 학습했으면 캐스케이드 불필요
         if parts_by_parent and not any("." in d["class_name"] for d in dets):
             dets = dets + parts.detect_with_parts(image, ontology, dets)
             used += "+parts"
         return dets, used
 
-    dets = ml.detect(image, parent_onto or ontology)
-    used = "foundation"
+    onto_use = parent_onto or ontology
+    # SAM 3 가중치가 있으면 파운데이션 경로를 그것으로 승급 (텍스트 → 전체 인스턴스)
+    if ml.sam3_available():
+        try:
+            dets = ml.detect_sam3(image, onto_use)
+            used = "sam3"
+        except Exception:
+            dets = ml.detect(image, onto_use)
+            used = "foundation(sam3 실패)"
+    else:
+        dets = (tiling.detect_tiled(image, lambda im: ml.detect(im, onto_use))
+                if use_tiles else ml.detect(image, onto_use))
+        used = "foundation" + ("+tiled" if use_tiles else "")
     if parts_by_parent:
         dets = dets + parts.detect_with_parts(image, ontology, dets)
         used += "+parts"
@@ -296,18 +324,48 @@ def autolabel_status(pid: int):
 
 @app.post("/api/images/{iid}/exemplar")
 def exemplar(iid: int, body: dict):
-    """예시 박스 1개 → 같은 이미지에서 유사 객체 전부 검출."""
+    """예시 박스 1개 → 같은 이미지에서 유사 객체 전부 검출.
+
+    전용 모델이 있으면 그 후보를 예시 유사도로 거르는 경로가 훨씬 정확하다
+    (특징맵 피크 방식은 미세 객체에서 무력). 없으면 피크 탐색으로 폴백.
+    """
     import numpy as np
 
-    image = np.array(Image.open(_image_path(iid)).convert("RGB"))
-    dets = ml.exemplar_detect(
-        image, body["bbox"],
-        topk=int(body.get("topk", 20)),
-        sim_thr=float(body.get("sim_thr", 0.6)))
+    pil = Image.open(_image_path(iid)).convert("RGB")
+    image = np.array(pil)
     cls = body.get("class_name", "")
+
+    conn = get_db()
+    im = conn.execute("SELECT project_id FROM images WHERE id=?", (iid,)).fetchone()
+    proj = conn.execute("SELECT * FROM projects WHERE id=?", (im["project_id"],)).fetchone()
+    conn.close()
+    student = train.active_model(im["project_id"])
+
+    mode = "peak"
+    if student and body.get("use_model", True):
+        ontology = [{**c, "threshold": 0.15} for c in json.loads(proj["ontology"])]
+        cands = ml.detect_student(pil, student, ontology)
+        # 예시 자신과 겹치는 후보는 제외 (이미 아는 것)
+        dets = ml.exemplar_rerank(image, body["bbox"], cands,
+                                  sim_thr=float(body.get("sim_thr", 0.55)))
+        mode = "model+exemplar"
+        if not dets:  # 모델이 아무것도 못 주면 피크 탐색으로 폴백
+            dets = ml.exemplar_detect(image, body["bbox"],
+                                      topk=int(body.get("topk", 20)),
+                                      sim_thr=float(body.get("sim_thr", 0.6)))
+            mode = "peak(fallback)"
+    else:
+        dets = ml.exemplar_detect(
+            image, body["bbox"],
+            topk=int(body.get("topk", 20)),
+            sim_thr=float(body.get("sim_thr", 0.6)))
+
     for d in dets:
-        d["class_name"] = cls
-    return {"detections": dets}
+        if mode.startswith("peak"):
+            d["class_name"] = cls
+        elif cls:
+            d["class_name"] = cls  # 사용자가 지정한 클래스로 통일
+    return {"detections": dets, "mode": mode}
 
 
 # ---------- 데이터셋 연결 임포트 ----------
@@ -427,7 +485,7 @@ def bulk_status(body: dict):
     conn.close()
     trained = None
     if body["status"] == "approved" and pid:
-        trained = train.maybe_start_training(pid["project_id"])
+        trained = train.maybe_start_training(pid["project_id"], debounce=True)
     return {"ok": True, "count": len(ids), "train": trained}
 
 

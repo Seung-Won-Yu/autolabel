@@ -74,6 +74,43 @@ def embed_image(data: bytes) -> dict:
 
 
 @torch.no_grad()
+def exemplar_rerank(image_np: np.ndarray, bbox: list[float],
+                    candidates: list[dict], sim_thr: float = 0.55) -> list[dict]:
+    """후보 박스들을 예시와의 특징 유사도로 걸러낸다.
+
+    특징맵 피크로 후보를 찾는 방식은 미세 객체(35px급)에서 무력하다.
+    전용 모델이 이미 후보를 뽑아준 상황이면, 그 후보 중 예시와 닮은 것만
+    남기는 편이 훨씬 정확하다 — "이런 것만 골라줘" 필터로 동작.
+    """
+    predictor = get_sam()
+    predictor.set_image(image_np)
+    global _current_key
+    _current_key = None
+
+    feats = predictor.features[0]
+    C, FH, FW = feats.shape
+    H, W = image_np.shape[:2]
+    scale = 1024 / max(H, W)
+
+    def pooled(bx, by, bw, bh):
+        gx1 = int(bx * scale / 1024 * FW)
+        gy1 = int(by * scale / 1024 * FH)
+        gx2 = max(gx1 + 1, int((bx + bw) * scale / 1024 * FW))
+        gy2 = max(gy1 + 1, int((by + bh) * scale / 1024 * FH))
+        f = feats[:, gy1:gy2, gx1:gx2].mean(dim=(1, 2))
+        return f / (f.norm() + 1e-6)
+
+    ex = pooled(*bbox)
+    out = []
+    for c in candidates:
+        sim = float((pooled(*c["bbox"]) * ex).sum())
+        if sim >= sim_thr:
+            out.append({**c, "confidence": round(sim, 4),
+                        "meta": {**(c.get("meta") or {}), "exemplar_sim": round(sim, 4)}})
+    return out
+
+
+@torch.no_grad()
 def exemplar_detect(image_np: np.ndarray, bbox: list[float],
                     topk: int = 20, sim_thr: float = 0.6) -> list[dict]:
     """시각 예시 검출 (PerSAM 패턴, 학습 프리):
@@ -172,6 +209,61 @@ def exemplar_detect(image_np: np.ndarray, bbox: list[float],
         if all(iou(c["bbox"], k["bbox"]) < 0.5 for k in kept):
             kept.append(c)
     return kept
+
+
+SAM3_PATH = "models/sam3.pt"
+_sam3 = None
+
+
+def sam3_available() -> bool:
+    from pathlib import Path
+
+    return Path(SAM3_PATH).exists()
+
+
+def get_sam3():
+    """SAM 3 — 텍스트 명사구 하나로 이미지 내 모든 인스턴스를 분할한다.
+
+    가중치는 Meta HF에서 접근 승인 후 받아 models/sam3.pt 로 두면 자동 사용된다.
+    없으면 기존 Grounding DINO + SAM 경로를 그대로 쓴다.
+    """
+    global _sam3
+    if _sam3 is None:
+        from ultralytics.models.sam import SAM3SemanticPredictor
+
+        _sam3 = SAM3SemanticPredictor(
+            overrides={"conf": 0.25, "task": "segment", "mode": "predict",
+                       "model": SAM3_PATH})
+    return _sam3
+
+
+def detect_sam3(image: Image.Image, ontology: list[dict]) -> list[dict]:
+    """SAM 3 개념 분할 → 박스 목록. 클래스별 임계값 적용."""
+    predictor = get_sam3()
+    prompts = [c.get("prompt") or c["name"] for c in ontology]
+    name_of = {(c.get("prompt") or c["name"]): c["name"] for c in ontology}
+    thresholds = {c["name"]: float(c.get("threshold", 0.35)) for c in ontology}
+
+    predictor.set_image(image)
+    results = predictor(text=prompts)
+    dets = []
+    for r in (results if isinstance(results, list) else [results]):
+        boxes = getattr(r, "boxes", None)
+        if boxes is None:
+            continue
+        labels = getattr(r, "names", {}) or {}
+        for b in boxes:
+            raw = labels.get(int(b.cls), prompts[0]) if labels else prompts[0]
+            cls = name_of.get(raw, raw)
+            conf = float(b.conf)
+            if conf < thresholds.get(cls, 0.35):
+                continue
+            x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
+            dets.append({"class_name": cls,
+                         "bbox": [round(x1, 1), round(y1, 1),
+                                  round(x2 - x1, 1), round(y2 - y1, 1)],
+                         "confidence": round(conf, 4)})
+    return dets
 
 
 _students: dict[str, object] = {}

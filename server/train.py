@@ -24,6 +24,8 @@ VAL_RATIO = 0.2
 
 _lock = threading.Lock()
 _procs: dict[int, subprocess.Popen] = {}
+_timers: dict[int, threading.Timer] = {}
+DEBOUNCE_SEC = 20  # 연속 승인이 끝나길 기다렸다 학습 (대량 승인 시 조기 발동 방지)
 
 
 def _status_path(pid: int) -> Path:
@@ -109,8 +111,22 @@ def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
     return len(rows), names
 
 
-def maybe_start_training(pid: int, force: bool = False) -> dict:
-    """승인 수 조건 충족 시 워커 프로세스 시작. force=수동 트리거."""
+def maybe_start_training(pid: int, force: bool = False, debounce: bool = False) -> dict:
+    """승인 수 조건 충족 시 워커 프로세스 시작.
+
+    debounce=True면 승인이 멈춘 뒤에 시작한다. 240장을 연속 승인하는 동안
+    첫 몇 장만으로 학습이 시작돼 나머지가 반영되지 않던 문제를 막는다.
+    """
+    if debounce and not force:
+        with _lock:
+            t = _timers.get(pid)
+            if t:
+                t.cancel()
+            timer = threading.Timer(DEBOUNCE_SEC, lambda: maybe_start_training(pid))
+            timer.daemon = True
+            _timers[pid] = timer
+            timer.start()
+        return {"status": "scheduled", "in_sec": DEBOUNCE_SEC}
     with _lock:
         if job_status(pid).get("status") == "running":
             return job_status(pid)

@@ -27,6 +27,36 @@ def pick_arch(n_images: int, override: str | None = None) -> str:
     return "yolo11m"
 
 
+def pick_imgsz(dataset_dir, n_images: int = 0, default: int = 640) -> int:
+    """라벨 크기 분포 + 데이터 양으로 학습 해상도 결정.
+
+    작은 객체가 지배적이면 해상도를 올리는 게 정석이지만, 실측 결과 소량
+    데이터에서는 역효과였다 (PCB 60장·960px → val 0.44 vs 640px 0.74).
+    고해상도는 배치가 줄고 수렴이 느려 소량에서 손해다. 따라서 데이터가
+    충분할 때만 올린다.
+    """
+    import statistics
+    from pathlib import Path as _P
+
+    if n_images < 200:
+        return default  # 소량에서는 해상도보다 데이터가 병목
+    ratios = []
+    for txt in list((_P(dataset_dir) / "labels" / "train").glob("*.txt"))[:300]:
+        for line in txt.read_text().splitlines():
+            p = line.split()
+            if len(p) >= 5:
+                # YOLO 정규화 좌표라 그대로 이미지 대비 비율
+                ratios.append((float(p[3]) * float(p[4])) ** 0.5)
+    if not ratios:
+        return default
+    med = statistics.median(ratios)
+    if med < 0.04:
+        return 1280
+    if med < 0.08:
+        return 960
+    return default
+
+
 def write_status(pid: int, **kw):
     RUNS.mkdir(parents=True, exist_ok=True)
     path = RUNS / f"train_status_{pid}.json"
@@ -67,7 +97,8 @@ def main(pid: int):
         except Exception:
             pass
         arch = pick_arch(n_images, override)
-        write_status(pid, arch=arch)
+        imgsz = pick_imgsz(run_dir / "dataset", n_images)
+        write_status(pid, arch=arch, imgsz=imgsz)
         model = YOLO(f"{arch}.pt")
         model.train(
             data=str(run_dir / "dataset" / "data.yaml"),
@@ -75,7 +106,8 @@ def main(pid: int):
             patience=10,
             freeze=10 if small else None,
             mosaic=0.0 if small else 1.0,
-            imgsz=640, device="mps", batch=8 if arch == "yolo11n" else 4,
+            imgsz=imgsz, device="mps",
+            batch=(8 if arch == "yolo11n" else 4) // (2 if imgsz > 800 else 1) or 1,
             project=str(run_dir), name="train", verbose=False, plots=False,
         )
         best = run_dir / "train" / "weights" / "best.pt"
