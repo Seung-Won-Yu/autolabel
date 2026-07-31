@@ -25,6 +25,8 @@ export default function App() {
   const [sampling, setSampling] = useState(null) // 진행 중인 통계 검수 계획
   // 설정·도구는 라벨링을 시작하면 접는다 — 매번 쓰는 건 이미지 목록이다
   const [setupOpen, setSetupOpen] = useState(true)
+  // 캔버스에서 숨긴 클래스 — 밀집 장면에서 한 종류만 보며 고칠 수 있게
+  const [hidden, setHidden] = useState(new Set())
   const dirty = useRef(false)
   const undoStack = useRef([])
   // 캔버스 크기는 컨테이너를 실측한다. 예전엔 window.innerWidth에서 상수를 뺀
@@ -38,12 +40,14 @@ export default function App() {
   if (sortMode === 'conf') visible = [...visible].sort((a, b) => (a.min_conf ?? 2) - (b.min_conf ?? 2))
   else if (sortMode === 'qa') visible = [...visible].sort((a, b) => (b.qa_score ?? -1) - (a.qa_score ?? -1))
 
-  const setMsg = useCallback((text) => {
-    setToast(text)
+  // 읽고 판단해야 하는 안내(배치 진단·심판 결과)는 3초 만에 사라지면 안 된다.
+  // sticky는 사용자가 닫을 때까지 남는다.
+  const setMsg = useCallback((text, sticky = false) => {
+    setToast(text ? { text, sticky } : null)
   }, [])
 
   useEffect(() => {
-    if (!toast) return
+    if (!toast || toast.sticky) return
     const t = setTimeout(() => setToast(null), 3000)
     return () => clearTimeout(t)
   }, [toast])
@@ -200,7 +204,7 @@ export default function App() {
       if (s.status !== 'running') {
         clearInterval(t)
         setImages(await api.listImages(project.id))
-        if (s.result) { setLastQa(s.result); setMsg(qaSummary(s.result)) }
+        if (s.result) { setLastQa(s.result); setMsg(qaSummary(s.result), true) }
         else setMsg(`심판 실패: ${s.error}`)
       }
     }, 2000)
@@ -240,8 +244,10 @@ export default function App() {
           dirty.current = false
         }
         // 검출률이 낮으면 결과만 던지지 말고 다음 수를 알려준다
+        // 검출률이 낮을 때의 안내는 읽고 판단해야 하니 사라지지 않게 둔다
         setMsg(s.status === 'failed' ? `배치 실패: ${s.error}`
-          : s.advice || `배치 오토라벨 완료: ${s.done}/${s.total}장`)
+          : s.advice || `배치 오토라벨 완료: ${s.done}/${s.total}장`,
+        s.status === 'failed' || (s.verdict && s.verdict !== 'good'))
       }
     }, 1500)
     return () => clearInterval(t)
@@ -337,7 +343,7 @@ export default function App() {
                   if (big) return setQaJob(r)
                   setImages(await api.listImages(project.id))
                   setLastQa(r)
-                  setMsg(qaSummary(r))
+                  setMsg(qaSummary(r), true)
                 }}>
                 {qaJob?.status === 'running' ? `심판 중 ${qaJob.done}/${qaJob.total}` : 'QA 분석'}
               </button>
@@ -479,7 +485,7 @@ export default function App() {
               <Canvas
                 imageUrl={api.imageUrl(current.id)}
                 imageId={current.id} tool={tool} onMsg={setMsg}
-                anns={anns} setAnns={setAnnsDirty}
+                anns={anns} setAnns={setAnnsDirty} hidden={hidden}
                 ontology={project.ontology}
                 activeClass={activeClass}
                 selectedId={selectedId} setSelectedId={setSelectedId}
@@ -507,6 +513,7 @@ export default function App() {
                 anns={anns} ontology={project.ontology}
                 selectedId={selectedId} setSelectedId={setSelectedId}
                 hoverId={hoverId} setHoverId={setHoverId}
+                hidden={hidden} setHidden={setHidden}
                 onDelete={(key) => { setAnnsDirty(anns.filter((a) => a._key !== key)); if (selectedId === key) setSelectedId(null) }}
                 onClass={(key, cls) => setAnnsDirty(anns.map((a) =>
                   a._key === key ? { ...a, class_name: cls, source: 'human' } : a))}
@@ -522,7 +529,12 @@ export default function App() {
         </main>
       </div>
 
-      {toast && <div className="toast">{toast}</div>}
+      {toast && (
+        <div className={`toast${toast.sticky ? ' sticky' : ''}`}>
+          <span>{toast.text}</span>
+          {toast.sticky && <button className="x" title="닫기" onClick={() => setToast(null)}>×</button>}
+        </div>
+      )}
       {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
     </div>
   )
@@ -583,8 +595,18 @@ function NextStep({ project, images, trainInfo, job, onAutolabel }) {
   )
 }
 
-function AnnPanel({ anns, ontology, selectedId, setSelectedId, hoverId, setHoverId, onDelete, onClass }) {
+function AnnPanel({ anns, ontology, selectedId, setSelectedId, hoverId, setHoverId,
+  onDelete, onClass, hidden, setHidden }) {
   const listRef = useRef()
+  // 클래스별 개수 — 23개가 드롭다운 23줄로만 늘어서면 무엇이 몇 개인지 안 보인다
+  const counts = anns.reduce((m, a) => ({ ...m, [a.class_name]: (m[a.class_name] || 0) + 1 }), {})
+  const toggle = (cls) => {
+    const next = new Set(hidden)
+    if (next.has(cls)) next.delete(cls)
+    else next.add(cls)
+    setHidden(next)
+  }
+  const shown = anns.filter((a) => !hidden.has(a.class_name))
   // 캔버스에서 박스를 클릭하면 패널의 해당 행으로 스크롤
   useEffect(() => {
     if (!selectedId || !listRef.current) return
@@ -595,9 +617,25 @@ function AnnPanel({ anns, ontology, selectedId, setSelectedId, hoverId, setHover
   return (
     <div className="annpanel" ref={listRef}>
       <div className="panel-title">어노테이션 ({anns.length})</div>
-      <div className="hint">행에 마우스를 올리면 캔버스에서 해당 박스만 밝게 표시됩니다</div>
+      {Object.keys(counts).length > 0 && (
+        <>
+          <div className="clschips">
+            {Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([cls, n]) => (
+              <button key={cls} className={`clschip${hidden.has(cls) ? ' off' : ''}`}
+                title={hidden.has(cls) ? '캔버스에 다시 표시' : '캔버스에서 숨기기'}
+                onClick={() => toggle(cls)}>
+                <i style={{ background: classColor(ontology, cls) }} />
+                {cls} <b>{n}</b>
+              </button>
+            ))}
+          </div>
+          <div className="hint">
+            클래스를 눌러 캔버스에서 숨기거나 다시 표시합니다 · 행에 마우스를 올리면 해당 박스만 밝게
+          </div>
+        </>
+      )}
       {anns.length === 0 && <div className="hint">아직 없음 — 오토라벨 또는 드래그로 시작</div>}
-      {anns.map((a, i) => (
+      {shown.map((a, i) => (
         <div key={a._key} data-key={a._key}
           className={`annrow ${selectedId === a._key ? 'active' : ''} ${hoverId === a._key ? 'hovered' : ''}`}
           onClick={() => setSelectedId(a._key)}
@@ -1023,6 +1061,15 @@ function ModelHistory({ pid, refreshKey, onMsg }) {
 
 function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setSortMode, onDelete }) {
   const badge = { unlabeled: '·', prelabeled: '◐', approved: '✓', rejected: '✗' }
+  const activeRow = useRef(null)
+  const pos = visible.findIndex((im) => im.id === current?.id)
+
+  // A/X·←→로 넘어갈 때 목록이 따라오게 한다. 안 그러면 143장을 리뷰하는 동안
+  // 현재 이미지가 목록 밖으로 밀려나 내가 어디쯤인지 알 수 없다.
+  useEffect(() => {
+    activeRow.current?.scrollIntoView({ block: 'nearest' })
+  }, [current?.id])
+
   return (
     <div className="imagelist">
       <div className="row filters">
@@ -1036,10 +1083,14 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
         <button className={sortMode === 'qa' ? 'active' : ''}
           onClick={() => setSortMode(sortMode === 'qa' ? 'none' : 'qa')} title="모델과 라벨이 싸우는 이미지 먼저 (QA 분석 후)">의심</button>
       </div>
-      <div className="hint">{visible.length}장 · ←→ 이동도 이 순서를 따릅니다</div>
+      <div className="hint">
+        {pos >= 0 ? <b>{pos + 1} / {visible.length}</b> : `${visible.length}장`}
+        {' · ←→ 이동도 이 순서를 따릅니다'}
+      </div>
       <ul className="ilist">
         {visible.map((im) => (
-          <li key={im.id} className={current?.id === im.id ? 'active' : ''} onClick={() => onOpen(im)}>
+          <li key={im.id} className={current?.id === im.id ? 'active' : ''}
+            ref={current?.id === im.id ? activeRow : null} onClick={() => onOpen(im)}>
             <img src={api.imageUrl(im.id)} loading="lazy" alt="" />
             <div className="meta">
               <div className="name">{im.file_name}</div>

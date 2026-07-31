@@ -54,8 +54,9 @@ def capabilities():
         "sam3": ml.sam3_available(),
         "sam3_hint": "models/sam3.pt 를 두면 텍스트 검출이 SAM 3로 승급됩니다 "
                      "(huggingface.co/facebook/sam3 접근 승인 후 다운로드)",
-        "sam_encoder": Path(ml.SAM_CKPT).exists(),
+        "sam_encoder": not ml.NO_MODELS and Path(ml.SAM_CKPT).exists(),
         "device": ml.DEVICE,
+        "models_disabled": ml.NO_MODELS,
     }
 
 
@@ -217,6 +218,10 @@ def replace_annotations(iid: int, body: dict):
 
 @app.get("/api/images/{iid}/embed")
 def embed(iid: int):
+    # 모델이 꺼져 있으면 503으로 분명히 알린다. 프론트는 임베딩 실패를 조용히
+    # 넘기므로(SAM 클릭만 비활성) 라벨링 자체는 계속된다.
+    if ml.NO_MODELS:
+        raise HTTPException(503, "모델 로딩이 꺼져 있습니다 (AUTOLABEL_NO_MODELS=1)")
     return ml.embed_image(_image_path(iid).read_bytes())
 
 

@@ -166,6 +166,53 @@ test('줌 컨트롤로 확대하고 맞춤으로 되돌린다', async ({ page })
   await expect.poll(pct).toBe(fitted)
 })
 
+test('이미지를 넘기면 목록이 따라오고 위치가 표시된다', async ({ page }) => {
+  // 예전엔 목록이 스크롤되지 않아, 25장쯤 넘기면 현재 이미지가 목록 밖으로
+  // 밀려나 내가 어디쯤인지 알 수 없었다 (143장 리뷰에서 치명적)
+  const { id, name } = await newProject(page, 'follow', ONE_CLASS)
+  for (let i = 0; i < 25; i++) await uploadImage(page, id, `img${i}.png`)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+  await expect(page.locator('.imagelist .hint')).toContainText('1 / 25')
+
+  for (let i = 0; i < 20; i++) await page.keyboard.press('ArrowRight')
+  await expect(page.locator('.imagelist .hint')).toContainText('21 / 25')
+
+  const visible = await page.evaluate(() => {
+    const ul = document.querySelector('.ilist')
+    const li = ul.querySelector('li.active').getBoundingClientRect()
+    const box = ul.getBoundingClientRect()
+    return li.top >= box.top - 1 && li.bottom <= box.bottom + 1
+  })
+  expect(visible, '현재 이미지가 목록 안에 보여야 한다').toBe(true)
+})
+
+test('클래스 칩으로 캔버스에서 숨기고 다시 표시한다', async ({ page }) => {
+  // 밀집 장면(박스 20개+)에서 한 종류만 보며 고칠 수 있어야 한다
+  const two = [{ name: 'a', prompt: 'a', threshold: 0.3 }, { name: 'b', prompt: 'b', threshold: 0.3 }]
+  const { id, name } = await newProject(page, 'chips', two)
+  const iid = await uploadImage(page, id)
+  await page.request.put(`${API}/images/${iid}/annotations`, {
+    data: { annotations: [
+      { class_name: 'a', bbox: [1, 1, 10, 10], source: 'human' },
+      { class_name: 'a', bbox: [20, 1, 10, 10], source: 'human' },
+      { class_name: 'b', bbox: [40, 1, 10, 10], source: 'human' },
+    ] },
+  })
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('.annrow')).toHaveCount(3)
+  await expect(page.locator('.clschip', { hasText: 'a' }).first()).toContainText('2')
+
+  await page.locator('.clschip', { hasText: 'a' }).first().click()
+  await expect(page.locator('.annrow')).toHaveCount(1)   // b만 남는다
+  await page.locator('.clschip', { hasText: 'a' }).first().click()
+  await expect(page.locator('.annrow')).toHaveCount(3)
+})
+
 test('한글 프로젝트명으로도 익스포트가 된다', async ({ page }) => {
   // HTTP 헤더는 latin-1만 담는다. 예전엔 Content-Disposition에 이름을 그대로
   // 넣어 한글이면 500이 났다 — 한국어 사용자는 익스포트가 통째로 막혔다

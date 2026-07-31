@@ -5,6 +5,7 @@ Phase 0에서 검증된 코드 이식. 모델은 최초 사용 시 lazy 로드 (
 import base64
 import hashlib
 import io
+import os
 import threading
 import time
 
@@ -24,7 +25,19 @@ _embed_cache: dict[str, dict] = {}
 _current_key: str | None = None
 
 
+class ModelsDisabled(RuntimeError):
+    """무거운 모델 로딩이 꺼진 상태에서 모델을 요구했다."""
+
+
+# 프론트 e2e는 SAM·GDINO가 필요 없다. 그런데도 이미지를 열 때마다 임베딩을
+# 계산하려 들어, 메인 서버와 테스트 서버가 동시에 SAM ViT-L(1.2GB)을 MPS에
+# 올리다 프로세스가 통째로 죽었다 (macOS 크래시 리포트까지 떴다).
+NO_MODELS = os.environ.get("AUTOLABEL_NO_MODELS") == "1"
+
+
 def get_sam():
+    if NO_MODELS:
+        raise ModelsDisabled("모델 로딩이 꺼져 있습니다 (AUTOLABEL_NO_MODELS=1)")
     global _sam_predictor
     with _lock:
         if _sam_predictor is None:
@@ -36,6 +49,8 @@ def get_sam():
 
 
 def get_dino():
+    if NO_MODELS:
+        raise ModelsDisabled("모델 로딩이 꺼져 있습니다 (AUTOLABEL_NO_MODELS=1)")
     global _dino
     with _lock:
         if _dino is None:

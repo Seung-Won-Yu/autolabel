@@ -75,8 +75,9 @@ kbd {
 .canvas-host { flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
 .canvas-wrap { position: relative; width: 100%; height: 100%; }
 /* 배율 표시와 맞춤 — 휠만 있으면 한번 어긋난 뷰를 되돌릴 수가 없다 */
+/* 우상단에 둔다 — 하단 중앙은 토스트 자리라 겹친다 */
 .zoombar {
-  position: absolute; right: 8px; bottom: 8px; z-index: 5;
+  position: absolute; right: 8px; top: 8px; z-index: 5;
   display: flex; align-items: center; gap: 4px;
   background: rgba(20, 22, 26, 0.85); border: 1px solid var(--border);
   border-radius: 8px; padding: 3px 6px; font-size: 12px;
@@ -157,6 +158,16 @@ kbd {
 .badge.rejected { color: var(--bad); }
 .badge.prelabeled { color: var(--warn); }
 
+/* 클래스별 개수 + 표시/숨김 — 밀집 장면에서 한 종류만 보며 고칠 수 있게 */
+.clschips { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 4px; }
+.clschip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 7px; font-size: 11px; border-radius: 999px;
+}
+.clschip i { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+.clschip b { color: var(--dim); font-weight: 600; }
+.clschip.off { opacity: 0.4; text-decoration: line-through; }
+
 .annpanel {
   width: 230px; flex-shrink: 0; overflow-y: auto;
   border: 1px solid var(--border); border-radius: 8px; padding: 8px; background: var(--bg2);
@@ -177,7 +188,11 @@ kbd {
   background: var(--bg3); border: 1px solid var(--border); border-radius: 8px;
   padding: 9px 16px; font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
   z-index: 50; max-width: 70vw;
+  display: flex; align-items: flex-start; gap: 10px;
 }
+/* 읽고 판단해야 하는 안내 — 사용자가 닫을 때까지 남는다 */
+.toast.sticky { border-color: var(--accent, #4c8dff); line-height: 1.5; }
+.toast .x { flex-shrink: 0; padding: 0 4px; }
 .overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,0.6);
   display: flex; align-items: center; justify-content: center; z-index: 100;

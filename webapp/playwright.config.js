@@ -25,8 +25,12 @@ export default defineConfig({
   },
   webServer: [
     {
-      // 실제 DB를 건드리지 않게 격리된 DB·업로드 경로로 띄운다
+      // 실제 DB를 건드리지 않게 격리된 DB·업로드 경로로 띄운다.
+      // AUTOLABEL_NO_MODELS=1은 필수다 — 프론트 e2e는 SAM·GDINO가 필요 없는데
+      // 이미지를 열 때마다 임베딩을 계산하려 들어, 개발용 서버와 동시에
+      // SAM ViT-L(1.2GB)을 MPS에 올리다 프로세스가 통째로 죽었다.
       command: `AUTOLABEL_DB=${E2E_DIR}/e2e.db AUTOLABEL_DATA=${E2E_DIR}/uploads `
+        + 'AUTOLABEL_NO_MODELS=1 '
         + `${ROOT}.venv/bin/python -m uvicorn server.main:app --port 8991`,
       cwd: ROOT,
       port: 8991,

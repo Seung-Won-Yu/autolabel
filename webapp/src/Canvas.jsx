@@ -10,8 +10,12 @@ export default function Canvas({
   imageUrl, imageId, tool, anns, setAnns, ontology, activeClass,
   selectedId, setSelectedId, hoverId = null, onMsg = () => {}, onExemplar = null,
   suggestions = [], onAcceptSuggestion = null,
+  hidden = new Set(),
   size = { w: 900, h: 640 },
 }) {
+  // 숨긴 클래스는 그리지 않는다. 번호는 어노테이션 패널의 표시 목록과 같은
+  // 기준으로 매겨야 패널 3번과 캔버스 3번이 같은 박스를 가리킨다.
+  const shownAnns = anns.filter((a) => !hidden.has(a.class_name))
   const [img] = useImage(imageUrl, 'anonymous')
   const stageRef = useRef()
   const [view, setView] = useState({ scale: 1, x: 0, y: 0 })
@@ -214,10 +218,10 @@ export default function Canvas({
     >
       <Layer>
         {img && <KImage image={img} name="bg" />}
-        {anns.map((a) => a.segmentation?.counts && (
+        {shownAnns.map((a) => a.segmentation?.counts && (
           <MaskAnn key={`m-${a._key}`} ann={a} color={classColor(ontology, a.class_name)} />
         ))}
-        {anns.map((a, i) => (
+        {shownAnns.map((a, i) => (
           <BoxAnn
             key={a._key} ann={a} index={i + 1}
             color={classColor(ontology, a.class_name)}
@@ -226,7 +230,7 @@ export default function Canvas({
             // 하나가 강조되면 나머지는 흐리게 — 밀집 장면에서 구분
             dimmed={(hoverId || selectedId) && hoverId !== a._key && selectedId !== a._key}
             // 라벨 텍스트: 붐비면(9개+) 강조된 것만 표시
-            showLabel={anns.length < 9 || hoverId === a._key || selectedId === a._key}
+            showLabel={shownAnns.length < 9 || hoverId === a._key || selectedId === a._key}
             onSelect={() => setSelectedId(a._key)}
             onChange={(bbox) => updateBox(a._key, bbox)}
             scale={view.scale}
