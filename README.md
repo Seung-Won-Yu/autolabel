@@ -116,9 +116,10 @@ webapp/   Vite + React + react-konva
 
 server/   FastAPI + SQLite
           ├ Grounding DINO   텍스트 → 박스
+          ├ SAM 3 (선택)      텍스트 개념 → 모든 인스턴스 분할 (models/sam3.pt 있으면 자동)
           ├ SAM ViT-L        박스 → 마스크, 임베딩, 예시 매칭
           ├ YOLO11n          전용 모델 (자동 파인튜닝, MPS)
-          └ 엔진 라우팅       활성 전용 모델 우선, 없으면 파운데이션 폴백
+          └ 엔진 라우팅       활성 전용 모델 > SAM 3 > GDINO+SAM 폴백
 ```
 
 ## 실행
@@ -131,6 +132,13 @@ server/   FastAPI + SQLite
 ```
 
 Grounding DINO · YOLO11n은 첫 사용 시 자동 다운로드.
+
+### SAM 3 켜기 (선택)
+
+[facebook/sam3](https://huggingface.co/facebook/sam3)에서 접근 승인 후 `sam3.pt`(3.45GB)를
+`models/sam3.pt`로 두면 제로샷 검출이 SAM 3로 자동 승급된다 (재시작 불필요 — 요청마다 확인).
+추가 의존성 `timm` + ultralytics CLIP 포크는 requirements.txt에 포함. SAM 3 라이선스는
+자체 라이선스(SAM License) — 상용·재배포 조건은 원문 확인.
 
 ### [`release/`](release/) — 바로 쓸 수 있는 가중치
 
@@ -260,8 +268,7 @@ Grounding DINO · YOLO11n은 첫 사용 시 자동 다운로드.
 ## 로드맵
 
 - [x] ~~part-level 캐스케이드~~ · ~~능동 샘플 선별~~ · ~~클라우드 학습 레인~~
-- [ ] acceptance sampling 배치 승인 (통계적 스팟체크)
-- [ ] SAM 3 / DINO-X 교체 (라이선스 검토 필요)
+- [x] ~~acceptance sampling 배치 승인~~ · ~~SAM 3 어댑터~~ (가중치 두면 자동)
 - [ ] 비디오 트래킹 (SAM 2 메모리 전파)
 - [ ] 멀티유저·대규모 인프라 (잡 큐, 임베딩 사전계산)
 

@@ -2,7 +2,10 @@ torch
 torchvision
 transformers
 segment-anything
-ultralytics
+ultralytics>=8.4.115  # SAM3SemanticModel.mask_threshold 는 8.4.115부터
+# SAM 3 (models/sam3.pt 존재 시)에만 필요한 두 줄 — 없으면 GDINO+SAM 경로만 사용
+timm
+clip @ git+https://github.com/ultralytics/CLIP.git
 fastapi
 uvicorn[standard]
 python-multipart

@@ -260,7 +260,7 @@ def get_sam3():
 
         _sam3 = SAM3SemanticPredictor(
             overrides={"conf": 0.25, "task": "segment", "mode": "predict",
-                       "model": SAM3_PATH})
+                       "model": SAM3_PATH, "save": False, "verbose": False})
     return _sam3
 
 
@@ -271,14 +271,16 @@ def detect_sam3(image: Image.Image, ontology: list[dict]) -> list[dict]:
     name_of = {(c.get("prompt") or c["name"]): c["name"] for c in ontology}
     thresholds = {c["name"]: float(c.get("threshold", 0.35)) for c in ontology}
 
-    predictor.set_image(image)
-    results = predictor(text=prompts)
+    with _infer_lock:  # set_image→predict가 2단계라 동시 요청이 이미지를 바꿔치기할 수 있음
+        predictor.set_image(image)
+        results = predictor(text=prompts)
     dets = []
     for r in (results if isinstance(results, list) else [results]):
         boxes = getattr(r, "boxes", None)
         if boxes is None:
             continue
-        labels = getattr(r, "names", {}) or {}
+        names = getattr(r, "names", None)
+        labels = dict(enumerate(names)) if isinstance(names, (list, tuple)) else (names or {})
         for b in boxes:
             raw = labels.get(int(b.cls), prompts[0]) if labels else prompts[0]
             cls = name_of.get(raw, raw)
