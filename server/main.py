@@ -630,12 +630,16 @@ def exemplar(iid: int, body: dict):
 @app.post("/api/import/preview")
 def import_preview(body: dict):
     """폴더 경로만 주면 이미지 수·라벨 형식·클래스를 미리 알려준다."""
+    if not body.get("images_dir"):
+        raise HTTPException(400, "images_dir 필수")
     return importer.preview(body["images_dir"], body.get("labels_dir"), body.get("coco_json"))
 
 
 @app.post("/api/projects/{pid}/import")
 def import_dataset(pid: int, body: dict):
     """복사 없이 폴더를 연결하고 기존 라벨을 가져온다 (대용량 데이터셋용)."""
+    if not body.get("images_dir"):
+        raise HTTPException(400, "images_dir 필수")
     return importer.start_import(pid, body)
 
 

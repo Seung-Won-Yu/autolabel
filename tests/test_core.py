@@ -340,3 +340,55 @@ def test_missing_label_suggestion_rejects_overlapping_boxes():
 
     # 라벨이 없으면 전부 신규 — 걸러내면 안 된다
     assert len(filter_new_objects(preds, [])) == 3
+
+
+def test_db_write_waits_for_concurrent_writer_instead_of_erroring():
+    """동시 쓰기에서 즉사하지 않는다 — 심판이 판정을 기록하는 동안 프로젝트
+    생성이 "database is locked" 500으로 죽었다 (실측). busy_timeout이 있으면
+    잠깐 기다렸다가 성공해야 한다."""
+    import tempfile
+    import threading
+    from pathlib import Path as _Path
+
+    from server import db
+
+    # 전용 임시 DB — 실서버 DB나 다른 테스트와 얽히지 않게
+    tmp = _Path(tempfile.mkdtemp()) / "lock.db"
+    orig = db.DB_PATH
+    db.DB_PATH = tmp
+    try:
+        db.init_db()
+        _run_lock_scenario(db, threading)
+    finally:
+        db.DB_PATH = orig
+
+
+def _run_lock_scenario(db, threading):
+    import time
+
+    c1 = db.get_db()
+    c1.execute("BEGIN IMMEDIATE")
+    c1.execute("INSERT INTO projects (name) VALUES ('locker')")
+
+    errors = []
+
+    def writer():  # sqlite 커넥션은 만든 스레드에서만 쓸 수 있다
+        try:
+            c2 = db.get_db()
+            # busy_timeout 없으면 여기서 sqlite3.OperationalError: database is locked
+            c2.execute("INSERT INTO projects (name) VALUES ('waiter')")
+            c2.commit()
+            c2.close()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    t = threading.Thread(target=writer)
+    t.start()
+    time.sleep(0.3)   # writer가 잠금에 걸려 기다리는 동안
+    c1.commit()       # 잠금 해제 — writer가 이어서 성공해야 한다
+    t.join(timeout=15)
+    assert not errors, errors
+    names = {r[0] for r in c1.execute(
+        "SELECT name FROM projects WHERE name IN ('locker','waiter')")}
+    assert names == {"locker", "waiter"}
+    c1.close()

@@ -277,6 +277,10 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
                     counts["stale"] += 1  # 판정 중 편집·삭제됨 — 결과 폐기
                 else:
                     counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+                # 박스마다 즉시 커밋 — 다음 판정(수 초~수십 초)까지 쓰기
+                # 트랜잭션을 쥐고 있으면 그동안 다른 쓰기(배치 오토라벨,
+                # 프로젝트 생성)가 전부 "database is locked"로 죽는다 (실측)
+                conn.commit()
             conn.commit()
             job.update(done=n, **counts)
             jobs.update("vlm", pid, done=n, **counts)

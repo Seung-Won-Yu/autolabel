@@ -66,14 +66,22 @@ CREATE TABLE IF NOT EXISTS models (
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # timeout: 다른 커넥션이 쓰기 트랜잭션을 쥐고 있으면 즉시 "database is
+    # locked"로 죽지 않고 기다린다 (실측: 심판이 판정을 기록하는 동안
+    # 프로젝트 생성이 500). WAL 전환은 배타 접근이 필요해 다른 커넥션이
+    # 활동 중이면 그 자체가 잠긴다 — init_db에서 1회만 설정한다.
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
     return conn
 
 
 def init_db():
     conn = get_db()
+    # WAL: 읽기가 쓰기에 안 막힌다. 영속 설정이라 시작 시 1회면 충분 —
+    # get_db마다 실행하면 다른 커넥션 활동 중 전환이 잠겨 오히려 죽는다
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(DDL)
     # 증분 마이그레이션 (idempotent)
     for stmt in (

@@ -29,3 +29,5 @@ webapp/playwright-report/
 
 # OS
 .DS_Store
+autolabel.db-wal
+autolabel.db-shm

@@ -591,9 +591,15 @@ def test_vlm_claude_code_adapter_parses_headless_output(monkeypatch, tmp_path):
     `claude -p --output-format json`의 result 텍스트에서 verdict JSON을 뽑는다.
     모델이 JSON 앞뒤에 말을 붙여도 견뎌야 한다.
     """
+    import glob
     import subprocess
+    import tempfile
 
     from server import vlm
+
+    # 실행 전 스냅샷 — 같은 머신에서 실제 심판이 돌고 있으면 그 임시 파일이
+    # 보일 수 있다. 이 테스트가 만든 파일만 검사해야 한다
+    before = set(glob.glob(f"{tempfile.gettempdir()}/vlm_judge_*.png"))
 
     captured = {}
 
@@ -611,10 +617,9 @@ def test_vlm_claude_code_adapter_parses_headless_output(monkeypatch, tmp_path):
     out = vlm._judge_claude_code(b"\x89PNG fake", "판정하라")
     assert out == {"verdict": "fail", "reason": "기준 위반"}
     assert captured["cmd"][0] == "claude" and "--output-format" in captured["cmd"]
-    # 임시 crop 파일은 정리되어야 한다
-    import glob
-    import tempfile
-    assert not glob.glob(f"{tempfile.gettempdir()}/vlm_judge_*.png")
+    # 임시 crop 파일은 정리되어야 한다 (이 테스트가 새로 만든 것 기준)
+    after = set(glob.glob(f"{tempfile.gettempdir()}/vlm_judge_*.png"))
+    assert not (after - before)
 
 
 def test_vlm_provider_prefers_subscription_over_local(monkeypatch):
@@ -708,3 +713,10 @@ def test_batch_verdict_partial_coverage_is_not_condemned():
     assert "대상이 없다면 정상" in v["advice"]
     assert _batch_verdict({"hit": 15, "found": 20}, 15)["verdict"] == "good"
     assert _batch_verdict({"hit": 0, "found": 0}, 15)["verdict"] == "empty"
+
+
+def test_import_without_images_dir_is_400_not_500(client):
+    pid = _project(client, "imp400")
+    r = client.post(f"/api/projects/{pid}/import", json={"image_dir": "/tmp/oops"})
+    assert r.status_code == 400
+    assert "images_dir" in r.json()["detail"]
