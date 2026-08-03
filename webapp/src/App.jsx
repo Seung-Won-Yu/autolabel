@@ -47,7 +47,9 @@ export default function App() {
   const queue = useRef(Promise.resolve())
 
   // 화면에 보이는 목록(필터·정렬 적용) — 이동(←→)도 이 순서를 따른다
-  let visible = filter === 'all' ? images : images.filter((im) => im.status === filter)
+  let visible = filter === 'all' ? images
+    : filter === 'flagged' ? images.filter((im) => (im.vlm_flags ?? 0) > 0)
+    : images.filter((im) => im.status === filter)
   if (sortMode === 'conf') visible = [...visible].sort((a, b) => (a.min_conf ?? 2) - (b.min_conf ?? 2))
   else if (sortMode === 'qa') visible = [...visible].sort((a, b) => (b.qa_score ?? -1) - (a.qa_score ?? -1))
   visibleRef.current = visible
@@ -114,6 +116,12 @@ export default function App() {
     // 않는다 — 지우면 그 편집의 자동저장 타이머와 이탈 경고가 전부 조용히
     // 건너뛰어, "저장됨" 토스트를 보고 닫은 탭에서 마지막 편집이 사라진다
     if (annsRef.current === list) dirty.current = false
+    // 사이드바 메타(개수·최저 conf)도 즉시 맞춘다 — 박스를 지웠는데 옛 숫자가
+    // 남아 있으면 검수 우선순위 판단이 틀어진다
+    const confs = list.map((a) => a.confidence).filter((c) => c != null)
+    setImages((imgs) => imgs.map((im) => (im.id === imageId
+      ? { ...im, ann_count: list.length, min_conf: confs.length ? Math.min(...confs) : null }
+      : im)))
     setMsg('저장됨')
   }, [setMsg])
 
@@ -292,9 +300,16 @@ export default function App() {
       setImages((imgs) => imgs.map((im) => (im.id === cur.id ? { ...im, status } : im)))
       setMsg(`${status === 'approved' ? '승인' : '거부'} → 다음 이미지 · Cmd+Z로 취소`)
       await moveImage(1)
+      // 리스트 끝이면 앞쪽에 남은 리뷰 대기로 순환한다 — 여기서 멈추면 A 연타
+      // 흐름이 죽는다 (실측: 15/15에서 승인 후 A 13연타 전부 무시)
+      if (currentRef.current?.id === cur.id) {
+        const pending = visibleRef.current.find(
+          (im) => im.id !== cur.id && (im.status === 'prelabeled' || im.status === 'unlabeled'))
+        if (pending) await openImage(pending)
+      }
     }).catch((e) => setMsg(`상태 변경 실패: ${e.message}`))
     return queue.current
-  }, [saveAnns, moveImage, setMsg, pushHistory])
+  }, [saveAnns, moveImage, openImage, setMsg, pushHistory])
 
   // 전역 핫키
   useEffect(() => {
@@ -918,18 +933,21 @@ function ProjectPicker({ projects, onOpen, onCreated }) {
       <div className="row">
         <input placeholder="새 프로젝트 이름" value={name} onChange={(e) => setName(e.target.value)}
           onKeyDown={async (e) => {
-            if (e.key === 'Enter' && name.trim()) { await api.createProject(name.trim(), []); setName(''); onCreated() }
+            // 만들었으면 바로 들어간다 — 목록에서 방금 만든 걸 또 찾아 누르게 하지 않기
+            if (e.key === 'Enter' && name.trim()) { const p = await api.createProject(name.trim(), []); setName(''); onOpen(p) }
           }} />
         <button className="primary" onClick={async () => {
           if (!name.trim()) return
-          await api.createProject(name.trim(), [])
-          setName(''); onCreated()
+          const p = await api.createProject(name.trim(), [])
+          setName(''); onOpen(p)
         }}>생성</button>
       </div>
       <ul className="plist">
         {projects.map((p) => (
-          <li key={p.id} onClick={() => onOpen(p)}>
-            <b>{p.name}</b> <small>{p.image_count ?? 0}장</small>
+          <li key={p.id} role="button" tabIndex={0} onClick={() => onOpen(p)}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(p) } }}>
+            <b>{p.name}</b> <small>{p.image_count ?? 0}장
+              {p.approved_count > 0 ? ` · ${p.approved_count}장 승인` : ''}</small>
             <button className="x rowdel" title="프로젝트 삭제"
               onClick={async (e) => {
                 e.stopPropagation()
@@ -966,7 +984,7 @@ function OntologyEditor({ project, setProject }) {
             onChange={(e) => save(rows.map((r, j) => (j === i ? { ...r, name: e.target.value } : r)))} />
           <input style={{ flex: 1, minWidth: 60 }} value={c.prompt} placeholder="프롬프트"
             onChange={(e) => save(rows.map((r, j) => (j === i ? { ...r, prompt: e.target.value } : r)))} />
-          <input style={{ width: 44 }} type="number" step="0.05" min="0" max="1" value={c.threshold}
+          <input style={{ width: 58 }} type="number" step="0.05" min="0" max="1" value={c.threshold}
             onChange={(e) => save(rows.map((r, j) => (j === i ? { ...r, threshold: +e.target.value } : r)))} />
           <button className="x" onClick={() => save(rows.filter((_, j) => j !== i))}>×</button>
         </div>
@@ -1460,11 +1478,12 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
     <div className="imagelist">
       <div className="row filters">
         {/* 거부도 필터에 둔다 — 예전엔 '전체'에서만 보여 되살릴 방법이 없었다 */}
-        {['all', 'prelabeled', 'approved', 'unlabeled', 'rejected'].map((f) => (
+        {['all', 'prelabeled', 'approved', 'unlabeled', 'rejected', 'flagged'].map((f) => (
           <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}
-            title={f === 'rejected' ? '거부한 이미지 — 익스포트에서 제외됩니다' : undefined}>
+            title={f === 'rejected' ? '거부한 이미지 — 익스포트에서 제외됩니다'
+              : f === 'flagged' ? '문맥 심판이 위반(✗)·불확실(?)로 판정한 박스가 있는 이미지' : undefined}>
             {{ all: '전체', prelabeled: '리뷰 대기', approved: '승인',
-              unlabeled: '미라벨', rejected: '거부' }[f]}
+              unlabeled: '미라벨', rejected: '거부', flagged: '심판 ✗' }[f]}
           </button>
         ))}
         <button className={sortMode === 'conf' ? 'active' : ''}
@@ -1505,6 +1524,7 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
                 {im.ann_count > 0 ? ` ${im.ann_count}개` : ' 라벨 없음'}
                 {im.min_conf != null ? ` · conf ${im.min_conf.toFixed(2)}` : ''}
                 {im.qa_score != null ? ` · QA ${im.qa_score}` : ''}
+                {(im.vlm_flags ?? 0) > 0 ? <span className="vflag"> · 심판 ✗{im.vlm_flags}</span> : null}
               </small>
             </div>
             <button className="x rowdel" title="이미지 삭제"

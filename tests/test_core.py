@@ -271,7 +271,9 @@ def test_batch_verdict_routes_by_detection_rate():
     from server.main import _batch_verdict
 
     assert _batch_verdict({"hit": 9, "found": 20}, 10)["verdict"] == "good"
-    assert _batch_verdict({"hit": 2, "found": 3}, 10)["verdict"] == "weak"
+    # 중간 커버리지는 'weak' 단정이 아니라 'partial' — 대상 없는 이미지가
+    # 정상인 데이터셋일 수 있다 (test_api의 회귀 테스트 참조)
+    assert _batch_verdict({"hit": 2, "found": 3}, 10)["verdict"] == "partial"
     empty = _batch_verdict({"hit": 0, "found": 0}, 10)
     assert empty["verdict"] == "empty"
     assert "프롬프트" in empty["advice"]  # 다음 수를 반드시 제시해야 한다

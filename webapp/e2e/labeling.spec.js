@@ -640,3 +640,28 @@ test('문맥 심판은 기준 저장 전엔 잠기고 완료 요약을 알린다
   await runBtn.click()
   await expect(page.getByText(/부합 1 · 위반 1/)).toBeVisible()
 })
+
+test('마지막 이미지를 승인하면 앞쪽 리뷰 대기로 순환한다', async ({ page }) => {
+  // 실측: 15장 중 마지막 장에서 A를 눌러 승인한 뒤엔 A가 죽은 키가 됐다 —
+  // 앞쪽에 리뷰할 13장이 남아 있는데도. 끝에서는 앞쪽 미처리 이미지로 돌아
+  // 가야 A 연타 흐름이 안 끊긴다.
+  const { id, name } = await newProject(page, 'wrap-approve', ONE_CLASS)
+  await uploadImage(page, id, 'first.png')
+  await uploadImage(page, id, 'second.png')
+  await uploadImage(page, id, 'third.png')
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+  await page.locator('canvas').first().click({ position: { x: 5, y: 5 } })
+
+  // 마지막 장으로 이동한 뒤 A 3연타 — 순환이 없으면 마지막 한 장만 승인된다
+  await page.keyboard.press('ArrowRight')
+  await page.keyboard.press('ArrowRight')
+  await page.keyboard.press('a')
+  await expect(page.getByText('1/3 승인')).toBeVisible()
+  await page.keyboard.press('a')
+  await expect(page.getByText('2/3 승인')).toBeVisible()
+  await page.keyboard.press('a')
+  await expect(page.getByText('3/3 승인')).toBeVisible()
+})

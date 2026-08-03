@@ -671,3 +671,40 @@ def test_colab_notebook_is_valid_json(client):
     nb = json.loads(r.content)
     assert nb["nbformat"] == 4 and nb["metadata"]["accelerator"] == "GPU"
     assert any("ultralytics" in "".join(c["source"]) for c in nb["cells"])
+
+
+def test_images_list_reports_vlm_flags_and_project_progress(client, make_image, tmp_path):
+    """심판 위반 필터의 근거 — 이미지 목록에 위반·불확실 박스 수(vlm_flags)가
+    나와야 위반이 어느 이미지에 있는지 찾는다 (실측: 뱃지·필터가 없어 15장을
+    일일이 뒤졌다). 프로젝트 목록의 승인 진행도(approved_count)도 같은 이유."""
+    pid = _project(client, "flags")
+    img = make_image(tmp_path / "flags", "a.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("a.jpg", f, "image/jpeg"))]).json()["saved"][0]
+    client.put(f"/api/images/{iid}/annotations", json={"annotations": [
+        {"class_name": "person", "bbox": [10, 10, 50, 50], "source": "model",
+         "meta": {"vlm": {"verdict": "fail", "reason": "x"}}},
+        {"class_name": "person", "bbox": [70, 10, 50, 50], "source": "model",
+         "meta": {"vlm": {"verdict": "pass", "reason": "y"}}},
+        {"class_name": "person", "bbox": [130, 10, 50, 50], "source": "model",
+         "meta": {"vlm": {"verdict": "unsure", "reason": "z"}}}]})
+    me = next(i for i in client.get(f"/api/projects/{pid}/images").json() if i["id"] == iid)
+    assert me["vlm_flags"] == 2  # fail + unsure — pass는 세지 않는다
+
+    client.put(f"/api/images/{iid}/status", json={"status": "approved"})
+    p = next(p for p in client.get("/api/projects").json() if p["id"] == pid)
+    assert p["image_count"] == 1 and p["approved_count"] == 1
+
+
+def test_batch_verdict_partial_coverage_is_not_condemned():
+    """중간 검출률을 '제로샷 약함'으로 단정하지 않는다 — 대상 없는 이미지가
+    섞인 데이터셋에선 낮은 커버리지가 정답이다 (실측: 개 9장+비개 6장에서
+    9/15 검출 = 만점인데 'weak' 판정으로 프롬프트 실험·수동 라벨을 권했다)."""
+    from server.main import _batch_verdict
+
+    v = _batch_verdict({"hit": 9, "found": 11}, 15)
+    assert v["verdict"] == "partial"
+    assert "대상이 없다면 정상" in v["advice"]
+    assert _batch_verdict({"hit": 15, "found": 20}, 15)["verdict"] == "good"
+    assert _batch_verdict({"hit": 0, "found": 0}, 15)["verdict"] == "empty"

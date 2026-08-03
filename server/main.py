@@ -71,8 +71,9 @@ def capabilities():
 def list_projects():
     conn = get_db()
     rows = [row_to_dict(r) for r in conn.execute(
-        "SELECT p.*, (SELECT COUNT(*) FROM images i WHERE i.project_id=p.id) AS image_count "
-        "FROM projects p ORDER BY p.id DESC")]
+        "SELECT p.*, (SELECT COUNT(*) FROM images i WHERE i.project_id=p.id) AS image_count, "
+        "(SELECT COUNT(*) FROM images i WHERE i.project_id=p.id AND i.status='approved') "
+        "AS approved_count FROM projects p ORDER BY p.id DESC")]
     conn.close()
     return rows
 
@@ -184,7 +185,9 @@ async def upload_images(pid: int, files: list[UploadFile]):
 def list_images(pid: int, status: str | None = None):
     conn = get_db()
     q = ("SELECT i.*, (SELECT COUNT(*) FROM annotations a WHERE a.image_id=i.id) AS ann_count, "
-         "(SELECT MIN(a.confidence) FROM annotations a WHERE a.image_id=i.id) AS min_conf "
+         "(SELECT MIN(a.confidence) FROM annotations a WHERE a.image_id=i.id) AS min_conf, "
+         "(SELECT COUNT(*) FROM annotations a WHERE a.image_id=i.id "
+         " AND json_extract(a.meta, '$.vlm.verdict') IN ('fail','unsure')) AS vlm_flags "
          "FROM images i WHERE i.project_id=?")
     args: list = [pid]
     if status:
@@ -415,9 +418,13 @@ def _batch_verdict(job: dict, total: int) -> dict:
                 "한 장도 못 찾았습니다. 검출 프롬프트를 영어로 바꾸거나 "
                 "'프롬프트 실험'으로 후보를 비교해 보세요. 그래도 안 되면 직접 "
                 "몇 장 그린 뒤 전용 모델을 학습시키는 편이 빠릅니다."}
-    return {"verdict": "weak", "advice":
-            f"{total}장 중 {hit}장에서만 검출({found}개). 이 도메인은 제로샷이 약합니다 — "
-            "'프롬프트 실험'으로 프롬프트를 고르거나, 직접 라벨 수십 장으로 "
+    # 중간 커버리지는 단정하지 않는다 — 대상이 없는 이미지가 섞인 데이터셋에선
+    # 낮은 검출률이 정답이다 (실측: 개 9장+비개 6장에서 9/15 검출 = 만점인데
+    # "제로샷 약함"으로 오판해 프롬프트 실험·수동 라벨로 오도했다)
+    return {"verdict": "partial", "advice":
+            f"{total}장 중 {hit}장에서 검출({found}개). 못 찾은 {total - hit}장에 실제로 "
+            "대상이 없다면 정상입니다 — 빈 이미지 몇 장을 열어 누락인지 확인하세요. "
+            "누락이 많으면 '프롬프트 실험'으로 표현을 고르거나, 직접 라벨 수십 장으로 "
             "전용 모델을 학습시키면 급격히 좋아집니다."}
 
 
