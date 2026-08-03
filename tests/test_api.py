@@ -542,6 +542,9 @@ def test_vlm_judge_stores_verdicts_and_reuses_cache(client, make_image, tmp_path
     s = run_and_wait()
     assert s["status"] == "completed", s
     assert s["pass"] == 1 and s["unsure"] == 1 and len(calls) == 2
+    # 박스 단위 진행률 — 박스 많은 이미지에서 이미지 단위 진행만 보이면
+    # 수십 분째 멈춘 것처럼 보인다 (실측)
+    assert s["total_boxes"] == 2 and s["done_boxes"] == 2, s
 
     anns = client.get(f"/api/images/{iid}/annotations").json()
     assert all(a["meta"]["vlm"]["rubric_sha"] for a in anns)

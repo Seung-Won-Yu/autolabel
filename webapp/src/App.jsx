@@ -1115,6 +1115,15 @@ function VlmJudge({ project, setProject, onMsg, onDone }) {
 
   useEffect(() => { setRubric(project.rubric || ''); setSaved(true) }, [project.id]) // eslint-disable-line
 
+  // 이미 돌고 있는 심판을 복원한다 — 새로 연 화면(재접속·다른 탭)에서 버튼이
+  // "실행" 대기로 보이면 진행 중인 판정을 이중 실행하거나 죽은 줄 안다.
+  // 논블로킹 (.then) — 프로젝트 열기 흐름을 지연시키지 않는다 (배치 복원과 동일)
+  useEffect(() => {
+    api.vlmStatus(project.id).then((s) => {
+      if (s.status === 'running') setJob(s)
+    }).catch(() => {})
+  }, [project.id])
+
   useEffect(() => {
     if (job?.status !== 'running') return
     const t = setInterval(async () => {
@@ -1172,7 +1181,9 @@ function VlmJudge({ project, setProject, onMsg, onDone }) {
                 ? ' — VLM 제공자 없음 (Claude Code CLI 설치=구독으로 무료, 또는 ANTHROPIC_API_KEY, 또는 Ollama)' : ''}`, true)
             }
           }}>
-          {job?.status === 'running' ? `심판 중 ${job.done ?? 0}/${job.total}` : '▶ 문맥 심판 실행'}
+          {job?.status === 'running'
+            ? `심판 중 — 박스 ${job.done_boxes ?? 0}/${job.total_boxes ?? '?'} (이미지 ${job.done ?? 0}/${job.total})`
+            : '▶ 문맥 심판 실행'}
         </button>
       </div>
     </div>

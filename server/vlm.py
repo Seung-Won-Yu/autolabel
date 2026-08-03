@@ -234,6 +234,15 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
     sha = rubric_sha(rubric)
     counts = {"pass": 0, "fail": 0, "unsure": 0, "cached": 0, "stale": 0}
     conn = get_db()
+    # 박스 단위 진행률 — 판정은 박스당 수 초~수십 초라 이미지 단위(done)만
+    # 보여주면 박스 많은 이미지에서 수십 분째 그대로로 보인다 (실측: 멈춤과
+    # 저속을 구분 못 해 죽었는지 확인하러 옴)
+    qmarks = ",".join("?" * len(image_ids))
+    total_boxes = conn.execute(
+        f"SELECT COUNT(*) FROM annotations WHERE image_id IN ({qmarks})",
+        image_ids).fetchone()[0] if image_ids else 0
+    done_boxes = 0
+    job.update(total_boxes=total_boxes, done_boxes=0)
     try:
         for n, iid in enumerate(image_ids, 1):
             im = conn.execute("SELECT * FROM images WHERE id=?", (iid,)).fetchone()
@@ -248,10 +257,12 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
                 # 같은 기준·같은 박스로 이미 판정된 것만 캐시로 인정.
                 # error 판정(일시 장애)은 제외 — 아니면 429 한 번에 영구 unsure.
                 # box 스냅샷 불일치(판정 후 박스 수정)도 재판정 대상이다.
+                done_boxes += 1
                 if (prev and prev.get("rubric_sha") == sha
                         and not prev.get("error") and prev.get("box") == box_key):
                     counts["cached"] += 1
                     counts[prev["verdict"]] = counts.get(prev["verdict"], 0) + 1
+                    job.update(done_boxes=done_boxes)
                     continue
                 if img is None:
                     path = _image_path(im)
@@ -281,6 +292,7 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
                 # 트랜잭션을 쥐고 있으면 그동안 다른 쓰기(배치 오토라벨,
                 # 프로젝트 생성)가 전부 "database is locked"로 죽는다 (실측)
                 conn.commit()
+                job.update(done_boxes=done_boxes, **counts)
             conn.commit()
             job.update(done=n, **counts)
             jobs.update("vlm", pid, done=n, **counts)
