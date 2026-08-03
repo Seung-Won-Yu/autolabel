@@ -55,6 +55,20 @@ export const api = {
       body: JSON.stringify(opts),
     }).then(j),
   autolabelStatus: (pid) => fetch(`/api/projects/${pid}/autolabel/status`).then(j),
+  saveRubric: (pid, rubric) =>
+    fetch(`/api/projects/${pid}/rubric`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rubric }),
+    }).then(j),
+  vlmJudge: (pid, body = {}) =>
+    fetch(`/api/projects/${pid}/vlm-judge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
+  vlmStatus: (pid) => fetch(`/api/projects/${pid}/vlm-judge/status`).then(j),
+  capabilities: () => fetch('/api/capabilities').then(j),
   exportUrl: (pid, fmt) => `/api/projects/${pid}/export.zip?fmt=${fmt}`,
   modelUrl: (pid) => `/api/projects/${pid}/model`,
   deleteImage: (iid) => fetch(`/api/images/${iid}`, { method: 'DELETE' }).then(j),

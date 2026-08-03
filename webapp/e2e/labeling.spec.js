@@ -598,3 +598,45 @@ test('중단된 임포트를 완료라고 말하지 않는다', async ({ page })
   await expect(page.getByText(/임포트가 중단됐습니다 \(400장 연결\)/)).toBeVisible()
   await expect(page.getByText(/임포트 완료/)).toHaveCount(0)
 })
+
+test('문맥 심판 verdict가 어노테이션 패널에 표시된다', async ({ page }) => {
+  // VLM 심판이 남긴 meta.vlm이 부합✓/위반✗ 칩으로 보여야 한다 — 리뷰어는
+  // 위반·불확실만 골라 확인하는 흐름이라 칩이 없으면 기능이 없는 것과 같다.
+  const { id, name } = await newProject(page, 'vlm-chip', ONE_CLASS)
+  const iid = await uploadImage(page, id)
+  await page.request.put(`${API}/images/${iid}/annotations`, { data: { annotations: [
+    { class_name: 'sig', bbox: [10, 10, 30, 30], source: 'model',
+      meta: { vlm: { verdict: 'fail', reason: '기준 위반: 테스트', rubric_sha: 'abc' } } },
+    { class_name: 'sig', bbox: [50, 50, 30, 30], source: 'model',
+      meta: { vlm: { verdict: 'pass', reason: '부합', rubric_sha: 'abc' } } },
+  ] } })
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+  await expect(page.locator('.vchip.fail')).toHaveCount(1)
+  await expect(page.locator('.vchip.pass')).toHaveCount(1)
+})
+
+test('문맥 심판은 기준 저장 전엔 잠기고 완료 요약을 알린다', async ({ page }) => {
+  const { id, name } = await newProject(page, 'vlm-flow', ONE_CLASS)
+  await uploadImage(page, id)
+  await page.route('**/api/projects/*/vlm-judge', (route) =>
+    route.fulfill({ json: { status: 'running', done: 0, total: 1 } }))
+  await page.route('**/api/projects/*/vlm-judge/status', (route) =>
+    route.fulfill({ json: { status: 'completed', done: 1, total: 1,
+      advice: '판정 3건: 부합 1 · 위반 1 · 불확실 1 — 위반·불확실만 확인하면 됩니다' } }))
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await page.locator('.setup-toggle').click()
+
+  const runBtn = page.getByRole('button', { name: '문맥 심판 실행' })
+  await expect(runBtn).toBeDisabled() // 기준 없는 판정은 의미가 없다
+  await page.getByPlaceholder(/판정 기준을 서술/).fill('파손 흔적이 있는 차량만')
+  await page.getByRole('button', { name: '기준 저장' }).click()
+  await expect(page.getByText('판정 기준 저장됨')).toBeVisible()
+
+  await runBtn.click()
+  await expect(page.getByText(/부합 1 · 위반 1/)).toBeVisible()
+})

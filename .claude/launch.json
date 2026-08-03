@@ -2,6 +2,18 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "autolabel-api",
+      "runtimeExecutable": "/Users/est/Documents/claude/autolabel/.venv/bin/python",
+      "runtimeArgs": ["-m", "uvicorn", "server.main:app", "--port", "8899"],
+      "port": 8899
+    },
+    {
+      "name": "autolabel-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "webapp"],
+      "port": 5173
+    },
+    {
       "name": "sam-demo",
       "runtimeExecutable": "/Users/est/Documents/claude/autolabel/.venv/bin/python",
       "runtimeArgs": ["scripts/embed_server.py"],

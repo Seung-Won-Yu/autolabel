@@ -228,3 +228,13 @@ table.lab tr.win td { color: var(--ok, #7ddc9a); font-weight: 600; }
 table.lab button { padding: 2px 8px; font-size: 11px; }
 
 details summary { cursor: pointer; color: var(--dim); font-size: 13px; font-weight: 600; }
+
+/* VLM 문맥 심판 verdict 칩 — 위반·불확실만 눈에 띄면 된다 */
+.vchip {
+  flex-shrink: 0; width: 16px; height: 16px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 700; cursor: help;
+}
+.vchip.pass { background: rgba(80, 200, 120, 0.18); color: #7ddc9a; }
+.vchip.fail { background: rgba(255, 90, 90, 0.22); color: #ff7a7a; }
+.vchip.unsure { background: rgba(255, 190, 70, 0.2); color: #ffc862; }

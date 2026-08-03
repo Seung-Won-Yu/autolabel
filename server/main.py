@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from server import importer, jobs, ml, train
+from server import importer, jobs, ml, train, vlm
 from server.db import get_db, init_db, row_to_dict
 
 DATA_DIR = Path(os.environ.get("AUTOLABEL_DATA")
@@ -61,6 +61,9 @@ def capabilities():
         "sam_encoder": not ml.NO_MODELS and Path(ml.SAM_CKPT).exists(),
         "device": ml.DEVICE,
         "models_disabled": ml.NO_MODELS,
+        # 문맥 심판(rubric 기반 박스 판정)에 쓸 VLM 제공자 — 없으면 null
+        "vlm": vlm.provider(),
+        "vlm_hint": vlm.PROVIDER_HINT,
     }
 
 
@@ -72,6 +75,53 @@ def list_projects():
         "FROM projects p ORDER BY p.id DESC")]
     conn.close()
     return rows
+
+
+@app.put("/api/projects/{pid}/rubric")
+def update_rubric(pid: int, body: dict):
+    """VLM 문맥 심판의 판정 기준 문서 저장."""
+    conn = get_db()
+    cur = conn.execute("UPDATE projects SET rubric=? WHERE id=?",
+                       (body.get("rubric", ""), pid))
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        raise HTTPException(404, "프로젝트 없음")
+    return {"ok": True}
+
+
+@app.post("/api/projects/{pid}/vlm-judge")
+def vlm_judge(pid: int, body: dict | None = None):
+    """VLM 문맥 심판 시작 — 리뷰 대기(prelabeled) 이미지의 박스를 rubric으로 판정.
+
+    같은 rubric으로 판정된 박스는 캐시를 재사용하므로 재실행 비용이 없다.
+    image_ids로 대상을 좁힐 수 있다.
+    """
+    conn = get_db()
+    proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    if not proj:
+        conn.close()
+        raise HTTPException(404, "프로젝트 없음")
+    rubric = (proj["rubric"] or "").strip() if "rubric" in proj.keys() else ""
+    if not rubric:
+        conn.close()
+        raise HTTPException(400, "판정 기준(rubric)을 먼저 작성하세요")
+    ids = (body or {}).get("image_ids") or [
+        r["id"] for r in conn.execute(
+            "SELECT id FROM images WHERE project_id=? AND status='prelabeled'", (pid,))]
+    conn.close()
+    if not ids:
+        return {"status": "completed", "done": 0, "total": 0,
+                "advice": "판정할 이미지가 없습니다 — 리뷰 대기(prelabeled) 이미지가 없습니다"}
+    st = vlm.start_judge(pid, rubric, ids)
+    if st.get("status") == "failed":
+        raise HTTPException(503, st["error"])
+    return st
+
+
+@app.get("/api/projects/{pid}/vlm-judge/status")
+def vlm_judge_status(pid: int):
+    return vlm.job_status(pid)
 
 
 @app.put("/api/projects/{pid}/ontology")
@@ -241,8 +291,24 @@ def get_annotations(iid: int):
 def replace_annotations(iid: int, body: dict):
     """이미지의 어노테이션 전체 교체 (캔버스 저장). 사람 수정은 source='human'."""
     conn = get_db()
+    # VLM 판정(meta.vlm)은 서버가 백그라운드로 채우는 값이라, 판정 전에 화면을
+    # 연 클라이언트의 사본에는 없다. 전체 교체가 그 사본을 그대로 쓰면 유료
+    # 판정과 캐시가 조용히 사라진다 — 클라이언트가 vlm을 보내지 않은 기존
+    # 행(id 기준)은 보존 병합한다.
+    old_vlm = {}
+    for r in conn.execute("SELECT id, meta FROM annotations WHERE image_id=?", (iid,)):
+        try:
+            v = json.loads(r["meta"]).get("vlm")
+            if v:
+                old_vlm[r["id"]] = v
+        except (json.JSONDecodeError, TypeError):
+            pass
     conn.execute("DELETE FROM annotations WHERE image_id=?", (iid,))
     for a in body["annotations"]:
+        meta = a.get("meta") or {}
+        if "vlm" not in meta and old_vlm.get(a.get("id")):
+            meta = {**meta, "vlm": old_vlm[a["id"]]}
+        a = {**a, "meta": meta}
         conn.execute(
             "INSERT INTO annotations (image_id, class_name, bbox, segmentation, confidence, "
             "parent_annotation_id, source, meta) VALUES (?,?,?,?,?,?,?,?)",

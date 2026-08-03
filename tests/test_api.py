@@ -489,6 +489,125 @@ def test_missing_ids_return_404_not_500(client):
     assert client.post("/api/projects/999999/autolabel", json={}).status_code == 404
 
 
+def test_vlm_judge_stores_verdicts_and_reuses_cache(client, make_image, tmp_path,
+                                                    monkeypatch):
+    """문맥 심판: rubric 저장 → 박스별 판정이 meta.vlm에 남는다.
+
+    같은 기준 재실행은 캐시를 써서 판정 함수를 다시 부르지 않아야 한다 —
+    VLM 호출은 건당 비용이라 재실행이 공짜여야 안심하고 다시 돌린다.
+    """
+    import time
+
+    from server import vlm
+
+    pid = _project(client, "vlm")
+    img = make_image(tmp_path / "vlm", "a.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("a.jpg", f, "image/jpeg"))]).json()["saved"][0]
+    client.put(f"/api/images/{iid}/annotations", json={"annotations": [
+        {"class_name": "person", "bbox": [10, 10, 50, 50], "source": "model"},
+        {"class_name": "person", "bbox": [100, 100, 50, 50], "source": "model"}]})
+    client.put(f"/api/images/{iid}/status", json={"status": "prelabeled"})
+
+    # 기준 없이 실행하면 400 — 기준 없는 판정은 의미가 없다
+    assert client.post(f"/api/projects/{pid}/vlm-judge", json={}).status_code == 400
+    assert client.put(f"/api/projects/{pid}/rubric",
+                      json={"rubric": "정면을 보는 사람만 person"}).json()["ok"]
+    assert client.get(f"/api/projects/{pid}").json()["rubric"].startswith("정면")
+
+    calls = []
+    behavior = {"fail_transiently": True}
+
+    def fake_judge(image, bbox, class_name, rubric, prov):
+        calls.append(list(bbox))
+        if behavior["fail_transiently"] and bbox[0] == 10:
+            # 일시 장애 흉내 (429 등) — 실제 judge_box와 같은 형태로 반환
+            return {"verdict": "unsure", "reason": "판정 실패: 429", "error": True}
+        return {"verdict": "fail" if bbox[0] == 10 else "pass", "reason": "테스트 근거"}
+
+    monkeypatch.setattr(vlm, "judge_box", fake_judge)
+    monkeypatch.setattr(vlm, "provider", lambda: "anthropic")
+
+    def run_and_wait():
+        r = client.post(f"/api/projects/{pid}/vlm-judge", json={})
+        assert r.status_code == 200, r.text
+        for _ in range(50):
+            s = client.get(f"/api/projects/{pid}/vlm-judge/status").json()
+            if s["status"] != "running":
+                return s
+            time.sleep(0.1)
+        raise AssertionError("판정이 끝나지 않음")
+
+    s = run_and_wait()
+    assert s["status"] == "completed", s
+    assert s["pass"] == 1 and s["unsure"] == 1 and len(calls) == 2
+
+    anns = client.get(f"/api/images/{iid}/annotations").json()
+    assert all(a["meta"]["vlm"]["rubric_sha"] for a in anns)
+
+    # 일시 장애로 실패한 판정은 캐시되면 안 된다 — 재실행 시 그 박스만 재판정.
+    # 이게 없으면 429 한 번에 영구 unsure가 되고, 기준을 바꿔 전량 재과금하는
+    # 것 말고는 탈출구가 없다.
+    behavior["fail_transiently"] = False
+    s = run_and_wait()
+    assert s["status"] == "completed", s
+    assert len(calls) == 3, "오류 판정이 캐시로 굳었다"
+    assert s["fail"] == 1 and s["cached"] == 1
+
+    # 정상 판정은 전량 캐시 — 재실행 비용 0
+    s = run_and_wait()
+    assert s["cached"] == 2 and len(calls) == 3, "캐시가 있는데 VLM을 다시 불렀다"
+
+    # 박스를 수정하면 그 박스만 재판정 — 낡은 판정이 유효한 척하면 안 된다
+    anns = client.get(f"/api/images/{iid}/annotations").json()
+    for a in anns:
+        if a["bbox"][0] == 10:
+            a["bbox"] = [12, 10, 50, 50]
+    client.put(f"/api/images/{iid}/annotations", json={"annotations": anns})
+    s = run_and_wait()
+    assert len(calls) == 4 and s["cached"] == 1, (calls, s)
+
+    # 저장(전체 교체)이 판정을 지우면 안 된다 — 클라이언트 사본에 vlm이 없어도
+    # id 기준으로 보존 병합된다 (유료 판정·캐시 보호)
+    anns = client.get(f"/api/images/{iid}/annotations").json()
+    stripped = [{"id": a["id"], "class_name": a["class_name"], "bbox": a["bbox"],
+                 "source": a["source"]} for a in anns]
+    client.put(f"/api/images/{iid}/annotations", json={"annotations": stripped})
+    anns = client.get(f"/api/images/{iid}/annotations").json()
+    assert all((a["meta"] or {}).get("vlm") for a in anns), "저장이 판정을 지웠다"
+    s = run_and_wait()
+    assert len(calls) == 4 and s["cached"] == 2, "보존된 판정이 캐시로 안 잡힌다"
+
+    # 기준이 바뀌면 전량 다시 판정한다
+    client.put(f"/api/projects/{pid}/rubric", json={"rubric": "완전히 다른 기준"})
+    run_and_wait()
+    assert len(calls) == 6
+
+
+def test_vlm_judge_without_provider_returns_clear_error(client, make_image, tmp_path,
+                                                        monkeypatch):
+    """제공자가 없으면 조용히 실패하지 말고 설정 방법을 알려야 한다."""
+    from server import vlm
+
+    monkeypatch.setattr(vlm, "provider", lambda: None)
+    pid = _project(client, "vlm-off")
+    client.put(f"/api/projects/{pid}/rubric", json={"rubric": "기준"})
+    img = make_image(tmp_path / "voff", "a.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("a.jpg", f, "image/jpeg"))]).json()["saved"][0]
+    client.put(f"/api/images/{iid}/status", json={"status": "prelabeled"})
+
+    r = client.post(f"/api/projects/{pid}/vlm-judge", json={})
+    assert r.status_code == 503
+    assert "ANTHROPIC_API_KEY" in r.json()["detail"]
+
+    # capabilities가 제공자 유무를 알린다 (UI 안내용)
+    cap = client.get("/api/capabilities").json()
+    assert "vlm" in cap and "vlm_hint" in cap
+
+
 def test_capabilities_reports_model_availability(client):
     cap = client.get("/api/capabilities").json()
     assert set(cap) >= {"sam3", "sam_encoder", "device"}

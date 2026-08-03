@@ -17,3 +17,6 @@ onnxscript
 onnxruntime
 pytest
 httpx
+# 선택: VLM 문맥 심판의 Claude API 제공자 (ANTHROPIC_API_KEY 필요).
+# 미설치여도 도구는 정상 동작 — Ollama 폴백 또는 기능 비활성.
+# anthropic

@@ -41,6 +41,7 @@ export default function App() {
   // 승인). 최신 값을 ref로 들고, 작업을 프라미스 체인으로 직렬화한다.
   const currentRef = useRef(null)
   const annsRef = useRef([])
+  const openSeq = useRef(0) // 이미지 열기 순번 — 낡은 fetch가 새 화면을 덮지 않게
   const visibleRef = useRef([])
   const imagesRef = useRef([])
   const queue = useRef(Promise.resolve())
@@ -106,7 +107,9 @@ export default function App() {
   }
 
   const saveAnns = useCallback(async (imageId, list) => {
-    await api.saveAnnotations(imageId, list.map(({ _key, id, ...a }) => a))
+    // id는 유지해서 보낸다 — 서버가 백그라운드로 채운 meta.vlm(유료 판정)을
+    // 이 사본에 없어도 id 기준으로 보존 병합할 수 있게
+    await api.saveAnnotations(imageId, list.map(({ _key, ...a }) => a))
     // 저장 비행 중 새 편집이 있었으면(annsRef가 이미 다른 참조) dirty를 지우지
     // 않는다 — 지우면 그 편집의 자동저장 타이머와 이탈 경고가 전부 조용히
     // 건너뛰어, "저장됨" 토스트를 보고 닫은 탭에서 마지막 편집이 사라진다
@@ -115,14 +118,21 @@ export default function App() {
   }, [setMsg])
 
   const openImage = useCallback(async (im) => {
+    // 열기 순번 — 연속 이동(화살표 연타, 이동 직후 undo)에서 먼저 시작한
+    // 열기의 fetch가 늦게 도착해 나중 이미지의 어노테이션을 덮는 레이스 차단
+    const seq = ++openSeq.current
     const cur = currentRef.current
     if (dirty.current && cur) await saveAnns(cur.id, annsRef.current)
+    // 저장을 기다리는 사이 더 최신 열기가 시작됐으면 여기서 멈춘다 — 계속
+    // 진행하면 currentRef를 낡은 이미지로 되돌려 화면과 상태가 어긋난다
+    if (seq !== openSeq.current) return false
     resetEmbed()
     // ref를 즉시 갱신한다 — 리렌더를 기다리면 연속 처리에서 다음 호출이
     // 아직 이전 이미지를 현재로 보고 같은 것을 또 처리한다
     currentRef.current = im
     setCurrent(im)
     const list = await api.getAnnotations(im.id)
+    if (seq !== openSeq.current) return false // 더 최신 열기가 진행 중 — 낡은 응답 폐기
     const mapped = list.map((a) => ({ ...a, _key: `db-${a.id}` }))
     annsRef.current = mapped
     setAnns(mapped)
@@ -131,6 +141,7 @@ export default function App() {
     dirty.current = false
     // 이력은 지우지 않는다 — 이미지를 넘긴 뒤에도 되돌릴 수 있어야 한다
     ensureEmbed(im.id).catch(() => {})
+    return true // 이 열기가 최신으로 완료됨 (경합 시 false)
   }, [saveAnns])
 
   // 이미지가 처음 생기면 자동으로 연다. 프로젝트를 열 때만 열면, 임포트나
@@ -188,6 +199,12 @@ export default function App() {
     if (currentRef.current?.id !== entry.imageId) {
       if (!target) return setMsg('되돌릴 이미지를 찾을 수 없습니다')
       await openImage(target)
+      // 이동(화살표)과 경합해 다른 이미지가 열렸으면 여기서 적용하면 안 된다 —
+      // 엉뚱한 이미지에 이전 어노테이션이 저장된다. 되밀어 넣고 중단.
+      if (currentRef.current?.id !== entry.imageId) {
+        undoStack.current.push(entry)
+        return setMsg('이미지 이동과 겹쳐 되돌리기를 중단했습니다 — 다시 Cmd+Z')
+      }
     }
     dirty.current = true
     annsRef.current = entry.before
@@ -483,6 +500,20 @@ export default function App() {
             onDone={async () => setImages(await api.listImages(project.id))} />
           <PromptLab project={project} setProject={setProject} onMsg={setMsg}
             hasImages={images.length > 0} />
+          <VlmJudge project={project} setProject={setProject} onMsg={setMsg}
+            onDone={async () => {
+              setImages(await api.listImages(project.id))
+              // 판정 결과(meta.vlm)를 현재 이미지 패널에 반영 — 편집 중이면 건드리지 않는다
+              const cur = currentRef.current
+              if (cur && !dirty.current) {
+                const list = await api.getAnnotations(cur.id)
+                if (currentRef.current?.id === cur.id && !dirty.current) {
+                  const mapped = list.map((a) => ({ ...a, _key: `db-${a.id}` }))
+                  annsRef.current = mapped
+                  setAnns(mapped)
+                }
+              }
+            }} />
           <div className="card">
             <div className="panel-title">일괄 작업</div>
             <div className="row">
@@ -843,6 +874,12 @@ function AnnPanel({ anns, ontology, selectedId, setSelectedId, hoverId, setHover
             {ontology.map((c) => <option key={c.name}>{c.name}</option>)}
           </select>
           <small>{a.confidence != null ? a.confidence.toFixed(2) : ''} {a.source === 'model' ? '🤖' : '✍️'}{a.segmentation ? ' ▦' : ''}</small>
+          {a.meta?.vlm && (
+            <span className={`vchip ${a.meta.vlm.verdict}`}
+              title={`문맥 심판: ${a.meta.vlm.reason}`}>
+              {a.meta.vlm.verdict === 'pass' ? '✓' : a.meta.vlm.verdict === 'fail' ? '✗' : '?'}
+            </span>
+          )}
           <button className="x" onClick={(e) => { e.stopPropagation(); onDelete(a._key) }}>×</button>
         </div>
       ))}
@@ -1045,6 +1082,81 @@ function PromptLab({ project, setProject, onMsg, hasImages }) {
           )}
         </>
       )}
+    </div>
+  )
+}
+
+// VLM 문맥 심판 — 외형이 아니라 "기준"으로 판정해야 하는 라벨용.
+// 검출 모델은 어디 있는지만 안다. "이 차가 사고 차량인가" 같은 문맥 판정은
+// 기준 텍스트를 읽고 이미지를 보는 VLM이 예비 판정하고, 사람은 위반·불확실만
+// 확인한다 — 리뷰가 전수 판독에서 예외 확인으로 바뀐다.
+function VlmJudge({ project, setProject, onMsg, onDone }) {
+  const [rubric, setRubric] = useState(project.rubric || '')
+  const [saved, setSaved] = useState(true)
+  const [job, setJob] = useState(null)
+
+  useEffect(() => { setRubric(project.rubric || ''); setSaved(true) }, [project.id]) // eslint-disable-line
+
+  useEffect(() => {
+    if (job?.status !== 'running') return
+    const t = setInterval(async () => {
+      const s = await api.vlmStatus(project.id)
+      setJob(s)
+      if (s.status !== 'running') {
+        clearInterval(t)
+        onDone()
+        // 완료가 아닌 종료를 완료로 말하지 않는다 (배치·임포트와 같은 규칙)
+        const text = s.status === 'failed' ? `문맥 심판 실패: ${s.error}`
+          : s.status === 'interrupted' ? `문맥 심판이 중단됐습니다 (${s.done ?? 0}/${s.total ?? '?'}장) — 다시 실행하세요`
+            : s.status === 'idle' ? '문맥 심판 진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요'
+              : s.advice || '문맥 심판 완료'
+        onMsg(text, true)
+      }
+    }, 1500)
+    return () => clearInterval(t)
+  }, [job?.status]) // eslint-disable-line
+
+  return (
+    <div className="card">
+      <div className="panel-title">🧑‍⚖️ 문맥 심판 (VLM)</div>
+      <div className="hint">
+        외형만으로 판정할 수 없는 라벨용. 판정 기준을 글로 쓰면 VLM이 박스마다
+        부합✓/위반✗/불확실? + 근거를 달아줍니다 — 위반·불확실만 확인하세요.
+        같은 기준 재실행은 캐시를 써서 비용이 없습니다.
+      </div>
+      <textarea value={rubric} rows={4} style={{ width: '100%' }}
+        placeholder={'판정 기준을 서술하세요. 예:\n- 파손·충돌 흔적이 있거나 사고 현장에 정차한 차량만 accident_vehicle\n- 단순 주행·주차 중인 차량은 제외'}
+        onChange={(e) => { setRubric(e.target.value); setSaved(false) }} />
+      <div className="row">
+        <button disabled={saved} onClick={async () => {
+          await api.saveRubric(project.id, rubric)
+          setProject({ ...project, rubric })
+          setSaved(true)
+          onMsg('판정 기준 저장됨')
+        }}>기준 저장</button>
+        <button className="primary"
+          disabled={job?.status === 'running' || !rubric.trim()}
+          title="리뷰 대기(prelabeled) 이미지의 모든 박스를 기준으로 판정합니다"
+          onClick={async () => {
+            try {
+              // 화면의 기준과 판정에 쓰이는 기준이 어긋나면 안 된다 — 미저장이면
+              // 먼저 저장한다 (수정해놓고 옛 기준으로 판정되는 사고 방지)
+              if (!saved) {
+                await api.saveRubric(project.id, rubric)
+                setProject({ ...project, rubric })
+                setSaved(true)
+              }
+              const s = await api.vlmJudge(project.id)
+              setJob(s)
+              if (s.status !== 'running') onMsg(s.advice || '판정할 이미지가 없습니다')
+            } catch (e) {
+              onMsg(`문맥 심판 시작 실패: ${e.message}${e.message.includes('503')
+                ? ' — VLM 제공자 없음 (ANTHROPIC_API_KEY 설정+pip install anthropic, 또는 Ollama 비전 모델)' : ''}`, true)
+            }
+          }}>
+          {job?.status === 'running' ? `심판 중 ${job.done ?? 0}/${job.total}` : '▶ 문맥 심판 실행'}
+        </button>
+      </div>
     </div>
   )
 }

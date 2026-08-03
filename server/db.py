@@ -85,6 +85,8 @@ def init_db():
         "ALTER TABLE images ADD COLUMN split TEXT",
         # 라운드별 실성능 기록 (게이트용 val이 아니라 홀드아웃 기준)
         "ALTER TABLE models ADD COLUMN test_map50 REAL",
+        # VLM 문맥 심판용 판정 기준 문서 (예: '사고 연루 차량만 accident_vehicle')
+        "ALTER TABLE projects ADD COLUMN rubric TEXT NOT NULL DEFAULT ''",
     ):
         try:
             conn.execute(stmt)
