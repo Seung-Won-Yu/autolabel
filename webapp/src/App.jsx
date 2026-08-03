@@ -1151,7 +1151,7 @@ function VlmJudge({ project, setProject, onMsg, onDone }) {
               if (s.status !== 'running') onMsg(s.advice || '판정할 이미지가 없습니다')
             } catch (e) {
               onMsg(`문맥 심판 시작 실패: ${e.message}${e.message.includes('503')
-                ? ' — VLM 제공자 없음 (ANTHROPIC_API_KEY 설정+pip install anthropic, 또는 Ollama 비전 모델)' : ''}`, true)
+                ? ' — VLM 제공자 없음 (Claude Code CLI 설치=구독으로 무료, 또는 ANTHROPIC_API_KEY, 또는 Ollama)' : ''}`, true)
             }
           }}>
           {job?.status === 'running' ? `심판 중 ${job.done ?? 0}/${job.total}` : '▶ 문맥 심판 실행'}

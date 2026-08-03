@@ -585,6 +585,57 @@ def test_vlm_judge_stores_verdicts_and_reuses_cache(client, make_image, tmp_path
     assert len(calls) == 6
 
 
+def test_vlm_claude_code_adapter_parses_headless_output(monkeypatch, tmp_path):
+    """Claude Code 헤드리스 어댑터 — 구독으로 호출하는 경로.
+
+    `claude -p --output-format json`의 result 텍스트에서 verdict JSON을 뽑는다.
+    모델이 JSON 앞뒤에 말을 붙여도 견뎌야 한다.
+    """
+    import subprocess
+
+    from server import vlm
+
+    captured = {}
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = json.dumps({"type": "result", "result":
+                                 '판정 결과입니다: {"verdict": "fail", "reason": "기준 위반"} 이상.'})
+        return R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    out = vlm._judge_claude_code(b"\x89PNG fake", "판정하라")
+    assert out == {"verdict": "fail", "reason": "기준 위반"}
+    assert captured["cmd"][0] == "claude" and "--output-format" in captured["cmd"]
+    # 임시 crop 파일은 정리되어야 한다
+    import glob
+    import tempfile
+    assert not glob.glob(f"{tempfile.gettempdir()}/vlm_judge_*.png")
+
+
+def test_vlm_provider_prefers_subscription_over_local(monkeypatch):
+    """제공자 자동 감지 순서: API 키 > Claude Code(구독, 무료) > Ollama."""
+    from server import vlm
+
+    monkeypatch.delenv("AUTOLABEL_VLM", raising=False)
+    monkeypatch.setattr(vlm, "_anthropic_ready", lambda: False)
+    monkeypatch.setattr(vlm, "_claude_code_ready", lambda: True)
+    monkeypatch.setattr(vlm, "_ollama_ready", lambda: True)
+    assert vlm.provider() == "claude-code"
+
+    monkeypatch.setattr(vlm, "_anthropic_ready", lambda: True)
+    assert vlm.provider() == "anthropic"
+
+    monkeypatch.setenv("AUTOLABEL_VLM", "ollama")
+    assert vlm.provider() == "ollama"
+    monkeypatch.setenv("AUTOLABEL_VLM", "off")
+    assert vlm.provider() is None
+
+
 def test_vlm_judge_without_provider_returns_clear_error(client, make_image, tmp_path,
                                                         monkeypatch):
     """제공자가 없으면 조용히 실패하지 말고 설정 방법을 알려야 한다."""

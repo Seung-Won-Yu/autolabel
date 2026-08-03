@@ -5,13 +5,16 @@
 텍스트를 읽고 이미지를 보는 VLM만 자동 제안이 가능한 부류다. 사람은 fail과
 unsure만 확인하면 되므로 리뷰가 전수 판독에서 예외 확인으로 바뀐다.
 
-제공자는 플러그인:
+제공자는 플러그인 (자동 감지 순서):
 - anthropic: ANTHROPIC_API_KEY가 있고 `pip install anthropic` 된 경우 (기본
   모델 claude-opus-5 — AUTOLABEL_VLM_MODEL로 변경, 예: claude-haiku-4-5로
-  비용 절감)
+  비용 절감). 가장 빠름, 종량 과금.
+- claude-code: Claude Code CLI가 설치돼 있으면 헤드리스(`claude -p`)로 호출 —
+  **구독(Pro/Team/Max)에 포함되어 추가 비용 없음**. 박스당 수 초로 느리지만
+  개인 규모엔 충분. API 키 없이 쓰는 기본 경로.
 - ollama: localhost:11434에 비전 모델이 떠 있는 경우 (기본 qwen2.5vl —
   AUTOLABEL_OLLAMA_MODEL로 변경). 오프라인·무료.
-- 없으면 기능만 비활성 — 도구는 정상 기동.
+- 없으면 기능만 비활성 — 도구는 정상 기동. AUTOLABEL_VLM으로 강제 가능.
 
 판정 결과는 어노테이션 meta.vlm에 저장하고 rubric 해시를 함께 남긴다 —
 같은 기준으로 재실행하면 캐시를 재사용해 비용이 다시 들지 않는다.
@@ -21,6 +24,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import threading
 
 from PIL import Image, ImageDraw
@@ -68,27 +72,37 @@ def _ollama_ready() -> bool:
         return False
 
 
+def _claude_code_ready() -> bool:
+    import shutil
+
+    return shutil.which("claude") is not None
+
+
 def provider() -> str | None:
-    """사용할 VLM 제공자. AUTOLABEL_VLM으로 강제(anthropic|ollama|off) 가능."""
+    """사용할 VLM 제공자. AUTOLABEL_VLM으로 강제(anthropic|claude-code|ollama|off)."""
     forced = os.environ.get("AUTOLABEL_VLM")
     if forced == "off":
         return None
-    if forced in ("anthropic", "ollama"):
+    if forced in ("anthropic", "claude-code", "ollama"):
         return forced
     if _anthropic_ready():
         return "anthropic"
+    # Claude Code 구독은 추가 비용이 없고 품질이 로컬 모델보다 높다 —
+    # API 키가 없을 때의 기본 경로
+    if _claude_code_ready():
+        return "claude-code"
     if _ollama_ready():
         return "ollama"
     return None
 
 
-PROVIDER_HINT = ("VLM 제공자가 없습니다 — ANTHROPIC_API_KEY 설정 후 "
-                 "`pip install anthropic`, 또는 Ollama에 비전 모델을 띄우세요 "
-                 "(예: ollama pull qwen2.5vl)")
+PROVIDER_HINT = ("VLM 제공자가 없습니다 — Claude Code CLI 설치(구독으로 무료), "
+                 "ANTHROPIC_API_KEY 설정 후 `pip install anthropic`, 또는 "
+                 "Ollama 비전 모델(예: ollama pull qwen2.5vl) 중 하나가 필요합니다")
 
 
-def _crop_b64(image: Image.Image, bbox: list[float]) -> str:
-    """박스 + 여백 crop, 박스 위치를 빨간 사각형으로 표시, PNG base64."""
+def _crop_png(image: Image.Image, bbox: list[float]) -> bytes:
+    """박스 + 여백 crop, 박스 위치를 빨간 사각형으로 표시, PNG 바이트."""
     x, y, w, h = bbox
     mx, my = w * CROP_MARGIN, h * CROP_MARGIN
     x1 = max(0, int(x - mx)); y1 = max(0, int(y - my))
@@ -101,7 +115,7 @@ def _crop_b64(image: Image.Image, bbox: list[float]) -> str:
         crop.thumbnail((CROP_MAX, CROP_MAX))
     buf = io.BytesIO()
     crop.save(buf, "PNG")
-    return base64.standard_b64encode(buf.getvalue()).decode()
+    return buf.getvalue()
 
 
 def _prompt(rubric: str, class_name: str) -> str:
@@ -140,6 +154,37 @@ def _judge_anthropic(img_b64: str, prompt: str) -> dict:
     return json.loads(text)
 
 
+def _judge_claude_code(img_png: bytes, prompt: str) -> dict:
+    """Claude Code CLI 헤드리스 — 구독(Pro/Team/Max)으로 호출, API 키 불필요.
+
+    crop을 임시 파일로 두고 Read 도구만 허용해 읽게 한다. 세션을 매번 띄우므로
+    박스당 수 초 — 개인 규모용. 대량이면 anthropic 제공자가 빠르다.
+    """
+    import subprocess
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="vlm_judge_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(img_png)
+        r = subprocess.run(
+            ["claude", "-p",
+             f"{path} 이미지를 Read 도구로 읽어라. 그 다음 아래 지시에 따라 "
+             f"JSON 한 줄로만 답하라 (다른 말 금지).\n\n{prompt}",
+             "--output-format", "json", "--allowedTools", "Read",
+             "--max-turns", "3"],
+            capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            raise RuntimeError(f"claude CLI 실패 (exit {r.returncode}): {r.stderr[:200]}")
+        text = json.loads(r.stdout).get("result", "")
+        m = re.search(r"\{.*\}", text, re.S)  # 앞뒤 산문 방어
+        if not m:
+            raise ValueError(f"응답에 JSON 없음: {text[:200]}")
+        return json.loads(m.group(0))
+    finally:
+        os.unlink(path)
+
+
 def _judge_ollama(img_b64: str, prompt: str) -> dict:
     import httpx
 
@@ -157,11 +202,15 @@ def judge_box(image: Image.Image, bbox: list[float], class_name: str,
               rubric: str, prov: str) -> dict:
     """박스 하나 판정. 반환: {verdict, reason}. 실패는 unsure로 강등 — 배치가
     한 건 때문에 죽으면 안 되고, 판정 불능은 사람이 보라는 신호가 맞다."""
-    img_b64 = _crop_b64(image, bbox)
+    png = _crop_png(image, bbox)
     prompt = _prompt(rubric, class_name)
     try:
-        out = _judge_anthropic(img_b64, prompt) if prov == "anthropic" \
-            else _judge_ollama(img_b64, prompt)
+        if prov == "anthropic":
+            out = _judge_anthropic(base64.standard_b64encode(png).decode(), prompt)
+        elif prov == "claude-code":
+            out = _judge_claude_code(png, prompt)
+        else:
+            out = _judge_ollama(base64.standard_b64encode(png).decode(), prompt)
         if out.get("verdict") not in ("pass", "fail", "unsure"):
             return {"verdict": "unsure", "reason": f"판정 형식 오류: {out}", "error": True}
         return {"verdict": out["verdict"], "reason": str(out.get("reason", ""))[:500]}
