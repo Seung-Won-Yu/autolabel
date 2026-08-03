@@ -723,3 +723,88 @@ def test_import_without_images_dir_is_400_not_500(client):
     r = client.post(f"/api/projects/{pid}/import", json={"image_dir": "/tmp/oops"})
     assert r.status_code == 400
     assert "images_dir" in r.json()["detail"]
+
+
+def _vlm_setup(client, make_image, tmp_path, name, boxes):
+    pid = _project(client, name)
+    img = make_image(tmp_path / name, "a.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("a.jpg", f, "image/jpeg"))]).json()["saved"][0]
+    client.put(f"/api/images/{iid}/annotations", json={"annotations": [
+        {"class_name": "person", "bbox": b, "source": "model"} for b in boxes]})
+    client.put(f"/api/images/{iid}/status", json={"status": "prelabeled"})
+    client.put(f"/api/projects/{pid}/rubric", json={"rubric": "사람만 부합"})
+    return pid, iid
+
+
+def _vlm_run(client, pid):
+    import time
+    assert client.post(f"/api/projects/{pid}/vlm-judge", json={}).status_code == 200
+    for _ in range(100):
+        s = client.get(f"/api/projects/{pid}/vlm-judge/status").json()
+        if s["status"] != "running":
+            return s
+        time.sleep(0.1)
+    raise AssertionError("판정이 끝나지 않음")
+
+
+def test_vlm_judge_skips_tiny_boxes_without_calling_vlm(client, make_image, tmp_path,
+                                                        monkeypatch):
+    """한 변 24px 미만 박스는 VLM 호출 없이 불확실로 확정 — VLM도 저해상도
+    crop엔 '식별 불가'만 답한다 (실측: kitchen 125박스 중 unsure 49건 대부분이
+    초소형 컵). 스킵 판정도 캐시에 남아 재실행 때 다시 안 묻는다."""
+    from server import vlm
+
+    pid, iid = _vlm_setup(client, make_image, tmp_path, "tiny",
+                          [[10, 10, 8, 8], [30, 30, 50, 50]])
+    calls = []
+
+    def fake(image, bbox, class_name, rubric, prov):
+        calls.append(list(bbox))
+        return {"verdict": "pass", "reason": "ok"}
+
+    monkeypatch.setattr(vlm, "judge_box", fake)
+    monkeypatch.setattr(vlm, "provider", lambda: "anthropic")
+
+    s = _vlm_run(client, pid)
+    assert s["status"] == "completed", s
+    assert calls == [[30, 30, 50, 50]], "큰 박스만 VLM에 물어야 한다"
+    tiny = next(a for a in client.get(f"/api/images/{iid}/annotations").json()
+                if a["bbox"] == [10, 10, 8, 8])
+    assert tiny["meta"]["vlm"]["verdict"] == "unsure"
+    assert tiny["meta"]["vlm"]["skipped"] == "tiny"
+
+    s = _vlm_run(client, pid)  # 재실행 — 스킵 판정도 캐시여야 한다
+    assert s["cached"] == 2 and len(calls) == 1, s
+
+
+def test_vlm_judge_runs_boxes_in_parallel(client, make_image, tmp_path, monkeypatch):
+    """박스 판정은 병렬 — claude CLI 기동이 박스당 수 초~수십 초라 순차로는
+    수백 박스에 수 시간이 든다. DB 쓰기는 메인 스레드 단일 레인 유지."""
+    import threading
+    import time
+
+    from server import vlm
+
+    monkeypatch.setenv("AUTOLABEL_VLM_WORKERS", "3")
+    pid, iid = _vlm_setup(client, make_image, tmp_path, "parallel",
+                          [[i * 60, 30, 50, 50] for i in range(4)])
+    lock = threading.Lock()
+    active = {"now": 0, "max": 0}
+
+    def fake(image, bbox, class_name, rubric, prov):
+        with lock:
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+        time.sleep(0.15)
+        with lock:
+            active["now"] -= 1
+        return {"verdict": "pass", "reason": "ok"}
+
+    monkeypatch.setattr(vlm, "judge_box", fake)
+    monkeypatch.setattr(vlm, "provider", lambda: "anthropic")
+
+    s = _vlm_run(client, pid)
+    assert s["status"] == "completed" and s["pass"] == 4, s
+    assert active["max"] >= 2, f"병렬 실행이 안 됨 (동시 최대 {active['max']})"

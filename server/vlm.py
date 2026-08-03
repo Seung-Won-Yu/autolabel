@@ -26,6 +26,7 @@ import json
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image, ImageDraw
 
@@ -35,6 +36,10 @@ from server.db import get_db, row_to_dict
 OLLAMA_URL = os.environ.get("AUTOLABEL_OLLAMA_URL", "http://localhost:11434")
 CROP_MARGIN = 0.25   # 박스 주변 문맥이 판정 근거다 (사고 차량 = 주변 상황)
 CROP_MAX = 1024      # 비전 토큰 비용 상한 — 판정에 이 이상 해상도는 불필요
+# 한 변이 이보다 작은 박스는 VLM도 "식별 불가"만 답한다 (실측: kitchen 125박스
+# 중 unsure 49건 대부분이 초소형 컵 crop) — 호출 없이 불확실로 확정해 시간·
+# 비용을 아끼고, 캐시에 남겨 재실행에도 다시 안 묻는다
+MIN_JUDGE_PX = 24
 
 VERDICT_SCHEMA = {
     "type": "object",
@@ -243,6 +248,42 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
         image_ids).fetchone()[0] if image_ids else 0
     done_boxes = 0
     job.update(total_boxes=total_boxes, done_boxes=0)
+    # 판정 병렬화 — claude-code는 CLI 기동이 박스당 수 초~수십 초라 순차로는
+    # 수백 박스에 수 시간이 든다. DB 쓰기는 이 스레드에서만 한다 (워커는
+    # 판정만) — 커밋·카운트 갱신의 단일 쓰기 레인 유지.
+    # ollama는 로컬 GPU 직렬이 더 빨라 기본 1.
+    workers = max(1, int(os.environ.get(
+        "AUTOLABEL_VLM_WORKERS", "1" if prov == "ollama" else "3")))
+    pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+
+    def record(a, iid, box_key, v):
+        """판정 결과 기록 — 정체성 조건부 병합 + 즉시 커밋 (긴 설명은 원위치 주석 참조)."""
+        nonlocal done_boxes
+        # 판정하는 수 초 사이 사용자가 저장하면 행이 DELETE+INSERT로
+        # 재생성되고 id가 재사용될 수 있다 — 낡은 meta 사본을 통째로
+        # 덮지 말고, 정체성(id+이미지+클래스+박스)이 그대로일 때만
+        # 현재 meta에 vlm 키 하나를 병합한다. 불일치면 0행 매치로 무해.
+        patch = {**v, "rubric_sha": sha, "provider": prov, "box": box_key}
+        # json_patch는 RFC-7386 병합 — 패치에 없는 키는 남는다. 이전
+        # 실패의 error 플래그가 성공 판정 뒤에도 살아남아 캐시를 영영
+        # 막지 않게, 성공 시 null(=키 삭제)을 명시한다.
+        patch.setdefault("error", None)
+        cur = conn.execute(
+            "UPDATE annotations SET meta=json_patch(meta, ?) "
+            "WHERE id=? AND image_id=? AND class_name=? AND bbox=?",
+            (json.dumps({"vlm": patch}, ensure_ascii=False),
+             a["id"], iid, a["class_name"], json.dumps(a["bbox"])))
+        if cur.rowcount == 0:
+            counts["stale"] += 1  # 판정 중 편집·삭제됨 — 결과 폐기
+        else:
+            counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+        # 박스마다 즉시 커밋 — 다음 판정(수 초~수십 초)까지 쓰기
+        # 트랜잭션을 쥐고 있으면 그동안 다른 쓰기(배치 오토라벨,
+        # 프로젝트 생성)가 전부 "database is locked"로 죽는다 (실측)
+        conn.commit()
+        done_boxes += 1
+        job.update(done_boxes=done_boxes, **counts)
+
     try:
         for n, iid in enumerate(image_ids, 1):
             im = conn.execute("SELECT * FROM images WHERE id=?", (iid,)).fetchone()
@@ -250,49 +291,45 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
                 continue
             anns = [row_to_dict(a) for a in conn.execute(
                 "SELECT * FROM annotations WHERE image_id=?", (iid,))]
-            img = None
+            to_judge = []
             for a in anns:
                 prev = (a.get("meta") or {}).get("vlm")
                 box_key = [a["bbox"], a["class_name"]]
                 # 같은 기준·같은 박스로 이미 판정된 것만 캐시로 인정.
                 # error 판정(일시 장애)은 제외 — 아니면 429 한 번에 영구 unsure.
                 # box 스냅샷 불일치(판정 후 박스 수정)도 재판정 대상이다.
-                done_boxes += 1
                 if (prev and prev.get("rubric_sha") == sha
                         and not prev.get("error") and prev.get("box") == box_key):
                     counts["cached"] += 1
                     counts[prev["verdict"]] = counts.get(prev["verdict"], 0) + 1
+                    done_boxes += 1
                     job.update(done_boxes=done_boxes)
                     continue
-                if img is None:
-                    path = _image_path(im)
-                    if not path.exists():
-                        break
-                    img = Image.open(path).convert("RGB")
-                v = judge_box(img, a["bbox"], a["class_name"], rubric, prov)
-                # 판정하는 수 초 사이 사용자가 저장하면 행이 DELETE+INSERT로
-                # 재생성되고 id가 재사용될 수 있다 — 낡은 meta 사본을 통째로
-                # 덮지 말고, 정체성(id+이미지+클래스+박스)이 그대로일 때만
-                # 현재 meta에 vlm 키 하나를 병합한다. 불일치면 0행 매치로 무해.
-                patch = {**v, "rubric_sha": sha, "provider": prov, "box": box_key}
-                # json_patch는 RFC-7386 병합 — 패치에 없는 키는 남는다. 이전
-                # 실패의 error 플래그가 성공 판정 뒤에도 살아남아 캐시를 영영
-                # 막지 않게, 성공 시 null(=키 삭제)을 명시한다.
-                patch.setdefault("error", None)
-                cur = conn.execute(
-                    "UPDATE annotations SET meta=json_patch(meta, ?) "
-                    "WHERE id=? AND image_id=? AND class_name=? AND bbox=?",
-                    (json.dumps({"vlm": patch}, ensure_ascii=False),
-                     a["id"], iid, a["class_name"], json.dumps(a["bbox"])))
-                if cur.rowcount == 0:
-                    counts["stale"] += 1  # 판정 중 편집·삭제됨 — 결과 폐기
+                w, h = a["bbox"][2], a["bbox"][3]
+                if min(w, h) < MIN_JUDGE_PX:
+                    record(a, iid, box_key, {
+                        "verdict": "unsure", "skipped": "tiny",
+                        "reason": f"박스가 {w:.0f}×{h:.0f}px로 너무 작아 판정 생략 "
+                                  "— 확대해 직접 확인하세요"})
+                    continue
+                to_judge.append((a, box_key))
+
+            if to_judge:
+                path = _image_path(im)
+                if not path.exists():
+                    done_boxes += len(to_judge)  # 원본 유실 — 판정 불가로 건너뜀
+                    job.update(done_boxes=done_boxes)
                 else:
-                    counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
-                # 박스마다 즉시 커밋 — 다음 판정(수 초~수십 초)까지 쓰기
-                # 트랜잭션을 쥐고 있으면 그동안 다른 쓰기(배치 오토라벨,
-                # 프로젝트 생성)가 전부 "database is locked"로 죽는다 (실측)
-                conn.commit()
-                job.update(done_boxes=done_boxes, **counts)
+                    img = Image.open(path).convert("RGB")
+                    img.load()  # 워커들이 crop을 공유하므로 픽셀을 미리 디코드
+
+                    def call(a, _img=img):
+                        return judge_box(_img, a["bbox"], a["class_name"], rubric, prov)
+
+                    results = (pool.map(call, [a for a, _ in to_judge]) if pool
+                               else map(call, [a for a, _ in to_judge]))
+                    for (a, box_key), v in zip(to_judge, results):
+                        record(a, iid, box_key, v)
             conn.commit()
             job.update(done=n, **counts)
             jobs.update("vlm", pid, done=n, **counts)
@@ -308,6 +345,8 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
         job.update(status="failed", error=str(e))
         jobs.update("vlm", pid, status="failed", error=str(e))
     finally:
+        if pool:
+            pool.shutdown(wait=False)
         conn.close()
 
 
