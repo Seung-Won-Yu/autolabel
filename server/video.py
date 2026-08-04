@@ -7,6 +7,9 @@
 
 가중치(models/sam3.pt)가 없으면 프레임 등록까지만 하고 정직하게 알린다 —
 그 상태에서도 배치 오토라벨(GDINO 폴백)로 라벨링은 가능하다.
+
+잡 상태는 jobs 모듈 단일 경로 — 모듈 로컬 사본을 두면 두 저장소가 드리프트한다
+(실측: 심판의 박스 진행률이 로컬에만 기록돼 재시작 복원에서 빠졌다).
 """
 import json
 import os
@@ -16,14 +19,14 @@ from pathlib import Path
 from server import jobs
 from server.db import get_db
 
-_jobs: dict[int, dict] = {}
 _start_lock = threading.Lock()
 
 MAX_FRAMES_DEFAULT = 300  # 30fps 영상 기준 stride 5로 약 50초 — 그 이상은 나눠서
+EXTRACT_COMMIT_EVERY = 25  # 추출 내내 쓰기 트랜잭션을 쥐지 않게 주기 커밋
 
 
 def job_status(pid: int) -> dict:
-    return _jobs.get(pid) or jobs.get("video", pid)
+    return jobs.get("video", pid)
 
 
 def extract_frames(video_path: Path, pid: int, data_dir: Path,
@@ -41,7 +44,7 @@ def extract_frames(video_path: Path, pid: int, data_dir: Path,
     conn = get_db()
     pdir = data_dir / str(pid)
     pdir.mkdir(parents=True, exist_ok=True)
-    stem = Path(video_path).stem.removeprefix("src_")  # 저장 시 붙인 충돌 방지 프리픽스 제거
+    stem = video_path.stem.removeprefix("src_")  # 저장 시 붙인 충돌 방지 프리픽스 제거
     ids: list[int] = []
     idx = 0
     try:
@@ -58,6 +61,10 @@ def extract_frames(video_path: Path, pid: int, data_dir: Path,
                 iid = cur.lastrowid
                 cv2.imwrite(str(pdir / f"{iid}_{fname}"), frame)
                 ids.append(iid)
+                # 추출 전체를 한 트랜잭션으로 쥐면 그동안 다른 쓰기(2초 자동
+                # 저장 등)가 busy_timeout을 넘겨 죽는다 — 주기적으로 놓아준다
+                if len(ids) % EXTRACT_COMMIT_EVERY == 0:
+                    conn.commit()
             idx += 1
         conn.commit()
     finally:
@@ -67,18 +74,15 @@ def extract_frames(video_path: Path, pid: int, data_dir: Path,
 
 
 def _track(pid: int, video_path: Path, frame_ids: list[int],
-           ontology: list[dict], stride: int, job: dict) -> int:
+           ontology: list[dict], stride: int) -> int:
     """SAM 3 비디오 전파 트래킹 → 프레임별 어노테이션 저장. 박스 수 반환."""
     from ultralytics.models.sam import SAM3VideoSemanticPredictor
 
-    from server.ml import SAM3_PATH
+    from server import ml
 
     prompts = [c.get("prompt") or c["name"] for c in ontology]
-    name_of = {(c.get("prompt") or c["name"]): c["name"] for c in ontology}
-    thresholds = {c["name"]: float(c.get("threshold", 0.35)) for c in ontology}
-    predictor = SAM3VideoSemanticPredictor(overrides={
-        "conf": 0.25, "task": "segment", "mode": "predict", "model": SAM3_PATH,
-        "save": False, "verbose": False, "vid_stride": stride})
+    predictor = SAM3VideoSemanticPredictor(
+        overrides={**ml.SAM3_OVERRIDES, "vid_stride": stride})
     results = predictor(source=str(video_path), text=prompts, stream=True)
 
     conn = get_db()
@@ -88,34 +92,19 @@ def _track(pid: int, video_path: Path, frame_ids: list[int],
             if k >= len(frame_ids):
                 break  # max_frames 초과분 — 추출 안 한 프레임의 결과는 버린다
             iid = frame_ids[k]
-            names = getattr(r, "names", None)
-            labels = (dict(enumerate(names)) if isinstance(names, (list, tuple))
-                      else (names or {}))
-            dets = 0
-            for b in (getattr(r, "boxes", None) or []):
-                raw = labels.get(int(b.cls), prompts[0]) if labels else prompts[0]
-                cls = name_of.get(raw, raw)
-                conf = float(b.conf)
-                if conf < thresholds.get(cls, 0.35):
-                    continue
-                x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
-                tid = getattr(b, "id", None)
-                meta = {"track_id": int(tid)} if tid is not None else {}
+            dets = ml.sam3_result_to_dets(r, ontology, with_track=True)
+            for d in dets:
+                meta = ({"track_id": d["track_id"]} if "track_id" in d else {})
                 conn.execute(
                     "INSERT INTO annotations (image_id, class_name, bbox, "
                     "confidence, source, meta) VALUES (?,?,?,?,?,?)",
-                    (iid, cls,
-                     json.dumps([round(x1, 1), round(y1, 1),
-                                 round(x2 - x1, 1), round(y2 - y1, 1)]),
-                     round(conf, 4), "model", json.dumps(meta)))
-                dets += 1
+                    (iid, d["class_name"], json.dumps(d["bbox"]),
+                     d["confidence"], "model", json.dumps(meta)))
             if dets:
                 conn.execute("UPDATE images SET status='prelabeled' WHERE id=?", (iid,))
-            n_boxes += dets
+            n_boxes += len(dets)
             conn.commit()  # 프레임마다 커밋 — 긴 쓰기 트랜잭션 금지 (심판 사고 참조)
-            job.update(done=k + 1)
-            if (k + 1) % 10 == 0:
-                jobs.update("video", pid, done=k + 1)
+            jobs.update("video", pid, done=k + 1)
     finally:
         conn.close()
     return n_boxes
@@ -123,32 +112,27 @@ def _track(pid: int, video_path: Path, frame_ids: list[int],
 
 def _run(pid: int, video_path: Path, ontology: list[dict], data_dir: Path,
          stride: int, max_frames: int):
-    job = _jobs[pid]
     try:
         frame_ids = extract_frames(video_path, pid, data_dir, stride, max_frames)
         if not frame_ids:
             raise ValueError("추출된 프레임이 없습니다")
-        job.update(total=len(frame_ids), phase="track")
-        jobs.update("video", pid, total=len(frame_ids))
+        jobs.update("video", pid, total=len(frame_ids), phase="track")
 
         from server import ml
         if os.environ.get("AUTOLABEL_NO_MODELS") or not ml.sam3_available():
             advice = (f"프레임 {len(frame_ids)}장 등록 (트래킹 생략 — "
                       + ("모델 비활성 모드" if os.environ.get("AUTOLABEL_NO_MODELS")
                          else "models/sam3.pt 없음, 배치 오토라벨을 대신 쓰세요") + ")")
-            job.update(status="completed", done=len(frame_ids), advice=advice)
             jobs.update("video", pid, status="completed", done=len(frame_ids),
                         advice=advice)
             return
 
-        n_boxes = _track(pid, video_path, frame_ids, ontology, stride, job)
+        n_boxes = _track(pid, video_path, frame_ids, ontology, stride)
         advice = (f"프레임 {len(frame_ids)}장 · 트래킹 박스 {n_boxes}개 — "
                   "리뷰를 시작하세요 (같은 객체는 track_id로 이어져 있습니다)")
-        job.update(status="completed", advice=advice)
         jobs.update("video", pid, status="completed", done=len(frame_ids),
                     advice=advice)
     except Exception as e:
-        job.update(status="failed", error=str(e))
         jobs.update("video", pid, status="failed", error=str(e))
 
 
@@ -156,12 +140,12 @@ def start(pid: int, video_path: Path, ontology: list[dict], data_dir: Path,
           stride: int = 5, max_frames: int = MAX_FRAMES_DEFAULT) -> dict:
     stride = max(1, int(stride))
     max_frames = max(1, min(int(max_frames), 2000))
-    with _start_lock:
-        if _jobs.get(pid, {}).get("status") == "running":
-            return _jobs[pid]
-        _jobs[pid] = {"status": "running", "phase": "extract", "done": 0, "total": 0}
-        jobs.start("video", pid, done=0, total=0)
+    with _start_lock:  # 더블클릭·중복 탭이 같은 비디오를 두 번 처리하지 않게
+        st = jobs.get("video", pid)
+        if st.get("status") == "running":
+            return st
+        jobs.start("video", pid, done=0, total=0, phase="extract")
         threading.Thread(
             target=_run, args=(pid, video_path, ontology, data_dir, stride, max_frames),
             daemon=True).start()
-    return _jobs[pid]
+    return jobs.get("video", pid)

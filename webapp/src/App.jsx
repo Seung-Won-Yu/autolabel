@@ -47,9 +47,12 @@ export default function App() {
   const queue = useRef(Promise.resolve())
 
   // 화면에 보이는 목록(필터·정렬 적용) — 이동(←→)도 이 순서를 따른다
-  let visible = filter === 'all' ? images
-    : filter === 'flagged' ? images.filter((im) => (im.vlm_flags ?? 0) > 0)
-    : images.filter((im) => im.status === filter)
+  // 필터 술어 맵 — 필터가 늘 때 삼항 체인이 깊어지지 않게
+  const FILTER_PRED = {
+    all: () => true,
+    flagged: (im) => (im.vlm_flags ?? 0) > 0,
+  }
+  let visible = images.filter(FILTER_PRED[filter] ?? ((im) => im.status === filter))
   if (sortMode === 'conf') visible = [...visible].sort((a, b) => (a.min_conf ?? 2) - (b.min_conf ?? 2))
   else if (sortMode === 'qa') visible = [...visible].sort((a, b) => (b.qa_score ?? -1) - (a.qa_score ?? -1))
   visibleRef.current = visible
@@ -119,9 +122,15 @@ export default function App() {
     // 사이드바 메타(개수·최저 conf)도 즉시 맞춘다 — 박스를 지웠는데 옛 숫자가
     // 남아 있으면 검수 우선순위 판단이 틀어진다
     const confs = list.map((a) => a.confidence).filter((c) => c != null)
-    setImages((imgs) => imgs.map((im) => (im.id === imageId
-      ? { ...im, ann_count: list.length, min_conf: confs.length ? Math.min(...confs) : null }
-      : im)))
+    const minConf = confs.length ? Math.min(...confs) : null
+    setImages((imgs) => {
+      const im = imgs.find((x) => x.id === imageId)
+      // 값이 그대로면 배열 참조를 유지한다 — 2초 자동저장마다 목록 전체가
+      // 리렌더되지 않게 (박스 이동만 한 저장이 대부분)
+      if (!im || (im.ann_count === list.length && im.min_conf === minConf)) return imgs
+      return imgs.map((x) => (x.id === imageId
+        ? { ...x, ann_count: list.length, min_conf: minConf } : x))
+    })
     setMsg('저장됨')
   }, [setMsg])
 
@@ -440,7 +449,7 @@ export default function App() {
       <div className="page">
         <h2>오토라벨</h2>
         <p className="hint">프로젝트를 선택하거나 새로 만드세요. 흐름: 클래스 정의 → 이미지 업로드 → 오토라벨 → 리뷰 → (자동) 전용 모델 학습</p>
-        <ProjectPicker projects={projects} onOpen={openProject} onCreated={refreshProjects} />
+        <ProjectPicker projects={projects} onOpen={openProject} onDeleted={refreshProjects} />
       </div>
     )
   }
@@ -928,7 +937,7 @@ function HelpOverlay({ onClose }) {
   )
 }
 
-function ProjectPicker({ projects, onOpen, onCreated }) {
+function ProjectPicker({ projects, onOpen, onDeleted }) {
   const [name, setName] = useState('')
   return (
     <div>
@@ -955,7 +964,7 @@ function ProjectPicker({ projects, onOpen, onCreated }) {
                 e.stopPropagation()
                 if (!confirm(`프로젝트 "${p.name}" 삭제? 이미지·라벨·모델 기록이 모두 지워집니다.`)) return
                 await api.deleteProject(p.id)
-                onCreated()
+                onDeleted()
               }}>×</button>
           </li>
         ))}
@@ -1019,35 +1028,51 @@ function UploadBox({ project, onUploaded, onMsg }) {
   )
 }
 
-// 비디오 → 프레임 추출 + SAM 3 전파 트래킹. 프레임은 일반 이미지로 등록되어
-// 리뷰·학습·익스포트 레인을 그대로 탄다. 한 프레임에서 잡힌 객체가 메모리
-// 전파로 이어지므로 영상 데이터는 라벨 비용이 "전 프레임"에서 "검수"로 준다.
-function VideoUpload({ project, onMsg, onDone }) {
+// 백그라운드 잡 폴링 + 재진입 복원 훅 — 심판·비디오가 같은 골격을 복사하며
+// 이미 갈라졌다 (비디오만 idle 분기 누락). 종료 처리(onDone)만 각자 전달한다.
+// 새로 연 화면에서 버튼이 '실행' 대기로 보이면 진행 중인 작업을 이중 실행하거나
+// 죽은 줄 알기 때문에, 마운트 시 running이면 복원한다 (논블로킹).
+function useJob(projectId, fetchStatus, onFinish, interval = 1500) {
   const [job, setJob] = useState(null)
-  const [stride, setStride] = useState(5)
 
-  // 진행 중인 작업 복원 — 새로 연 화면에서도 진행률이 보여야 한다 (심판과 동일)
   useEffect(() => {
-    api.videoStatus(project.id).then((s) => {
-      if (s.status === 'running') setJob(s)
-    }).catch(() => {})
-  }, [project.id])
+    setJob(null) // 프로젝트 전환 시 이전 프로젝트 잡 표시 제거
+    fetchStatus().then((s) => { if (s.status === 'running') setJob(s) }).catch(() => {})
+  }, [projectId]) // eslint-disable-line
 
   useEffect(() => {
     if (job?.status !== 'running') return
     const t = setInterval(async () => {
-      const s = await api.videoStatus(project.id)
+      const s = await fetchStatus()
       setJob(s)
       if (s.status !== 'running') {
         clearInterval(t)
-        onDone()
-        onMsg(s.status === 'failed' ? `비디오 처리 실패: ${s.error}`
-          : s.status === 'interrupted' ? `비디오 처리가 중단됐습니다 (${s.done ?? 0}/${s.total ?? '?'}) — 다시 업로드하세요`
-            : s.advice || '비디오 처리 완료', true)
+        onFinish(s)
       }
-    }, 1500)
+    }, interval)
     return () => clearInterval(t)
   }, [job?.status]) // eslint-disable-line
+
+  return [job, setJob]
+}
+
+// 완료가 아닌 종료를 완료로 말하지 않는다 — 잡 공통 종료 메시지 규칙
+function jobEndMessage(s, label, fallback) {
+  return s.status === 'failed' ? `${label} 실패: ${s.error}`
+    : s.status === 'interrupted' ? `${label}이(가) 중단됐습니다 (${s.done ?? 0}/${s.total ?? '?'}) — 다시 실행하세요`
+      : s.status === 'idle' ? `${label} 진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요`
+        : s.advice || fallback
+}
+
+// 비디오 → 프레임 추출 + SAM 3 전파 트래킹. 프레임은 일반 이미지로 등록되어
+// 리뷰·학습·익스포트 레인을 그대로 탄다. 한 프레임에서 잡힌 객체가 메모리
+// 전파로 이어지므로 영상 데이터는 라벨 비용이 "전 프레임"에서 "검수"로 준다.
+function VideoUpload({ project, onMsg, onDone }) {
+  const [stride, setStride] = useState(5)
+  const [job, setJob] = useJob(project.id, () => api.videoStatus(project.id), (s) => {
+    onDone()
+    onMsg(jobEndMessage(s, '비디오 처리', '비디오 처리 완료'), true)
+  })
 
   const running = job?.status === 'running'
   // 클래스는 vupload — .upload를 쓰면 이미지 업로드 셀렉터(label.upload)와 겹친다
@@ -1166,37 +1191,12 @@ function PromptLab({ project, setProject, onMsg, hasImages }) {
 function VlmJudge({ project, setProject, onMsg, onDone }) {
   const [rubric, setRubric] = useState(project.rubric || '')
   const [saved, setSaved] = useState(true)
-  const [job, setJob] = useState(null)
+  const [job, setJob] = useJob(project.id, () => api.vlmStatus(project.id), (s) => {
+    onDone()
+    onMsg(jobEndMessage(s, '문맥 심판', '문맥 심판 완료'), true)
+  })
 
   useEffect(() => { setRubric(project.rubric || ''); setSaved(true) }, [project.id]) // eslint-disable-line
-
-  // 이미 돌고 있는 심판을 복원한다 — 새로 연 화면(재접속·다른 탭)에서 버튼이
-  // "실행" 대기로 보이면 진행 중인 판정을 이중 실행하거나 죽은 줄 안다.
-  // 논블로킹 (.then) — 프로젝트 열기 흐름을 지연시키지 않는다 (배치 복원과 동일)
-  useEffect(() => {
-    api.vlmStatus(project.id).then((s) => {
-      if (s.status === 'running') setJob(s)
-    }).catch(() => {})
-  }, [project.id])
-
-  useEffect(() => {
-    if (job?.status !== 'running') return
-    const t = setInterval(async () => {
-      const s = await api.vlmStatus(project.id)
-      setJob(s)
-      if (s.status !== 'running') {
-        clearInterval(t)
-        onDone()
-        // 완료가 아닌 종료를 완료로 말하지 않는다 (배치·임포트와 같은 규칙)
-        const text = s.status === 'failed' ? `문맥 심판 실패: ${s.error}`
-          : s.status === 'interrupted' ? `문맥 심판이 중단됐습니다 (${s.done ?? 0}/${s.total ?? '?'}장) — 다시 실행하세요`
-            : s.status === 'idle' ? '문맥 심판 진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요'
-              : s.advice || '문맥 심판 완료'
-        onMsg(text, true)
-      }
-    }, 1500)
-    return () => clearInterval(t)
-  }, [job?.status]) // eslint-disable-line
 
   return (
     <div className="card">

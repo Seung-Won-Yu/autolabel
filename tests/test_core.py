@@ -347,7 +347,6 @@ def test_db_write_waits_for_concurrent_writer_instead_of_erroring():
     생성이 "database is locked" 500으로 죽었다 (실측). busy_timeout이 있으면
     잠깐 기다렸다가 성공해야 한다."""
     import tempfile
-    import threading
     from pathlib import Path as _Path
 
     from server import db
@@ -358,12 +357,13 @@ def test_db_write_waits_for_concurrent_writer_instead_of_erroring():
     db.DB_PATH = tmp
     try:
         db.init_db()
-        _run_lock_scenario(db, threading)
+        _run_lock_scenario(db)
     finally:
         db.DB_PATH = orig
 
 
-def _run_lock_scenario(db, threading):
+def _run_lock_scenario(db):
+    import threading
     import time
 
     c1 = db.get_db()

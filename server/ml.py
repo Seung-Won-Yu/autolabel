@@ -239,6 +239,9 @@ def exemplar_detect(image_np: np.ndarray, bbox: list[float],
 
 
 SAM3_PATH = "models/sam3.pt"
+# 이미지·비디오 예측기가 공유하는 기본 설정 (비디오는 vid_stride만 얹는다)
+SAM3_OVERRIDES = {"conf": 0.25, "task": "segment", "mode": "predict",
+                  "model": SAM3_PATH, "save": False, "verbose": False}
 _sam3 = None
 
 
@@ -258,40 +261,56 @@ def get_sam3():
     if _sam3 is None:
         from ultralytics.models.sam import SAM3SemanticPredictor
 
-        _sam3 = SAM3SemanticPredictor(
-            overrides={"conf": 0.25, "task": "segment", "mode": "predict",
-                       "model": SAM3_PATH, "save": False, "verbose": False})
+        _sam3 = SAM3SemanticPredictor(overrides=dict(SAM3_OVERRIDES))
     return _sam3
+
+
+def sam3_result_to_dets(r, ontology: list[dict], with_track: bool = False) -> list[dict]:
+    """ultralytics SAM 3 Results 하나 → 검출 dict 목록.
+
+    프롬프트↔클래스 매핑·임계값 필터·좌표 반올림 규약의 단일 소스 —
+    이미지 경로(detect_sam3)와 비디오 경로(video._track)가 공유한다.
+    r.names는 dict일 때도 list일 때도 있다 (실측: 비디오 예측기는 list).
+    """
+    prompts = [c.get("prompt") or c["name"] for c in ontology]
+    name_of = {(c.get("prompt") or c["name"]): c["name"] for c in ontology}
+    thresholds = {c["name"]: float(c.get("threshold", 0.35)) for c in ontology}
+    boxes = getattr(r, "boxes", None)
+    if boxes is None:
+        return []
+    names = getattr(r, "names", None)
+    labels = dict(enumerate(names)) if isinstance(names, (list, tuple)) else (names or {})
+    dets = []
+    for b in boxes:
+        raw = labels.get(int(b.cls), prompts[0]) if labels else prompts[0]
+        cls = name_of.get(raw, raw)
+        conf = float(b.conf)
+        if conf < thresholds.get(cls, 0.35):
+            continue
+        x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
+        d = {"class_name": cls,
+             "bbox": [round(x1, 1), round(y1, 1),
+                      round(x2 - x1, 1), round(y2 - y1, 1)],
+             "confidence": round(conf, 4)}
+        if with_track:
+            tid = getattr(b, "id", None)
+            if tid is not None:
+                d["track_id"] = int(tid)
+        dets.append(d)
+    return dets
 
 
 def detect_sam3(image: Image.Image, ontology: list[dict]) -> list[dict]:
     """SAM 3 개념 분할 → 박스 목록. 클래스별 임계값 적용."""
     predictor = get_sam3()
     prompts = [c.get("prompt") or c["name"] for c in ontology]
-    name_of = {(c.get("prompt") or c["name"]): c["name"] for c in ontology}
-    thresholds = {c["name"]: float(c.get("threshold", 0.35)) for c in ontology}
 
     with _infer_lock:  # set_image→predict가 2단계라 동시 요청이 이미지를 바꿔치기할 수 있음
         predictor.set_image(image)
         results = predictor(text=prompts)
     dets = []
     for r in (results if isinstance(results, list) else [results]):
-        boxes = getattr(r, "boxes", None)
-        if boxes is None:
-            continue
-        names = getattr(r, "names", None)
-        labels = dict(enumerate(names)) if isinstance(names, (list, tuple)) else (names or {})
-        for b in boxes:
-            raw = labels.get(int(b.cls), prompts[0]) if labels else prompts[0]
-            cls = name_of.get(raw, raw)
-            conf = float(b.conf)
-            if conf < thresholds.get(cls, 0.35):
-                continue
-            x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
-            dets.append({"class_name": cls,
-                         "bbox": [round(x1, 1), round(y1, 1),
-                                  round(x2 - x1, 1), round(y2 - y1, 1)],
-                         "confidence": round(conf, 4)})
+        dets.extend(sam3_result_to_dets(r, ontology))
     return dets
 
 

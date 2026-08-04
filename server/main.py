@@ -200,7 +200,11 @@ async def upload_video(pid: int, file: UploadFile, stride: int = 5,
     pdir = DATA_DIR / str(pid)
     pdir.mkdir(parents=True, exist_ok=True)
     dst = pdir / f"src_{fname}"
-    dst.write_bytes(await file.read())
+    # 통째로 read()하면 영상 크기만큼 RAM 스파이크 + 이벤트 루프 블로킹 —
+    # 1MB 청크 스트리밍 복사
+    with dst.open("wb") as out:
+        while chunk := await file.read(1 << 20):
+            out.write(chunk)
     return video.start(pid, dst, ontology, DATA_DIR, stride=stride, max_frames=max_frames)
 
 
@@ -212,11 +216,15 @@ def video_status(pid: int):
 @app.get("/api/projects/{pid}/images")
 def list_images(pid: int, status: str | None = None):
     conn = get_db()
-    q = ("SELECT i.*, (SELECT COUNT(*) FROM annotations a WHERE a.image_id=i.id) AS ann_count, "
-         "(SELECT MIN(a.confidence) FROM annotations a WHERE a.image_id=i.id) AS min_conf, "
-         "(SELECT COUNT(*) FROM annotations a WHERE a.image_id=i.id "
-         " AND json_extract(a.meta, '$.vlm.verdict') IN ('fail','unsure')) AS vlm_flags "
-         "FROM images i WHERE i.project_id=?")
+    # 상관 서브쿼리 3개는 이미지마다 annotations를 3번 훑는다 — 집계 조인
+    # 1패스로. (목록은 프로젝트 열기·배치 후마다 도는 핫패스)
+    q = ("SELECT i.*, COALESCE(s.ann_count, 0) AS ann_count, s.min_conf, "
+         "COALESCE(s.vlm_flags, 0) AS vlm_flags "
+         "FROM images i LEFT JOIN ("
+         "  SELECT image_id, COUNT(*) AS ann_count, MIN(confidence) AS min_conf, "
+         "  SUM(json_extract(meta, '$.vlm.verdict') IN ('fail','unsure')) AS vlm_flags "
+         "  FROM annotations GROUP BY image_id"
+         ") s ON s.image_id = i.id WHERE i.project_id=?")
     args: list = [pid]
     if status:
         q += " AND i.status=?"

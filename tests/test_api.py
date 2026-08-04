@@ -738,15 +738,20 @@ def _vlm_setup(client, make_image, tmp_path, name, boxes):
     return pid, iid
 
 
-def _vlm_run(client, pid):
+def _wait_job(client, status_url, tries=100):
+    """백그라운드 잡 폴링 — running이 아닌 첫 상태를 반환."""
     import time
-    assert client.post(f"/api/projects/{pid}/vlm-judge", json={}).status_code == 200
-    for _ in range(100):
-        s = client.get(f"/api/projects/{pid}/vlm-judge/status").json()
+    for _ in range(tries):
+        s = client.get(status_url).json()
         if s["status"] != "running":
             return s
         time.sleep(0.1)
-    raise AssertionError("판정이 끝나지 않음")
+    raise AssertionError(f"잡이 끝나지 않음: {status_url}")
+
+
+def _vlm_run(client, pid):
+    assert client.post(f"/api/projects/{pid}/vlm-judge", json={}).status_code == 200
+    return _wait_job(client, f"/api/projects/{pid}/vlm-judge/status")
 
 
 def test_vlm_judge_skips_tiny_boxes_without_calling_vlm(client, make_image, tmp_path,
@@ -841,11 +846,7 @@ def test_video_upload_extracts_frames_and_reports_honestly(client, tmp_path,
                         files=[("file", ("v.mp4", f, "video/mp4"))])
     assert r.status_code == 200, r.text
 
-    for _ in range(100):
-        s = client.get(f"/api/projects/{pid}/video/status").json()
-        if s["status"] != "running":
-            break
-        time.sleep(0.1)
+    s = _wait_job(client, f"/api/projects/{pid}/video/status")
     assert s["status"] == "completed", s
     assert "트래킹 생략" in s["advice"]
 

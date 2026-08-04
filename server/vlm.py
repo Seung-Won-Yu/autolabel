@@ -254,15 +254,18 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
     # ollama는 로컬 GPU 직렬이 더 빨라 기본 1.
     workers = max(1, int(os.environ.get(
         "AUTOLABEL_VLM_WORKERS", "1" if prov == "ollama" else "3")))
-    pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    # workers=1이어도 풀을 쓴다 — max_workers=1은 순차와 의미가 같고,
+    # Optional 분기 3곳(생성·map·shutdown)이 사라진다
+    pool = ThreadPoolExecutor(max_workers=workers)
 
-    def record(a, iid, box_key, v):
-        """판정 결과 기록 — 정체성 조건부 병합 + 즉시 커밋 (긴 설명은 원위치 주석 참조)."""
+    def record(a, v):
+        """판정 결과 기록 — 정체성 조건부 병합 + 즉시 커밋."""
         nonlocal done_boxes
         # 판정하는 수 초 사이 사용자가 저장하면 행이 DELETE+INSERT로
         # 재생성되고 id가 재사용될 수 있다 — 낡은 meta 사본을 통째로
         # 덮지 말고, 정체성(id+이미지+클래스+박스)이 그대로일 때만
         # 현재 meta에 vlm 키 하나를 병합한다. 불일치면 0행 매치로 무해.
+        box_key = [a["bbox"], a["class_name"]]
         patch = {**v, "rubric_sha": sha, "provider": prov, "box": box_key}
         # json_patch는 RFC-7386 병합 — 패치에 없는 키는 남는다. 이전
         # 실패의 error 플래그가 성공 판정 뒤에도 살아남아 캐시를 영영
@@ -272,7 +275,7 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
             "UPDATE annotations SET meta=json_patch(meta, ?) "
             "WHERE id=? AND image_id=? AND class_name=? AND bbox=?",
             (json.dumps({"vlm": patch}, ensure_ascii=False),
-             a["id"], iid, a["class_name"], json.dumps(a["bbox"])))
+             a["id"], a["image_id"], a["class_name"], json.dumps(a["bbox"])))
         if cur.rowcount == 0:
             counts["stale"] += 1  # 판정 중 편집·삭제됨 — 결과 폐기
         else:
@@ -307,12 +310,12 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
                     continue
                 w, h = a["bbox"][2], a["bbox"][3]
                 if min(w, h) < MIN_JUDGE_PX:
-                    record(a, iid, box_key, {
+                    record(a, {
                         "verdict": "unsure", "skipped": "tiny",
                         "reason": f"박스가 {w:.0f}×{h:.0f}px로 너무 작아 판정 생략 "
                                   "— 확대해 직접 확인하세요"})
                     continue
-                to_judge.append((a, box_key))
+                to_judge.append(a)
 
             if to_judge:
                 path = _image_path(im)
@@ -326,13 +329,13 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
                     def call(a, _img=img):
                         return judge_box(_img, a["bbox"], a["class_name"], rubric, prov)
 
-                    results = (pool.map(call, [a for a, _ in to_judge]) if pool
-                               else map(call, [a for a, _ in to_judge]))
-                    for (a, box_key), v in zip(to_judge, results):
-                        record(a, iid, box_key, v)
-            conn.commit()
+                    for a, v in zip(to_judge, pool.map(call, to_judge)):
+                        record(a, v)
+            # 박스 카운터도 디스크에 남긴다 — 메모리(_jobs)에만 있으면 서버
+            # 재시작 후 복원 화면에서 박스 진행률이 사라진다 (실측 드리프트)
             job.update(done=n, **counts)
-            jobs.update("vlm", pid, done=n, **counts)
+            jobs.update("vlm", pid, done=n, done_boxes=done_boxes,
+                        total_boxes=total_boxes, **counts)
         judged = counts["pass"] + counts["fail"] + counts["unsure"]
         advice = (f"판정 {judged}건: 부합 {counts['pass']} · 위반 {counts['fail']} · "
                   f"불확실 {counts['unsure']}"
@@ -345,8 +348,8 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
         job.update(status="failed", error=str(e))
         jobs.update("vlm", pid, status="failed", error=str(e))
     finally:
-        if pool:
-            pool.shutdown(wait=False)
+        # cancel_futures: 잡이 죽으면 큐에 남은 판정(유료 호출)도 버린다
+        pool.shutdown(wait=False, cancel_futures=True)
         conn.close()
 
 
