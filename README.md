@@ -2,14 +2,21 @@
 
 # autolabel
 
-**프롬프트 한 줄에서 전용 모델까지 — 로컬에서 돌아가는 오토라벨링 도구**
+**모델이 먼저 라벨을 만들고, 사람은 예외만 고친다.**
 
-객체를 *말하거나 · 예시로 그리거나 · 클릭*하면 자동 라벨링하고,
-승인 라벨이 쌓이면 **알아서 전용 모델을 학습**해 다음 라벨링부터 그 모델이 일한다.
+이미지 폴더를 넣고 객체를 *말하거나 · 예시로 그리거나 · 클릭*하면 초안이 만들어진다.
+승인 라벨이 쌓이면 **전용 모델을 자동 학습**해 다음 초안을 더 정확하게 만든다.
 
-클라우드 없음 · API 키 없음 · 데이터 유출 없음 — Apple Silicon 한 대로 전 과정 완결.
+기본 경로 100% 로컬 · 필수 API 키 없음 · COCO/YOLO 출력 — Apple Silicon 한 대로 전 과정 완결.
 
-**[→ 소개 페이지](https://seung-won-yu.github.io/autolabel/)**
+**[소개 페이지](https://seung-won-yu.github.io/autolabel/)** ·
+**[3단계 설치](#실행)** · **[실측 성능](#실측-성능)**
+
+<br>
+
+<a href="https://seung-won-yu.github.io/autolabel/">
+  <img src="docs/og.png" alt="autolabel — 모델 초안, 예외 검수, 자동 학습으로 이어지는 로컬 오토라벨링 도구" width="900">
+</a>
 
 </div>
 
@@ -135,7 +142,11 @@ server/   FastAPI + SQLite
 
 ## 실행
 
+기준 환경은 Apple Silicon Mac · Python 3.11 · Node 20이다. 최초 셋업에서 SAM 가중치
+1.2GB와 프론트엔드 의존성을 내려받는다.
+
 ```bash
+git clone https://github.com/Seung-Won-Yu/autolabel.git && cd autolabel
 ./setup.sh     # 최초 1회: venv + 의존성 + SAM 가중치(1.2GB) + 브라우저 디코더
 ./start.sh     # 백엔드 + 프론트 동시 실행, 브라우저 자동 오픈 (종료: Ctrl+C)
 ./test.sh      # 백엔드 회귀 49개 (3초) — 코드를 고쳤으면 항상 실행

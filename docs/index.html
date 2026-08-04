@@ -3,14 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>autolabel — 라벨링, 대부분은 기계가</title>
-<meta name="description" content="프롬프트 한 줄에서 전용 모델까지. 클라우드 없이 Mac 한 대로 완결되는 오토라벨링 도구. 문서 서명 제로샷 mAP50 0.995.">
+<meta name="description" content="모델이 먼저 라벨을 만들고 사람은 예외만 고친다. Apple Silicon 한 대에서 초안, 검수, 전용 모델 학습까지 이어지는 로컬 오토라벨링 도구.">
+<link rel="canonical" href="https://seung-won-yu.github.io/autolabel/">
 <meta property="og:title" content="autolabel — 라벨링, 대부분은 기계가">
-<meta property="og:description" content="모델이 먼저 깔고, 사람은 예외만 확인한다. 로컬에서 완결되는 오토라벨링 도구.">
+<meta property="og:description" content="모델 초안 → 예외 검수 → 자동 학습. Apple Silicon에서 완결되는 로컬 오토라벨링 워크플로.">
 <meta property="og:url" content="https://seung-won-yu.github.io/autolabel/">
 <meta property="og:type" content="website">
-<meta name="theme-color" content="#000000">
+<meta property="og:site_name" content="autolabel">
+<meta property="og:locale" content="ko_KR">
+<meta property="og:image" content="https://seung-won-yu.github.io/autolabel/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="autolabel — 라벨링, 대부분은 기계가">
+<meta name="twitter:description" content="모델 초안 → 예외 검수 → 자동 학습. 로컬에서 완결되는 오토라벨링 워크플로.">
+<meta name="twitter:image" content="https://seung-won-yu.github.io/autolabel/og.png">
+<meta name="theme-color" content="#080a0d" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f7f8fa" media="(prefers-color-scheme: light)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect x='14' y='22' width='72' height='56' rx='10' fill='none' stroke='%232997ff' stroke-width='10'/><circle cx='50' cy='50' r='9' fill='%232997ff'/></svg>">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"autolabel","applicationCategory":"DeveloperApplication","operatingSystem":"macOS (Apple Silicon)","description":"모델 초안, 예외 검수, 전용 모델 학습을 로컬에서 잇는 오토라벨링 도구","url":"https://seung-won-yu.github.io/autolabel/","codeRepository":"https://github.com/Seung-Won-Yu/autolabel","programmingLanguage":["Python","JavaScript"]}
+</script>
 <style>
   /* ═══ 토큰 ═══ */
   :root {
@@ -18,7 +33,7 @@
     --text: #f5f5f7; --dim: #a1a1a6; --faint: #7d7d82;
     --line: rgba(255,255,255,.11); --line-2: rgba(255,255,255,.055);
     --card: rgba(255,255,255,.035); --card-2: rgba(255,255,255,.06);
-    --accent: #2997ff; --accent-2: #7c5cff;
+    --accent: #4c8bf5; --accent-solid: #1769d2; --accent-2: #2dd4bf;
     --ok: #32d74b; --bad: #ff453a; --warn: #ffd60a;
     --scene: #16161a; --scene-2: #23232a; --scene-3: #2e2e37;
     --glass: rgba(20,20,24,.72);
@@ -27,17 +42,17 @@
   @media (prefers-color-scheme: light) {
     :root {
       --bg: #fff; --bg-2: #f5f5f7; --bg-3: #ececf0;
-      --text: #1d1d1f; --dim: #6e6e73; --faint: #8a8a8f;
+      --text: #1d1d1f; --dim: #5f6368; --faint: #666a70;
       --line: rgba(0,0,0,.11); --line-2: rgba(0,0,0,.055);
       --card: rgba(0,0,0,.022); --card-2: #fff;
-      --accent: #0071e3; --accent-2: #6d3fe0;
-      --ok: #1a8f3c; --bad: #d70015; --warn: #a86b00;
+      --accent: #0969da; --accent-solid: #0969da; --accent-2: #008b78;
+      --ok: #137333; --bad: #d70015; --warn: #8a5700;
       --scene: #e9e9ee; --scene-2: #d6d6dd; --scene-3: #c3c3cc;
       --glass: rgba(255,255,255,.78);
     }
   }
   * { box-sizing: border-box; margin: 0; padding: 0 }
-  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100% }
+  html { scroll-behavior: smooth; scroll-padding-top: 74px; -webkit-text-size-adjust: 100% }
   body {
     background: var(--bg); color: var(--text); overflow-x: hidden;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
@@ -46,6 +61,7 @@
   }
   a { color: var(--accent); text-decoration: none }
   a:hover { text-decoration: underline }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; border-radius: 6px }
   code, .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; font-size: .87em }
   kbd {
     font: inherit; font-size: .78em; border: 1px solid var(--line); border-bottom-width: 2px;
@@ -54,66 +70,76 @@
   .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px }
   .narrow { max-width: 760px }
   em { font-style: normal; color: var(--text) }
+  .skip-link {
+    position: fixed; top: 8px; left: 12px; z-index: 100; padding: 9px 14px; border-radius: 8px;
+    background: var(--text); color: var(--bg); font-size: 14px; font-weight: 700;
+    transform: translateY(-160%);
+  }
+  .skip-link:focus { transform: translateY(0) }
 
   /* ═══ 상단 바 ═══ */
   nav {
-    position: sticky; top: 0; z-index: 40; height: 52px;
+    position: sticky; top: 0; z-index: 40; height: 58px;
     background: var(--glass); backdrop-filter: saturate(180%) blur(22px);
     -webkit-backdrop-filter: saturate(180%) blur(22px);
     border-bottom: 1px solid var(--line-2);
   }
   nav .wrap { display: flex; align-items: center; gap: 26px; height: 100% }
   nav .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: -.02em; color: var(--text) }
-  nav .links { display: flex; gap: 24px; margin-left: auto; font-size: 14px }
+  nav .links { display: flex; align-items: center; gap: 24px; margin-left: auto; font-size: 14px }
   nav .links a { color: var(--dim) }
   nav .links a:hover { color: var(--text); text-decoration: none }
-  @media (max-width: 700px) { nav .links a.opt { display: none } }
+  nav .links .nav-cta {
+    display: inline-flex; align-items: center; min-height: 44px; color: var(--text); padding: 7px 14px;
+    border: 1px solid var(--line); border-radius: 980px; background: var(--card); font-weight: 600;
+  }
+  nav .links .nav-cta:hover { background: var(--card-2) }
 
   /* ═══ 히어로 ═══ */
-  .hero { position: relative; padding: 92px 0 0; text-align: center; overflow: hidden }
-  .glow { position: absolute; inset: -20% -10% auto; height: 760px; pointer-events: none; z-index: 0 }
-  .glow i {
-    position: absolute; border-radius: 50%; filter: blur(90px); opacity: .5;
-    animation: drift 22s ease-in-out infinite alternate;
-  }
-  .glow i:nth-child(1) { width: 620px; height: 620px; left: 8%; top: 4%;
-    background: radial-gradient(circle, color-mix(in srgb, var(--accent) 55%, transparent), transparent 68%) }
-  .glow i:nth-child(2) { width: 520px; height: 520px; right: 6%; top: 12%; animation-delay: -8s;
-    background: radial-gradient(circle, color-mix(in srgb, var(--accent-2) 48%, transparent), transparent 68%) }
-  .glow i:nth-child(3) { width: 420px; height: 420px; left: 42%; top: 30%; animation-delay: -14s; opacity: .34;
-    background: radial-gradient(circle, color-mix(in srgb, var(--ok) 40%, transparent), transparent 70%) }
-  @media (prefers-color-scheme: light) { .glow i { opacity: .3 } .glow i:nth-child(3) { opacity: .2 } }
-  @keyframes drift {
-    from { transform: translate3d(0,0,0) scale(1) }
-    to   { transform: translate3d(38px,-26px,0) scale(1.12) }
+  .hero { position: relative; padding: 64px 0 0; text-align: center; overflow: hidden }
+  .hero::before {
+    content: ""; position: absolute; inset: 0 0 auto; height: 760px; pointer-events: none; opacity: .46;
+    background-image:
+      linear-gradient(var(--line-2) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line-2) 1px, transparent 1px),
+      radial-gradient(circle at 50% 22%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 48%);
+    background-size: 48px 48px, 48px 48px, auto;
+    mask-image: linear-gradient(to bottom, #000 0%, rgba(0,0,0,.78) 55%, transparent 100%);
+    -webkit-mask-image: linear-gradient(to bottom, #000 0%, rgba(0,0,0,.78) 55%, transparent 100%);
   }
   .hero .wrap { position: relative; z-index: 1 }
 
-  h1 {
-    font-size: clamp(46px, 9.4vw, 116px); line-height: .98; font-weight: 700;
-    letter-spacing: -.046em;
+  .hero-flow {
+    display: inline-flex; align-items: center; gap: 9px; margin-bottom: 16px; color: var(--dim);
+    font: 600 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .035em;
   }
+  .hero-flow i { width: 20px; height: 1px; background: var(--accent); opacity: .7 }
+
+  h1 {
+    font-size: 88px; line-height: .98; font-weight: 740; letter-spacing: -.041em;
+  }
+  h1, h2, .tagline, .lede { word-break: keep-all; overflow-wrap: break-word }
   h1 .grad {
     background: linear-gradient(100deg, var(--accent) 8%, var(--accent-2) 92%);
     -webkit-background-clip: text; background-clip: text; color: transparent;
   }
   .tagline {
-    margin: 26px auto 0; max-width: 680px; color: var(--dim);
-    font-size: clamp(18px, 2.4vw, 26px); line-height: 1.36; letter-spacing: -.022em;
+    margin: 20px auto 0; max-width: 760px; color: var(--dim);
+    font-size: 20px; line-height: 1.5; letter-spacing: -.016em;
   }
-  .badges { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 24px }
+  .badges { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 18px }
   .pill {
     font-size: 13px; color: var(--dim); padding: 5px 13px; border-radius: 980px;
     border: 1px solid var(--line); background: var(--card);
   }
-  .cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 32px }
+  .cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 24px }
   .btn {
     display: inline-flex; align-items: center; gap: 7px; padding: 13px 28px; border-radius: 980px;
     font-size: 16.5px; font-weight: 500; transform: translateZ(0);
     transition: transform .2s cubic-bezier(.16,1,.3,1), opacity .2s, background .2s, box-shadow .3s;
   }
   .btn.primary {
-    color: #fff; background: linear-gradient(100deg, var(--accent), var(--accent-2));
+    color: #fff; background: var(--accent-solid);
     box-shadow: 0 6px 26px color-mix(in srgb, var(--accent) 34%, transparent);
   }
   .btn.primary:hover { text-decoration: none; transform: translateY(-2px);
@@ -124,20 +150,21 @@
 
   /* 히어로 스탯 밴드 */
   .band {
-    display: flex; justify-content: center; gap: 0; flex-wrap: wrap;
-    margin: 46px auto 0; max-width: 860px;
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    margin: 34px auto 0; max-width: 900px; padding: 18px 0;
+    border-block: 1px solid var(--line-2);
   }
-  .band div { padding: 0 30px; text-align: center; border-left: 1px solid var(--line-2) }
+  .band div { padding: 0 22px; text-align: center; border-left: 1px solid var(--line-2) }
   .band div:first-child { border-left: none }
   .band b {
-    display: block; font-size: clamp(26px, 3.6vw, 38px); font-weight: 700;
+    display: block; font-size: 34px; font-weight: 700;
     letter-spacing: -.035em; font-variant-numeric: tabular-nums; line-height: 1.1;
   }
   .band span { font-size: 13.5px; color: var(--faint) }
-  @media (max-width: 620px) { .band div { padding: 12px 18px; border-left: none } }
+  .band small { font-size: .5em; color: var(--dim); margin-left: 2px }
 
   /* ═══ 앱 목업 ═══ */
-  .stage { perspective: 1600px; margin-top: 66px; padding-bottom: 6px }
+  .stage { perspective: 1600px; margin-top: 38px; padding-bottom: 6px }
   .window {
     max-width: 1060px; margin: 0 auto; border-radius: 16px; overflow: hidden;
     border: 1px solid var(--line); background: var(--bg-2);
@@ -205,18 +232,16 @@
   }
 
   /* ═══ 섹션 공통 ═══ */
-  section { padding: 108px 0; position: relative }
+  section { padding: 96px 0; position: relative }
   section.alt { background: var(--bg-2); border-block: 1px solid var(--line-2) }
   .eyebrow {
     display: block; text-align: center; font-size: 12.5px; font-weight: 600;
-    letter-spacing: .1em; text-transform: uppercase; margin-bottom: 15px;
-    background: linear-gradient(100deg, var(--accent), var(--accent-2));
-    -webkit-background-clip: text; background-clip: text; color: transparent;
+    letter-spacing: .1em; text-transform: uppercase; margin-bottom: 15px; color: var(--accent);
   }
-  h2 { font-size: clamp(30px, 4.6vw, 52px); line-height: 1.1; letter-spacing: -.034em;
+  h2 { font-size: 50px; line-height: 1.1; letter-spacing: -.032em;
        font-weight: 700; text-align: center }
   .lede { margin: 20px auto 0; max-width: 660px; text-align: center; color: var(--dim);
-          font-size: clamp(16px, 1.9vw, 19.5px) }
+          font-size: 19px }
 
   /* ═══ 비교 슬라이더 ═══ */
   .compare {
@@ -283,19 +308,11 @@
   @media (max-width: 640px) { .g3, .g2 { grid-template-columns: 1fr } }
   .card {
     background: var(--card); border: 1px solid var(--line); border-radius: var(--r); padding: 27px;
-    transition: transform .45s cubic-bezier(.16,1,.3,1), border-color .45s, background .45s;
     position: relative; overflow: hidden;
   }
-  .card::after {
-    content: ""; position: absolute; inset: -1px; border-radius: inherit; opacity: 0;
-    background: radial-gradient(420px circle at 50% 0%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 70%);
-    transition: opacity .45s; pointer-events: none;
-  }
-  .card:hover { transform: translateY(-5px); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)) }
-  .card:hover::after { opacity: 1 }
   .card .ic {
     width: 36px; height: 36px; border-radius: 11px; display: grid; place-items: center; color: #fff;
-    background: linear-gradient(140deg, var(--accent), var(--accent-2)); margin-bottom: 15px;
+    background: var(--accent); margin-bottom: 15px;
   }
   .card h3 { font-size: 19.5px; letter-spacing: -.022em; font-weight: 600; margin-bottom: 9px }
   .card p { color: var(--dim); font-size: 15.5px }
@@ -379,9 +396,15 @@
   details .body p + p { margin-top: 11px }
 
   /* ═══ 마무리 ═══ */
-  .final { position: relative; text-align: center; padding: 128px 0; overflow: hidden }
-  .final .glow { inset: -30% -10% auto; height: 620px }
+  .final { position: relative; text-align: center; padding: 118px 0; overflow: hidden }
+  .final::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .7;
+    background:
+      radial-gradient(circle at 42% 50%, color-mix(in srgb, var(--accent) 17%, transparent), transparent 28%),
+      radial-gradient(circle at 58% 50%, color-mix(in srgb, var(--accent-2) 14%, transparent), transparent 26%);
+  }
   .final .wrap { position: relative; z-index: 1 }
+  .final h2 { font-size: 58px }
   footer { border-top: 1px solid var(--line-2); padding: 46px 0 66px; text-align: center }
   footer p { font-size: 13.5px; color: var(--faint) } footer p + p { margin-top: 9px }
   footer a { color: var(--dim) }
@@ -437,11 +460,64 @@
     background: linear-gradient(90deg, var(--accent), var(--accent-2));
     transform: scaleX(0); transform-origin: left; transition: transform .1s linear }
 
+  @media (max-width: 900px) {
+    h1 { font-size: 72px }
+    .tagline { font-size: 19px }
+    h2 { font-size: 44px }
+  }
+
+  @media (max-width: 700px) {
+    .wrap { padding-inline: 20px }
+    nav .wrap { gap: 14px }
+    nav .links { gap: 0 }
+    nav .links a:not(.nav-cta) { display: none }
+    .hero { padding-top: 58px }
+    .hero::before { background-size: 36px 36px, 36px 36px, auto; height: 620px }
+    .hero-flow { margin-bottom: 18px; font-size: 10px; gap: 7px }
+    .hero-flow i { width: 12px }
+    h1 { font-size: 54px; line-height: 1; letter-spacing: -.04em }
+    .tagline { margin-top: 22px; font-size: 18px; line-height: 1.55 }
+    .badges { margin-top: 20px }
+    .pill { padding: 4px 10px; font-size: 12px }
+    .cta { margin-top: 26px }
+    .btn { min-height: 48px; justify-content: center; padding: 11px 22px; font-size: 15.5px }
+    .band { grid-template-columns: repeat(2, 1fr); margin-top: 36px; padding: 0 }
+    .band div { padding: 18px 10px }
+    .band div:nth-child(odd) { border-left: 0 }
+    .band div:nth-child(n+3) { border-top: 1px solid var(--line-2) }
+    .band b { font-size: 30px }
+    .band span { font-size: 12px }
+    .stage { margin-top: 42px }
+    .window { border-radius: 11px }
+    .titlebar { padding: 8px 10px }
+    .titlebar .prog { display: none }
+    .canvas { min-height: 220px }
+    section { padding: 76px 0 }
+    h2 { font-size: 38px; letter-spacing: -.03em }
+    .lede { font-size: 17px }
+    .compare { margin-top: 36px; border-radius: 14px }
+    .grid { margin-top: 36px }
+    .card { padding: 22px }
+    .tl { margin-top: 42px; padding-left: 42px }
+    .step .dot { left: -42px }
+    pre { padding: 18px; font-size: 13px; line-height: 1.7 }
+    details { border-radius: 13px; padding-inline: 18px }
+    .final { padding: 90px 0 }
+    .final h2 { font-size: 42px }
+    footer { padding: 38px 0 52px }
+  }
+
+  @media (max-width: 390px) {
+    h1 { font-size: 48px }
+    .hero-flow { letter-spacing: 0 }
+    .cta .btn { width: 100% }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto }
     .rise, .js .reveal, .js tbody tr { opacity: 1 !important; transform: none !important; animation: none !important }
-    .js .reveal, .js tbody tr, .card, .btn, .fill, details, .step .dot { transition: none !important }
-    .glow i, .mk-box, .mk-lab, .mk-chip, .mk-scan, .arow.live .vchip, pre .cursor {
+    .js .reveal, .js tbody tr, .btn, .fill, details, .step .dot { transition: none !important }
+    .mk-box, .mk-lab, .mk-chip, .mk-scan, .arow.live .vchip, pre .cursor {
       animation: none !important; opacity: 1 !important; stroke-dashoffset: 0 !important; transform: none !important }
     .window { transform: none !important }
     #progress { display: none }
@@ -450,13 +526,19 @@
 </head>
 <body>
 <script>
-  // 리빌을 숨기는 CSS는 .js 아래에만 있다 — JS가 죽으면 내용은 그냥 보인다
+  // JS 자체가 꺼지면 내용은 원래부터 보인다. 이후 인터랙션 코드가 실패해도
+  // watchdog이 리빌 요소를 되살려 마케팅 본문이 빈 화면으로 남지 않게 한다.
   document.documentElement.classList.add('js')
+  setTimeout(() => {
+    document.querySelectorAll('.reveal, tbody').forEach((el) => el.classList.add('in'))
+    document.querySelectorAll('.fill').forEach((el) => { el.style.width = el.dataset.w + '%' })
+  }, 3000)
 </script>
 
+<a class="skip-link" href="#content">본문으로 건너뛰기</a>
 <div id="progress"></div>
 
-<nav>
+<nav aria-label="주요 탐색">
   <div class="wrap">
     <a class="brand" href="#top">
       <svg width="18" height="18" viewBox="0 0 100 100" aria-hidden="true">
@@ -470,29 +552,32 @@
       <a class="opt" href="#judge">문맥 심판</a>
       <a href="#proof">증거</a>
       <a href="#start">시작하기</a>
-      <a href="https://github.com/Seung-Won-Yu/autolabel">GitHub</a>
+      <a class="nav-cta" href="https://github.com/Seung-Won-Yu/autolabel" aria-label="autolabel GitHub 저장소 열기">GitHub ↗</a>
     </div>
   </div>
 </nav>
 
+<main id="content">
 <!-- ══ 히어로 ══ -->
-<div class="hero" id="top">
-  <div class="glow" aria-hidden="true"><i></i><i></i><i></i></div>
+<header class="hero" id="top">
   <div class="wrap">
+    <div class="hero-flow rise d1" aria-label="제품 흐름">
+      <span>모델 초안</span><i aria-hidden="true"></i><span>예외 검수</span><i aria-hidden="true"></i><span>자동 학습</span>
+    </div>
     <h1 class="rise d1">라벨링,<br><span class="grad">대부분은 기계가.</span></h1>
-    <p class="tagline rise d2">프롬프트 한 줄에서 전용 모델까지 — 로컬에서 완결되는 오토라벨링 도구</p>
+    <p class="tagline rise d2">이미지 폴더를 넣으면 모델이 먼저 라벨을 만들고,<br>사람은 틀린 것만 고친다. 승인할수록 다음 초안은 더 정확해진다.</p>
     <div class="badges rise d3">
-      <span class="pill">클라우드 없음</span><span class="pill">필수 API 키 없음</span>
-      <span class="pill">데이터 유출 없음</span><span class="pill">Mac 한 대로 완결</span>
+      <span class="pill">기본 경로 100% 로컬</span><span class="pill">필수 API 키 없음</span>
+      <span class="pill">Apple Silicon 최적화</span><span class="pill">COCO · YOLO 출력</span>
     </div>
     <div class="cta rise d4">
-      <a class="btn primary" href="https://github.com/Seung-Won-Yu/autolabel">GitHub에서 보기 →</a>
-      <a class="btn ghost" href="#start">설치 3줄</a>
+      <a class="btn primary" href="#start">설치부터 시작 →</a>
+      <a class="btn ghost" href="https://github.com/Seung-Won-Yu/autolabel">GitHub 저장소 ↗</a>
     </div>
     <div class="band rise d5">
-      <div><b data-count="0.995" data-decimals="3">0.000</b><span>문서 서명 제로샷 mAP50</span></div>
-      <div><b data-count="0.8" data-decimals="1">0.0</b><span>장당 오토라벨 (초)</span></div>
-      <div><b data-count="75" data-decimals="0">0</b><span>회귀 테스트 통과</span></div>
+      <div><b>0.995</b><span>문서 서명 제로샷 mAP50</span></div>
+      <div><b>0.8<small>초</small></b><span>장당 박스 오토라벨</span></div>
+      <div><b>75</b><span>회귀 테스트 통과</span></div>
       <div><b>0</b><span>필수 클라우드 의존</span></div>
     </div>
   </div>
@@ -593,13 +678,13 @@
     </div>
     <p class="caption">화면 구성 재현 도식 — 실제 앱은 이 배치로 동작한다 (스크린샷 아님)</p>
   </div>
-</div>
+</header>
 
 <!-- ══ 왜 ══ -->
 <section class="alt" id="why">
   <div class="wrap">
     <span class="eyebrow reveal">문제</span>
-    <h2 class="reveal">라벨링의 90%는<br>기계가 이미 할 수 있다</h2>
+    <h2 class="reveal">사람이 전부 그리던 순서를<br>기계가 먼저 그리도록 뒤집었다</h2>
     <p class="lede reveal">그런데 기존 도구는 사람이 그리는 화면을 먼저 주고 오토라벨을 부가 기능으로 둔다.
       순서가 거꾸로다. 슬라이더를 끌어 차이를 보라.</p>
 
@@ -788,17 +873,17 @@
 
     <div class="grid g3 stagger" style="margin-top:46px">
       <div class="card reveal" style="--i:0">
-        <span class="metric g" data-count="0.995" data-decimals="3">0.000</span>
+        <span class="metric g">0.995</span>
         <p><b>문서 서명 제로샷 mAP50</b><br>SAM 3. 같은 데이터에서 기존 경로는 0.000 —
           라벨 0장으로 시작이 가능해졌다</p>
       </div>
       <div class="card reveal" style="--i:1">
-        <span class="metric"><span data-count="0.963" data-decimals="3">0.000</span></span>
+        <span class="metric">0.963</span>
         <p><b>PCB 결함 (제로샷 완전 실패 도메인)</b><br>≈0 → 승인 42장 0.593 → 300장 0.963.
           특수 도메인의 정공법</p>
       </div>
       <div class="card reveal" style="--i:2">
-        <span class="metric"><span data-count="9" data-decimals="0">0</span><small>/9</small></span>
+        <span class="metric">9<small>/9</small></span>
         <p><b>정검출 · 오검출 0</b><br>개 9장 + 함정 6장. 개 닮은 인형에도 속지 않았다</p>
       </div>
     </div>
@@ -819,7 +904,7 @@
       </div>
     </div>
 
-    <div class="tablewrap reveal">
+    <div class="tablewrap reveal" role="region" aria-label="autolabel 실측 성능 표" tabindex="0">
       <table>
         <thead><tr><th>항목</th><th>수치</th></tr></thead>
         <tbody>
@@ -869,17 +954,19 @@
 <section id="start">
   <div class="wrap narrow">
     <span class="eyebrow reveal">시작하기</span>
-    <h2 class="reveal">세 줄이면 끝난다</h2>
+    <h2 class="reveal">세 단계면 시작된다</h2>
     <p class="lede reveal">Apple Silicon Mac · Python 3.11 · Node 20 기준.</p>
-<pre class="reveal"><span class="c"># 1. 최초 1회 — venv · 의존성 · SAM 가중치 · 브라우저 디코더</span>
+<pre class="reveal"><span class="c"># 1. 저장소 받기</span>
+git clone https://github.com/Seung-Won-Yu/autolabel.git &amp;&amp; cd autolabel
+
+<span class="c"># 2. 최초 1회 — venv · 의존성 · SAM 가중치 · 브라우저 디코더</span>
 ./setup.sh
 
-<span class="c"># 2. 실행 — 백엔드 + 프론트 동시, 브라우저 자동 오픈</span>
-./start.sh
-
-<span class="c"># 3. 코드를 고쳤으면 (백엔드 49개 · 브라우저 26개)</span>
-./test.sh &amp;&amp; ./test-e2e.sh<span class="cursor"></span></pre>
+<span class="c"># 3. 실행 — 백엔드 + 프론트 동시, 브라우저 자동 오픈</span>
+./start.sh<span class="cursor"></span></pre>
     <ul class="plain stagger reveal">
+      <li><b>코드를 고쳤다면</b> — <code>./test.sh &amp;&amp; ./test-e2e.sh</code>로 백엔드 49개와
+        브라우저 26개 회귀 경로를 확인한다.</li>
       <li><b>첫 프로젝트</b> — 이름 짓고, 클래스 한 줄 적고, 이미지 던지고, “전체 오토라벨”을 누른다.
         나머지는 “지금 할 일” 배너가 단계별로 안내한다.</li>
       <li><b>SAM 3는 선택</b> — <a href="https://huggingface.co/facebook/sam3">facebook/sam3</a> 접근 승인 후
@@ -931,16 +1018,16 @@
 
 <!-- ══ 마무리 ══ -->
 <div class="final">
-  <div class="glow" aria-hidden="true"><i></i><i></i><i></i></div>
   <div class="wrap">
-    <h2 class="reveal" style="font-size:clamp(32px,5.2vw,60px)">첫 라벨까지<br>5분이면 된다</h2>
-    <p class="lede reveal">클래스 한 줄 적고, 이미지 던지고, 버튼 하나.</p>
+    <h2 class="reveal">준비됐다면,<br>첫 배치를 돌려보자</h2>
+    <p class="lede reveal">클래스 한 줄 적고, 이미지 폴더를 연결하고, 모델의 초안을 확인한다.</p>
     <div class="cta reveal">
       <a class="btn primary" href="https://github.com/Seung-Won-Yu/autolabel">저장소 열기 →</a>
-      <a class="btn ghost" href="https://github.com/Seung-Won-Yu/autolabel#readme">전체 문서</a>
+      <a class="btn ghost" href="https://github.com/Seung-Won-Yu/autolabel/blob/main/README.md">전체 문서</a>
     </div>
   </div>
 </div>
+</main>
 
 <footer>
   <div class="wrap">
@@ -955,7 +1042,6 @@
 (() => {
   'use strict'
   const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches
-  const counters = [...document.querySelectorAll('[data-count]')]
   const fills = [...document.querySelectorAll('.fill')]
   const rafT = (fn) => { let q = false; return () => { if (q) return; q = true
     requestAnimationFrame(() => { q = false; fn() }) } }
@@ -968,6 +1054,7 @@
       p = Math.max(0, Math.min(100, v))
       cmp.style.setProperty('--p', p + '%')
       knob.setAttribute('aria-valuenow', Math.round(p))
+      knob.setAttribute('aria-valuetext', `자동 라벨 영역 ${100 - Math.round(p)}%`)
     }
     const fromEvent = (e) => {
       const r = cmp.getBoundingClientRect()
@@ -989,8 +1076,7 @@
   }
 
   if (reduced) {
-    // 모션 최소화: 숫자·바 길이는 JS만 아는 값이라 여기서 확정한다
-    counters.forEach((el) => { el.textContent = (+el.dataset.count).toFixed(+el.dataset.decimals) })
+    // 모션 최소화: 바 길이는 JS만 아는 값이라 여기서 확정한다
     fills.forEach((el) => { el.style.width = el.dataset.w + '%' })
     document.querySelectorAll('.reveal, tbody').forEach((el) => el.classList.add('in'))
     document.querySelectorAll('.step').forEach((el) => el.classList.add('lit'))
@@ -998,28 +1084,9 @@
     return
   }
 
-  /* ── 카운트업 ─────────── */
-  const countUp = (el) => {
-    if (el.dataset.done) return
-    el.dataset.done = '1'
-    const target = +el.dataset.count, dec = +el.dataset.decimals
-    const final = () => { el.textContent = target.toFixed(dec) }
-    if (document.hidden) return final()      // 숨은 탭에서는 rAF가 멈춘다 — 값만 확정
-    const dur = 1250, t0 = performance.now()
-    const tick = (now) => {
-      const q = Math.min(1, (now - t0) / dur)
-      el.textContent = (target * (1 - Math.pow(1 - q, 3))).toFixed(dec)
-      if (q < 1) requestAnimationFrame(tick); else final()
-    }
-    requestAnimationFrame(tick)
-    setTimeout(final, dur + 400)             // rAF가 멈춰도 값은 맞게 끝난다
-  }
-
   /* ── 스크롤 리빌 ─────────── */
   const activate = (el) => {
     el.classList.add('in')
-    if (el.matches('[data-count]')) countUp(el)
-    el.querySelectorAll?.('[data-count]').forEach(countUp)
     el.querySelectorAll?.('.fill').forEach((f) => { f.style.width = f.dataset.w + '%' })
   }
   const io = new IntersectionObserver((es) => {
