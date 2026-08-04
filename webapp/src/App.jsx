@@ -511,6 +511,8 @@ export default function App() {
           <OntologyEditor project={project} setProject={setProject} />
           <UploadBox project={project} onMsg={setMsg}
             onUploaded={async () => setImages(await api.listImages(project.id))} />
+          <VideoUpload project={project} onMsg={setMsg}
+            onDone={async () => setImages(await api.listImages(project.id))} />
           <LinkImport project={project} setProject={setProject} onMsg={setMsg}
             onDone={async () => setImages(await api.listImages(project.id))} />
           <PromptLab project={project} setProject={setProject} onMsg={setMsg}
@@ -1012,6 +1014,59 @@ function UploadBox({ project, onUploaded, onMsg }) {
             onMsg?.(`${r.saved.length}/${files.length}장 업로드 — 실패: ${r.failed.join(', ')}`, true)
           }
           onUploaded()
+        }} />
+    </label>
+  )
+}
+
+// 비디오 → 프레임 추출 + SAM 3 전파 트래킹. 프레임은 일반 이미지로 등록되어
+// 리뷰·학습·익스포트 레인을 그대로 탄다. 한 프레임에서 잡힌 객체가 메모리
+// 전파로 이어지므로 영상 데이터는 라벨 비용이 "전 프레임"에서 "검수"로 준다.
+function VideoUpload({ project, onMsg, onDone }) {
+  const [job, setJob] = useState(null)
+  const [stride, setStride] = useState(5)
+
+  // 진행 중인 작업 복원 — 새로 연 화면에서도 진행률이 보여야 한다 (심판과 동일)
+  useEffect(() => {
+    api.videoStatus(project.id).then((s) => {
+      if (s.status === 'running') setJob(s)
+    }).catch(() => {})
+  }, [project.id])
+
+  useEffect(() => {
+    if (job?.status !== 'running') return
+    const t = setInterval(async () => {
+      const s = await api.videoStatus(project.id)
+      setJob(s)
+      if (s.status !== 'running') {
+        clearInterval(t)
+        onDone()
+        onMsg(s.status === 'failed' ? `비디오 처리 실패: ${s.error}`
+          : s.status === 'interrupted' ? `비디오 처리가 중단됐습니다 (${s.done ?? 0}/${s.total ?? '?'}) — 다시 업로드하세요`
+            : s.advice || '비디오 처리 완료', true)
+      }
+    }, 1500)
+    return () => clearInterval(t)
+  }, [job?.status]) // eslint-disable-line
+
+  const running = job?.status === 'running'
+  // 클래스는 vupload — .upload를 쓰면 이미지 업로드 셀렉터(label.upload)와 겹친다
+  return (
+    <label className="vupload" title="mp4/mov 업로드 → 프레임 추출 → SAM 3가 첫 검출을 메모리 전파로 추적해 프레임별 초안 라벨 생성">
+      {running
+        ? `🎬 ${job.phase === 'extract' ? '프레임 추출 중…' : `트래킹 중 ${job.done ?? 0}/${job.total ?? '?'}`}`
+        : <>🎬 비디오 임포트 (프레임 추출 + 자동 트래킹) · <select value={stride} onClick={(e) => e.preventDefault()}
+            onChange={(e) => setStride(+e.target.value)}>
+            {[2, 5, 10, 15].map((s) => <option key={s} value={s}>{s}프레임마다</option>)}
+          </select></>}
+      <input type="file" accept="video/mp4,video/quicktime,video/*" hidden disabled={running}
+        onChange={async (e) => {
+          const f = e.target.files[0]
+          e.target.value = ''
+          if (!f) return
+          try {
+            setJob(await api.uploadVideo(project.id, f, stride))
+          } catch (err) { onMsg(`비디오 업로드 실패: ${err.message}`, true) }
         }} />
     </label>
   )

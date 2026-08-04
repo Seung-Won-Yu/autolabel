@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from server import importer, jobs, ml, train, vlm
+from server import importer, jobs, ml, train, video, vlm
 from server.db import get_db, init_db, row_to_dict
 
 DATA_DIR = Path(os.environ.get("AUTOLABEL_DATA")
@@ -179,6 +179,34 @@ async def upload_images(pid: int, files: list[UploadFile]):
     finally:
         conn.close()
     return {"saved": saved, "failed": failed}
+
+
+@app.post("/api/projects/{pid}/video")
+async def upload_video(pid: int, file: UploadFile, stride: int = 5,
+                       max_frames: int = video.MAX_FRAMES_DEFAULT):
+    """비디오 업로드 → 프레임 추출 + SAM 3 전파 트래킹 (백그라운드).
+
+    프레임은 일반 이미지로 등록되어 리뷰·학습·익스포트 레인을 그대로 탄다.
+    """
+    conn = get_db()
+    proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    conn.close()
+    if not proj:
+        raise HTTPException(404, "프로젝트 없음")
+    ontology = json.loads(proj["ontology"])
+    if not ontology:
+        raise HTTPException(400, "클래스를 먼저 정의하세요 — 트래킹 프롬프트로 씁니다")
+    fname = Path(file.filename or "").name or "video.mp4"
+    pdir = DATA_DIR / str(pid)
+    pdir.mkdir(parents=True, exist_ok=True)
+    dst = pdir / f"src_{fname}"
+    dst.write_bytes(await file.read())
+    return video.start(pid, dst, ontology, DATA_DIR, stride=stride, max_frames=max_frames)
+
+
+@app.get("/api/projects/{pid}/video/status")
+def video_status(pid: int):
+    return video.job_status(pid)
 
 
 @app.get("/api/projects/{pid}/images")

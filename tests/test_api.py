@@ -808,3 +808,57 @@ def test_vlm_judge_runs_boxes_in_parallel(client, make_image, tmp_path, monkeypa
     s = _vlm_run(client, pid)
     assert s["status"] == "completed" and s["pass"] == 4, s
     assert active["max"] >= 2, f"병렬 실행이 안 됨 (동시 최대 {active['max']})"
+
+
+def test_video_upload_extracts_frames_and_reports_honestly(client, tmp_path,
+                                                           monkeypatch):
+    """비디오 레인: 프레임이 stride 간격으로 일반 이미지로 등록된다.
+
+    모델 없는 모드에서는 트래킹을 건너뛰되 그 사실을 정직하게 알려야 한다 —
+    조용히 0박스면 사용자는 트래킹이 실패한 줄 모른다.
+    """
+    import time
+
+    import cv2
+    import numpy as np
+
+    # 개발 머신엔 models/sam3.pt가 있어 실제 트래킹이 돌아버린다 — 테스트는
+    # 추출·등록·정직 보고만 검증한다
+    monkeypatch.setenv("AUTOLABEL_NO_MODELS", "1")
+
+    vid = tmp_path / "v.mp4"
+    wr = cv2.VideoWriter(str(vid), cv2.VideoWriter_fourcc(*"mp4v"), 10, (64, 48))
+    assert wr.isOpened(), "mp4v 인코더 사용 불가"
+    for i in range(20):
+        f = np.zeros((48, 64, 3), np.uint8)
+        f[10:30, i * 2:i * 2 + 16] = 255
+        wr.write(f)
+    wr.release()
+
+    pid = _project(client, "video")
+    with open(vid, "rb") as f:
+        r = client.post(f"/api/projects/{pid}/video?stride=5&max_frames=3",
+                        files=[("file", ("v.mp4", f, "video/mp4"))])
+    assert r.status_code == 200, r.text
+
+    for _ in range(100):
+        s = client.get(f"/api/projects/{pid}/video/status").json()
+        if s["status"] != "running":
+            break
+        time.sleep(0.1)
+    assert s["status"] == "completed", s
+    assert "트래킹 생략" in s["advice"]
+
+    imgs = client.get(f"/api/projects/{pid}/images").json()
+    assert len(imgs) == 3  # 프레임 0, 5, 10 (max_frames=3)
+    assert [i["file_name"] for i in imgs] == ["v_f000000.jpg", "v_f000005.jpg", "v_f000010.jpg"]
+    assert all(i["width"] == 64 and i["height"] == 48 for i in imgs)
+    # 프레임 파일이 실제로 서빙된다
+    assert client.get(f"/api/images/{imgs[0]['id']}/file").status_code == 200
+
+    # 클래스 없는 프로젝트는 400 — 트래킹 프롬프트가 없다
+    empty = client.post("/api/projects", json={"name": "novid", "ontology": []}).json()["id"]
+    with open(vid, "rb") as f:
+        r = client.post(f"/api/projects/{empty}/video",
+                        files=[("file", ("v.mp4", f, "video/mp4"))])
+    assert r.status_code == 400

@@ -24,6 +24,12 @@ export const api = {
     for (const f of files) fd.append('files', f)
     return fetch(`/api/projects/${id}/images`, { method: 'POST', body: fd }).then(j)
   },
+  uploadVideo: (id, file, stride = 5) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return fetch(`/api/projects/${id}/video?stride=${stride}`, { method: 'POST', body: fd }).then(j)
+  },
+  videoStatus: (id) => fetch(`/api/projects/${id}/video/status`).then(j),
   listImages: (id) => fetch(`/api/projects/${id}/images`).then(j),
   imageUrl: (iid) => `/api/images/${iid}/file`,
   // 목록 썸네일은 원본을 받아 줄이면 안 된다 (143장 = 9.3MB)
