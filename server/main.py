@@ -30,9 +30,6 @@ init_db()
 # 사용자에게 끝났다고 알린다.
 jobs.sweep_stale()
 
-# 배치 잡 상태 (MVP: 인메모리 단일 워커 — Phase 2에서 큐로 교체)
-_jobs: dict[int, dict] = {}
-
 
 # ---------- 프로젝트 ----------
 
@@ -465,10 +462,7 @@ def _batch_verdict(job: dict, total: int) -> dict:
 
 
 def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool):
-    job = _jobs[pid]
-    # 진행 상황을 디스크에도 남긴다 — 서버가 재시작하면 메모리 기록은 사라지고
-    # 프론트가 그걸 "완료"로 읽는다 (실측: "완료: undefined/undefined장")
-    jobs.update("autolabel", pid, done=0, total=len(image_ids))
+    found = hit = 0
     conn = get_db()
     try:
         for n, iid in enumerate(image_ids, 1):
@@ -495,13 +489,13 @@ def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool
                 "UPDATE images SET status='prelabeled' WHERE id=? AND status='unlabeled'",
                 (iid,))
             conn.commit()
-            job.update(done=n, total=len(image_ids), found=job.get("found", 0) + len(dets),
-                       hit=job.get("hit", 0) + (1 if dets else 0))
-            jobs.update("autolabel", pid, done=n, total=len(image_ids))
-        job.update(status="completed", **_batch_verdict(job, len(image_ids)))
-        jobs.update("autolabel", pid, status="completed", **_batch_verdict(job, len(image_ids)))
+            found += len(dets)
+            hit += 1 if dets else 0
+            jobs.update("autolabel", pid, done=n, total=len(image_ids),
+                        found=found, hit=hit)
+        jobs.update("autolabel", pid, status="completed",
+                    **_batch_verdict({"found": found, "hit": hit}, len(image_ids)))
     except Exception as e:  # 잡 실패를 상태로 노출
-        job.update(status="failed", error=str(e))
         jobs.update("autolabel", pid, status="failed", error=str(e))
     finally:
         conn.close()
@@ -510,7 +504,7 @@ def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool
 @app.post("/api/projects/{pid}/autolabel")
 def autolabel_batch(pid: int, body: dict):
     """배치 오토라벨 — 백그라운드 스레드 (MVP)."""
-    if _jobs.get(pid, {}).get("status") == "running":
+    if jobs.get("autolabel", pid).get("status") == "running":
         raise HTTPException(409, "이미 실행 중인 잡 있음")
     conn = get_db()
     proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
@@ -530,19 +524,20 @@ def autolabel_batch(pid: int, body: dict):
         return {"status": "completed", "done": 0, "total": 0,
                 "advice": "라벨할 이미지가 없습니다 — 리뷰 전(unlabeled/prelabeled) "
                           "이미지가 없습니다. 승인·거부된 라벨은 덮어쓰지 않습니다."}
-    _jobs[pid] = {"status": "running", "done": 0, "total": len(ids)}
-    jobs.start("autolabel", pid, done=0, total=len(ids))
+    ok, st = jobs.try_start("autolabel", pid, done=0, total=len(ids))
+    if not ok:
+        raise HTTPException(409, "이미 실행 중인 잡 있음")
     threading.Thread(
         target=_run_batch, args=(pid, ids, ontology, body.get("masks", True)),
         daemon=True).start()
-    return _jobs[pid]
+    return st
 
 
 @app.get("/api/projects/{pid}/autolabel/status")
 def autolabel_status(pid: int):
-    # 메모리에 없으면 디스크 기록을 본다 — 서버 재시작 후에도 중단(interrupted)을
-    # 알려야 한다. 없으면 진짜로 한 번도 실행하지 않은 것(idle)이다.
-    return _jobs.get(pid) or jobs.get("autolabel", pid)
+    # jobs가 메모리 캐시 → 디스크 순으로 본다 — 서버 재시작 후에도 중단
+    # (interrupted)을 알리고, 기록이 없으면 진짜 미실행(idle)이다.
+    return jobs.get("autolabel", pid)
 
 
 MAX_LAB_PROMPTS = 8  # 표본 5장 기준 이 이상은 대기가 너무 길어진다
@@ -681,8 +676,7 @@ def import_dataset(pid: int, body: dict):
 
 @app.get("/api/projects/{pid}/import/status")
 def import_status(pid: int):
-    st = importer.job_status(pid)
-    return st if st.get("status") != "idle" else jobs.get("import", pid)
+    return importer.job_status(pid)  # jobs가 메모리→디스크 폴백을 이미 담당
 
 
 # ---------- 외부 모델 임포트 ----------
@@ -1053,8 +1047,7 @@ def run_qa(pid: int, background: bool = False):
 def qa_status(pid: int):
     from server import qa
 
-    st = qa.job_status(pid)
-    return st if st.get("status") != "idle" else jobs.get("qa", pid)
+    return qa.job_status(pid)  # jobs가 메모리→디스크 폴백을 이미 담당
 
 
 @app.get("/api/images/{iid}/suggestions")

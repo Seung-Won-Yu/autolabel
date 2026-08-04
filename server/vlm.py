@@ -26,7 +26,7 @@ import json
 import os
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image, ImageDraw
 
@@ -50,9 +50,6 @@ VERDICT_SCHEMA = {
     "required": ["verdict", "reason"],
     "additionalProperties": False,
 }
-
-_jobs: dict[int, dict] = {}
-
 
 def rubric_sha(rubric: str) -> str:
     return hashlib.sha256(rubric.strip().encode()).hexdigest()[:12]
@@ -226,7 +223,7 @@ def judge_box(image: Image.Image, bbox: list[float], class_name: str,
 
 
 def job_status(pid: int) -> dict:
-    return _jobs.get(pid) or jobs.get("vlm", pid)
+    return jobs.get("vlm", pid)
 
 
 def _image_path(im: dict):
@@ -235,7 +232,6 @@ def _image_path(im: dict):
 
 
 def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
-    job = _jobs[pid]
     sha = rubric_sha(rubric)
     counts = {"pass": 0, "fail": 0, "unsure": 0, "cached": 0, "stale": 0}
     conn = get_db()
@@ -247,7 +243,7 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
         f"SELECT COUNT(*) FROM annotations WHERE image_id IN ({qmarks})",
         image_ids).fetchone()[0] if image_ids else 0
     done_boxes = 0
-    job.update(total_boxes=total_boxes, done_boxes=0)
+    jobs.update("vlm", pid, total_boxes=total_boxes, done_boxes=0)
     # 판정 병렬화 — claude-code는 CLI 기동이 박스당 수 초~수십 초라 순차로는
     # 수백 박스에 수 시간이 든다. DB 쓰기는 이 스레드에서만 한다 (워커는
     # 판정만) — 커밋·카운트 갱신의 단일 쓰기 레인 유지.
@@ -285,16 +281,24 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
         # 프로젝트 생성)가 전부 "database is locked"로 죽는다 (실측)
         conn.commit()
         done_boxes += 1
-        job.update(done_boxes=done_boxes, **counts)
+        jobs.update("vlm", pid, done_boxes=done_boxes, **counts)
 
     try:
-        for n, iid in enumerate(image_ids, 1):
+        # 1패스: 캐시·스킵·유실을 즉시 처리하고 실판정 대상을 전역으로 모은다.
+        # 이미지 단위로 풀에 넣으면 이미지 경계마다 워커가 최저속 박스에 맞춰
+        # 드레인돼, 박스 1~2개짜리 이미지는 사실상 직렬이 된다 — 플랫 큐로
+        # 워커가 항상 차 있게 한다.
+        work: list[tuple[dict, object]] = []  # (ann, 이미지 경로)
+        left: dict[int, int] = {}             # iid -> 남은 실판정 박스 수
+        done_images = 0
+        for iid in image_ids:
             im = conn.execute("SELECT * FROM images WHERE id=?", (iid,)).fetchone()
             if not im:
                 continue
             anns = [row_to_dict(a) for a in conn.execute(
                 "SELECT * FROM annotations WHERE image_id=?", (iid,))]
-            to_judge = []
+            path = _image_path(im)
+            pending = 0
             for a in anns:
                 prev = (a.get("meta") or {}).get("vlm")
                 box_key = [a["bbox"], a["class_name"]]
@@ -306,7 +310,6 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
                     counts["cached"] += 1
                     counts[prev["verdict"]] = counts.get(prev["verdict"], 0) + 1
                     done_boxes += 1
-                    job.update(done_boxes=done_boxes)
                     continue
                 w, h = a["bbox"][2], a["bbox"][3]
                 if min(w, h) < MIN_JUDGE_PX:
@@ -315,37 +318,46 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
                         "reason": f"박스가 {w:.0f}×{h:.0f}px로 너무 작아 판정 생략 "
                                   "— 확대해 직접 확인하세요"})
                     continue
-                to_judge.append(a)
-
-            if to_judge:
-                path = _image_path(im)
                 if not path.exists():
-                    done_boxes += len(to_judge)  # 원본 유실 — 판정 불가로 건너뜀
-                    job.update(done_boxes=done_boxes)
-                else:
-                    img = Image.open(path).convert("RGB")
-                    img.load()  # 워커들이 crop을 공유하므로 픽셀을 미리 디코드
+                    done_boxes += 1  # 원본 유실 — 판정 불가로 건너뜀
+                    continue
+                work.append((a, path))
+                pending += 1
+            if pending:
+                left[iid] = pending
+            else:
+                done_images += 1
+            jobs.update("vlm", pid, done=done_images, done_boxes=done_boxes, **counts)
 
-                    def call(a, _img=img):
-                        return judge_box(_img, a["bbox"], a["class_name"], rubric, prov)
+        def judge_one(item):
+            a, p = item
+            # 박스마다 이미지를 다시 연다 — JPEG 디코드(수십 ms)는 판정(수 초~
+            # 수십 초)에 비해 공짜고, 워커 수만큼만 메모리에 올라온다
+            img = Image.open(p).convert("RGB")
+            return judge_box(img, a["bbox"], a["class_name"], rubric, prov)
 
-                    for a, v in zip(to_judge, pool.map(call, to_judge)):
-                        record(a, v)
-            # 박스 카운터도 디스크에 남긴다 — 메모리(_jobs)에만 있으면 서버
-            # 재시작 후 복원 화면에서 박스 진행률이 사라진다 (실측 드리프트)
-            job.update(done=n, **counts)
-            jobs.update("vlm", pid, done=n, done_boxes=done_boxes,
-                        total_boxes=total_boxes, **counts)
+        # 2패스: 전역 큐를 통째로 제출하고 끝나는 순서대로 기록한다 —
+        # DB 쓰기·카운트는 이 스레드에서만 (단일 쓰기 레인)
+        futures = {pool.submit(judge_one, item): item[0] for item in work}
+        for fut in as_completed(futures):
+            a = futures[fut]
+            try:
+                v = fut.result()
+            except Exception as e:  # 이미지 열기 실패 등 — 배치는 계속
+                v = {"verdict": "unsure", "reason": f"판정 실패: {e}", "error": True}
+            record(a, v)
+            left[a["image_id"]] -= 1
+            if left[a["image_id"]] == 0:
+                done_images += 1
+                jobs.update("vlm", pid, done=done_images)
         judged = counts["pass"] + counts["fail"] + counts["unsure"]
         advice = (f"판정 {judged}건: 부합 {counts['pass']} · 위반 {counts['fail']} · "
                   f"불확실 {counts['unsure']}"
                   + (f" (캐시 재사용 {counts['cached']})" if counts["cached"] else "")
                   + (f" (편집으로 무효화 {counts['stale']})" if counts["stale"] else "")
                   + " — 위반·불확실만 확인하면 됩니다")
-        job.update(status="completed", advice=advice, **counts)
         jobs.update("vlm", pid, status="completed", advice=advice, **counts)
     except Exception as e:
-        job.update(status="failed", error=str(e))
         jobs.update("vlm", pid, status="failed", error=str(e))
     finally:
         # cancel_futures: 잡이 죽으면 큐에 남은 판정(유료 호출)도 버린다
@@ -353,22 +365,16 @@ def _run_judge(pid: int, rubric: str, image_ids: list[int], prov: str):
         conn.close()
 
 
-_start_lock = threading.Lock()
-
-
 def start_judge(pid: int, rubric: str, image_ids: list[int]) -> dict:
-    # provider()는 Ollama HTTP 프로브로 최대 1초 걸린다 — 잠금 밖에서 확인
+    # provider()는 Ollama HTTP 프로브로 최대 1초 걸린다 — 등록 전에 확인
     prov = provider()
     if not prov:
         return {"status": "failed", "error": PROVIDER_HINT}
-    # 검사-등록을 원자화한다. 더블클릭·중복 탭이 검사를 동시에 통과하면 같은
-    # 배치가 두 번 판정되어 API 비용이 2배가 되고 잡 상태가 서로를 덮는다.
-    with _start_lock:
-        if _jobs.get(pid, {}).get("status") == "running":
-            return _jobs[pid]
-        _jobs[pid] = {"status": "running", "done": 0, "total": len(image_ids),
-                      "provider": prov}
-        jobs.start("vlm", pid, done=0, total=len(image_ids))
-        threading.Thread(target=_run_judge, args=(pid, rubric, image_ids, prov),
-                         daemon=True).start()
-    return _jobs[pid]
+    # try_start가 검사-등록을 원자화한다 — 더블클릭·중복 탭이 같은 배치를
+    # 두 번 판정해 API 비용이 2배가 되지 않게
+    ok, st = jobs.try_start("vlm", pid, done=0, total=len(image_ids), provider=prov)
+    if not ok:
+        return st
+    threading.Thread(target=_run_judge, args=(pid, rubric, image_ids, prov),
+                     daemon=True).start()
+    return st

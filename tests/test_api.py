@@ -386,7 +386,8 @@ def test_batch_autolabel_default_skips_reviewed_images(client, make_image, tmp_p
 
     def fake_run(pid_, image_ids, ontology, masks):
         seen["ids"] = image_ids
-        m._jobs[pid_].update(status="completed")
+        from server import jobs as _jobs_mod
+        _jobs_mod.update("autolabel", pid_, status="completed")
 
     monkeypatch.setattr(m, "_run_batch", fake_run)
     r = client.post(f"/api/projects/{pid}/autolabel", json={}).json()

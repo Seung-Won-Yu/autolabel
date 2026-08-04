@@ -130,9 +130,15 @@ def test_job_state_survives_restart_and_marks_interrupted():
     해석해 "배치 오토라벨 완료: undefined/undefined장"을 띄웠다. 절반만 라벨된
     데이터를 두고 사용자는 끝난 줄 안다.
     """
+    import time as _time
+
     from server import jobs
 
     jobs.start("autolabel", 4242, done=0, total=10)
+    # 진행 카운터 디스크 쓰기는 스로틀된다(WRITE_INTERVAL) — 창을 넘겨서
+    # 기록되게 한다. 실사용에서 진행 갱신은 초 단위로 흩어져 있고, 크래시로
+    # 잃는 것은 마지막 창 하나치 숫자뿐이다.
+    _time.sleep(jobs.WRITE_INTERVAL + 0.05)
     jobs.update("autolabel", 4242, done=3)
     assert jobs.get("autolabel", 4242)["done"] == 3
 

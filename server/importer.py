@@ -16,11 +16,11 @@ from server import jobs
 from server.db import get_db
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-_jobs: dict[int, dict] = {}
+
 
 
 def job_status(pid: int) -> dict:
-    return _jobs.get(pid, {"status": "idle"})
+    return jobs.get("import", pid)
 
 
 def preview(images_dir: str, labels_dir: str | None = None,
@@ -63,7 +63,6 @@ def preview(images_dir: str, labels_dir: str | None = None,
 def _run_import(pid: int, images_dir: str, labels_dir: str | None,
                 coco_json: str | None, class_names: list[str],
                 limit: int | None, require_class: str | None, seed: int):
-    job = _jobs[pid]
     conn = get_db()
     try:
         idir = Path(images_dir).expanduser()
@@ -120,7 +119,7 @@ def _run_import(pid: int, images_dir: str, labels_dir: str | None,
         random.Random(seed).shuffle(candidates)
         if limit:
             candidates = candidates[:limit]
-        job.update(total=len(candidates), done=0)
+        jobs.update("import", pid, total=len(candidates), done=0)
 
         is_coco = bool(coco_json)
         for n, (key, src, rows) in enumerate(candidates, 1):
@@ -149,28 +148,23 @@ def _run_import(pid: int, images_dir: str, labels_dir: str | None,
                      json.dumps({"origin": coco_json or labels_dir or "yolo"})))
             if n % 200 == 0:
                 conn.commit()
-                job.update(done=n)
                 jobs.update("import", pid, done=n, total=len(candidates))
         conn.commit()
-        job.update(status="completed", done=len(candidates))
         jobs.update("import", pid, status="completed", done=len(candidates))
     except Exception as e:
-        job.update(status="failed", error=str(e))
         jobs.update("import", pid, status="failed", error=str(e))
     finally:
         conn.close()
 
 
 def start_import(pid: int, body: dict) -> dict:
-    if _jobs.get(pid, {}).get("status") == "running":
-        return _jobs[pid]
-    _jobs[pid] = {"status": "running", "done": 0, "total": 0}
-    # 서버 재시작 시 기록이 사라져 "완료"로 오독되지 않게 디스크에도 남긴다
-    jobs.start("import", pid, done=0, total=0)
+    ok, st = jobs.try_start("import", pid, done=0, total=0)
+    if not ok:
+        return st
     threading.Thread(
         target=_run_import,
         args=(pid, body["images_dir"], body.get("labels_dir"), body.get("coco_json"),
               body.get("class_names", []), body.get("limit"),
               body.get("require_class"), int(body.get("seed", 42))),
         daemon=True).start()
-    return _jobs[pid]
+    return st

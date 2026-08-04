@@ -12,6 +12,7 @@ interrupted로 정리한다 — 그 스레드는 이전 프로세스와 함께 �
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -19,6 +20,11 @@ JOBS_DIR = Path(os.environ.get("AUTOLABEL_DATA") or (ROOT / "data" / "uploads"))
 
 _lock = threading.Lock()
 _cache: dict[str, dict] = {}
+_last_write: dict[str, float] = {}
+# 비종결 update의 디스크 쓰기 간격 — 박스·프레임마다 fsync하지 않게.
+# 캐시는 항상 최신이라 상태 API는 정확하고, 스로틀로 잃는 것은 크래시 직전
+# 0.5초치 진행 숫자뿐이다 (재시작 시 어차피 interrupted로 정리된다).
+WRITE_INTERVAL = 0.5
 
 
 def _path(kind: str, pid: int) -> Path:
@@ -41,14 +47,40 @@ def start(kind: str, pid: int, **fields) -> dict:
         state = {"status": "running", **fields}
         _cache[_key(kind, pid)] = state
         _write(kind, pid, state)
+        _last_write[_key(kind, pid)] = time.monotonic()
         return dict(state)
+
+
+def try_start(kind: str, pid: int, **fields) -> tuple[bool, dict]:
+    """원자적 검사-등록 — 이미 실행 중이면 (False, 현재 상태).
+
+    검사와 등록이 분리돼 있으면 더블클릭·중복 탭이 검사를 동시에 통과해
+    같은 배치가 두 번 돌아 비용이 2배가 된다. 모듈마다 자기 락으로 감싸던
+    것을 여기로 일반화.
+    """
+    with _lock:
+        key = _key(kind, pid)
+        cur = _cache.get(key)
+        if cur and cur.get("status") == "running":
+            return False, dict(cur)
+        state = {"status": "running", **fields}
+        _cache[key] = state
+        _write(kind, pid, state)
+        _last_write[key] = time.monotonic()
+        return True, dict(state)
 
 
 def update(kind: str, pid: int, **fields) -> dict:
     with _lock:
-        state = _cache.setdefault(_key(kind, pid), {"status": "running"})
+        key = _key(kind, pid)
+        state = _cache.setdefault(key, {"status": "running"})
         state.update(fields)
-        _write(kind, pid, state)
+        # 상태 전이(완료·실패 등)는 즉시 기록, 진행 카운터는 스로틀
+        now = time.monotonic()
+        if (state.get("status") != "running"
+                or now - _last_write.get(key, 0.0) >= WRITE_INTERVAL):
+            _write(kind, pid, state)
+            _last_write[key] = now
         return dict(state)
 
 

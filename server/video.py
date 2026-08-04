@@ -19,8 +19,6 @@ from pathlib import Path
 from server import jobs
 from server.db import get_db
 
-_start_lock = threading.Lock()
-
 MAX_FRAMES_DEFAULT = 300  # 30fps 영상 기준 stride 5로 약 50초 — 그 이상은 나눠서
 EXTRACT_COMMIT_EVERY = 25  # 추출 내내 쓰기 트랜잭션을 쥐지 않게 주기 커밋
 
@@ -140,12 +138,11 @@ def start(pid: int, video_path: Path, ontology: list[dict], data_dir: Path,
           stride: int = 5, max_frames: int = MAX_FRAMES_DEFAULT) -> dict:
     stride = max(1, int(stride))
     max_frames = max(1, min(int(max_frames), 2000))
-    with _start_lock:  # 더블클릭·중복 탭이 같은 비디오를 두 번 처리하지 않게
-        st = jobs.get("video", pid)
-        if st.get("status") == "running":
-            return st
-        jobs.start("video", pid, done=0, total=0, phase="extract")
-        threading.Thread(
-            target=_run, args=(pid, video_path, ontology, data_dir, stride, max_frames),
-            daemon=True).start()
-    return jobs.get("video", pid)
+    # try_start가 검사-등록을 원자화 — 더블클릭이 같은 비디오를 두 번 처리하지 않게
+    ok, st = jobs.try_start("video", pid, done=0, total=0, phase="extract")
+    if not ok:
+        return st
+    threading.Thread(
+        target=_run, args=(pid, video_path, ontology, data_dir, stride, max_frames),
+        daemon=True).start()
+    return st

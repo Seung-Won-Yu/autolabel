@@ -9,16 +9,19 @@ from pathlib import Path
 
 from PIL import Image
 
-from server import ml, train
+from server import jobs, ml, train
 from server.db import get_db, row_to_dict
 
 ROOT = Path(__file__).parent.parent
 
-_jobs: dict[int, dict] = {}
 
 
 def job_status(pid: int) -> dict:
-    return _jobs.get(pid, {"status": "idle"})
+    st = jobs.get("qa", pid)
+    # 결과 본문(의심 목록)은 커서 메모리에만 둔다 — 완료 상태에 붙여 반환
+    if st.get("status") == "completed" and pid in _results:
+        return {**st, "result": _results[pid]}
+    return st
 
 
 def _iou(a, b):
@@ -196,21 +199,35 @@ def analyze(pid: int, progress: dict | None = None) -> dict:
     }
 
 
+# 결과 본문은 크다 (의심 목록 전체) — 잡 상태 파일에 싣지 않고 메모리에만
+# 둔다. 서버 재시작으로 사라지면 다시 분석하면 된다 (중단 판별은 jobs가 담당)
+_results: dict[int, dict] = {}
+
+
+class _JobProgress:
+    """analyze()의 progress 싱크 — dict.update 시그니처 그대로 jobs에 전달."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+
+    def update(self, **kw):
+        from server import jobs
+
+        jobs.update("qa", self.pid, **kw)
+
+
 def _run_judge(pid: int):
     from server import jobs
 
-    job = _jobs[pid]
     try:
-        result = analyze(pid, progress=job)
+        result = analyze(pid, progress=_JobProgress(pid))
         if result.get("error"):
-            job.update(status="failed", error=result["error"])
             jobs.update("qa", pid, status="failed", error=result["error"])
         else:
-            job.update(status="completed", result=result, done=job.get("total", 0))
-            # 결과 본문은 크니 디스크 기록에는 상태만 남긴다 (중단 판별용)
-            jobs.update("qa", pid, status="completed", done=job.get("total", 0))
+            _results[pid] = result
+            st = jobs.get("qa", pid)
+            jobs.update("qa", pid, status="completed", done=st.get("total", 0))
     except Exception as e:
-        job.update(status="failed", error=str(e))
         jobs.update("qa", pid, status="failed", error=str(e))
 
 
@@ -218,10 +235,8 @@ def start_judge(pid: int) -> dict:
     """대규모 심판 — 백그라운드 실행 (수만 장 대응)."""
     from server import jobs
 
-    if _jobs.get(pid, {}).get("status") == "running":
-        return _jobs[pid]
-    _jobs[pid] = {"status": "running", "done": 0, "total": 0}
-    # 서버 재시작 시 기록이 사라져 "완료"로 오독되지 않게 디스크에도 남긴다
-    jobs.start("qa", pid, done=0, total=0)
+    ok, st = jobs.try_start("qa", pid, done=0, total=0)
+    if not ok:
+        return st
     threading.Thread(target=_run_judge, args=(pid,), daemon=True).start()
-    return _jobs[pid]
+    return st

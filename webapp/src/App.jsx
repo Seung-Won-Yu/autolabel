@@ -12,7 +12,6 @@ export default function App() {
   const [selectedId, setSelectedId] = useState(null)
   const [hoverId, setHoverId] = useState(null) // 패널 행 ↔ 캔버스 박스 상호 하이라이트
   const [activeClass, setActiveClass] = useState('')
-  const [job, setJob] = useState({ status: 'idle' })
   const [toast, setToast] = useState(null)
   const [tool, setTool] = useState('box')
   const [trainInfo, setTrainInfo] = useState({ job: { status: 'idle' }, active_model: null })
@@ -20,7 +19,6 @@ export default function App() {
   const [filter, setFilter] = useState('all')
   const [sortMode, setSortMode] = useState('none')
   const [lastQa, setLastQa] = useState(null)
-  const [qaJob, setQaJob] = useState(null)
   const [suggest, setSuggest] = useState([]) // 현재 이미지의 누락 라벨 제안
   const [sampling, setSampling] = useState(null) // 진행 중인 통계 검수 계획
   // 설정·도구는 라벨링을 시작하면 접는다 — 매번 쓰는 건 이미지 목록이다
@@ -66,6 +64,44 @@ export default function App() {
     setToast(text ? { text, sticky } : null)
   }, [])
 
+  // 배치 오토라벨 잡 — 폴링·재진입 복원은 useJob이, 종료 처리만 여기서.
+  // 완료가 아닌 종료를 완료로 말하지 않는다. 예전엔 서버 재시작으로 잡 기록이
+  // 사라지면 "완료: undefined/undefined장"을 띄웠다 — 절반만 라벨된 데이터를
+  // 두고 사용자는 끝난 줄 안다.
+  const [job, setJob] = useJob(
+    project?.id,
+    () => (project ? api.autolabelStatus(project.id) : Promise.resolve({ status: 'idle' })),
+    async (s) => {
+      setImages(await api.listImages(project.id))
+      // 배치가 도는 동안 사용자는 이미지를 옮겨 다닌다 — 완료 시점의 현재
+      // 이미지(ref)를 쓰고, 편집 중(dirty)이면 미저장 편집을 덮지 않는다.
+      const cur = currentRef.current
+      if (cur && !dirty.current) {
+        const list = await api.getAnnotations(cur.id)
+        if (currentRef.current?.id === cur.id && !dirty.current) {
+          const mapped = list.map((a) => ({ ...a, _key: `db-${a.id}` }))
+          annsRef.current = mapped
+          setAnns(mapped)
+        }
+      }
+      const bad = s.status !== 'completed'
+      const text = s.status === 'completed'
+        ? (s.advice || `배치 오토라벨 완료: ${s.done}/${s.total}장`)
+        : jobEndMessage(s, '배치', '배치 완료')
+      // 읽고 판단해야 하는 안내는 사라지지 않게 둔다
+      setMsg(text, bad || (s.verdict && s.verdict !== 'good'))
+    })
+
+  // QA 심판 잡 — 결과 본문(result)은 완료 상태에 붙어 온다
+  const [qaJob, setQaJob] = useJob(
+    project?.id,
+    () => (project ? api.qaStatus(project.id) : Promise.resolve({ status: 'idle' })),
+    async (s) => {
+      setImages(await api.listImages(project.id))
+      if (s.result) { setLastQa(s.result); setMsg(qaSummary(s.result), true) }
+      else setMsg(`심판 실패: ${s.error || '진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요'}`, true)
+    }, 2000)
+
   useEffect(() => {
     if (!toast || toast.sticky) return
     const t = setTimeout(() => setToast(null), 3000)
@@ -94,12 +130,7 @@ export default function App() {
     setCurrent(null); setAnns([])
     // 빈 프로젝트는 설정부터 해야 하고, 이미 이미지가 있으면 바로 라벨링이다
     setSetupOpen(imgs.length === 0)
-    // 새로고침·재진입 시 서버에서 아직 도는 배치를 복원한다 — 안 하면 진행
-    // 표시가 사라지고, 재클릭은 409로 무음 실패한다. await 금지: 여기서 열기
-    // 흐름을 늦추면 사용자가 이미 이동한 뒤 아래 setCurrent가 위치를 되감는다
-    api.autolabelStatus(p.id)
-      .then((s) => { if (s?.status === 'running') setJob(s) })
-      .catch(() => {})
+    // 도는 중인 배치·심판 잡 복원은 useJob 훅이 project.id 변화를 보고 처리한다
     // 첫 이미지 자동 열기 — 빈 캔버스로 시작하지 않게
     if (imgs.length) {
       const first = imgs.find((im) => im.status === 'prelabeled')
@@ -209,19 +240,21 @@ export default function App() {
       await api.setImageStatus(entry.imageId, entry.before)
       setImages((imgs) => imgs.map((im) => (
         im.id === entry.imageId ? { ...im, status: entry.before } : im)))
-      if (target && currentRef.current?.id !== entry.imageId) await openImage(target)
+      if (target) await openImage(target)
       return setMsg(`${entry.was === 'approved' ? '승인' : '거부'} 취소${label}`)
     }
-    // 어노테이션 되돌리기 — 다른 이미지 것이면 그 이미지로 이동한 뒤 적용한다
+    // 어노테이션 되돌리기 — 대상 이미지를 "무조건" 다시 연다. currentRef가
+    // 이미 대상을 가리켜도 화살표 이동의 openImage가 비행 중이면 currentRef가
+    // 낡은 값이라, 지름길로 복구한 직후 비행 중이던 fetch가 화면을 덮는다
+    // (실측: DB엔 복구됐는데 화면은 다음 이미지의 빈 캔버스). openImage는
+    // 순번(openSeq)을 올려 비행 중인 열기를 무효화하므로 이게 유일한 안전 경로다.
+    if (!target) return setMsg('되돌릴 이미지를 찾을 수 없습니다')
+    await openImage(target)
+    // 그 사이 더 최신 이동이 시작됐으면 여기서 적용하면 안 된다 —
+    // 엉뚱한 이미지에 이전 어노테이션이 저장된다. 되밀어 넣고 중단.
     if (currentRef.current?.id !== entry.imageId) {
-      if (!target) return setMsg('되돌릴 이미지를 찾을 수 없습니다')
-      await openImage(target)
-      // 이동(화살표)과 경합해 다른 이미지가 열렸으면 여기서 적용하면 안 된다 —
-      // 엉뚱한 이미지에 이전 어노테이션이 저장된다. 되밀어 넣고 중단.
-      if (currentRef.current?.id !== entry.imageId) {
-        undoStack.current.push(entry)
-        return setMsg('이미지 이동과 겹쳐 되돌리기를 중단했습니다 — 다시 Cmd+Z')
-      }
+      undoStack.current.push(entry)
+      return setMsg('이미지 이동과 겹쳐 되돌리기를 중단했습니다 — 다시 Cmd+Z')
     }
     dirty.current = true
     annsRef.current = entry.before
@@ -370,22 +403,6 @@ export default function App() {
     return () => window.removeEventListener('keydown', h)
   })
 
-  // 백그라운드 심판 잡 폴링
-  useEffect(() => {
-    if (qaJob?.status !== 'running' || !project) return
-    const t = setInterval(async () => {
-      const s = await api.qaStatus(project.id)
-      setQaJob(s)
-      if (s.status !== 'running') {
-        clearInterval(t)
-        setImages(await api.listImages(project.id))
-        if (s.result) { setLastQa(s.result); setMsg(qaSummary(s.result), true) }
-        else setMsg(`심판 실패: ${s.error || '진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요'}`, true)
-      }
-    }, 2000)
-    return () => clearInterval(t)
-  }, [qaJob?.status, project?.id]) // eslint-disable-line
-
   // 드래그앤드롭 업로드 — 창 어디에 놓아도 됨
   useEffect(() => {
     if (!project) return
@@ -407,42 +424,6 @@ export default function App() {
     window.addEventListener('drop', drop)
     return () => { window.removeEventListener('dragover', over); window.removeEventListener('drop', drop) }
   }, [project?.id, setMsg]) // eslint-disable-line
-
-  // 배치 잡 폴링
-  useEffect(() => {
-    if (job.status !== 'running' || !project) return
-    const t = setInterval(async () => {
-      const s = await api.autolabelStatus(project.id)
-      setJob(s)
-      if (s.status !== 'running') {
-        clearInterval(t)
-        setImages(await api.listImages(project.id))
-        // 배치가 도는 동안 사용자는 이미지를 옮겨 다닌다 — state의 current는
-        // 폴링 시작 시점 클로저라 낡았다. 완료 시점의 현재 이미지(ref)를 쓰고,
-        // 편집 중(dirty)이면 서버 갱신으로 미저장 편집을 덮지 않는다.
-        const cur = currentRef.current
-        if (cur && !dirty.current) {
-          const list = await api.getAnnotations(cur.id)
-          if (currentRef.current?.id === cur.id && !dirty.current) {
-            const mapped = list.map((a) => ({ ...a, _key: `db-${a.id}` }))
-            annsRef.current = mapped
-            setAnns(mapped)
-          }
-        }
-        // 완료가 아닌 종료를 완료로 말하지 않는다. 예전엔 서버 재시작으로
-        // 잡 기록이 사라지면 "완료: undefined/undefined장"을 띄웠다 — 절반만
-        // 라벨된 데이터를 두고 사용자는 끝난 줄 안다.
-        const bad = s.status === 'failed' || s.status === 'interrupted' || s.status === 'idle'
-        const text = s.status === 'failed' ? `배치 실패: ${s.error}`
-          : s.status === 'interrupted' ? `배치가 중단됐습니다 (${s.done ?? 0}/${s.total ?? '?'}장 처리) — ${s.error || '다시 실행하세요'}`
-            : s.status === 'idle' ? '배치 진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요'
-              : s.advice || `배치 오토라벨 완료: ${s.done}/${s.total}장`
-        // 읽고 판단해야 하는 안내는 사라지지 않게 둔다
-        setMsg(text, bad || (s.verdict && s.verdict !== 'good'))
-      }
-    }, 1500)
-    return () => clearInterval(t)
-  }, [job.status, project]) // eslint-disable-line
 
   if (!project) {
     return (
@@ -543,7 +524,7 @@ export default function App() {
           <div className="card">
             <div className="panel-title">일괄 작업</div>
             <div className="row">
-              <button className="primary" disabled={job.status === 'running'}
+              <button className="primary" disabled={job?.status === 'running'}
                 title="전 이미지에 모델이 라벨 초안을 생성합니다 (덮어쓰지 않고 모델 라벨만 갱신)"
                 onClick={async () => {
                   if (!project.ontology.length) return setMsg('클래스를 먼저 정의하세요')
@@ -553,7 +534,7 @@ export default function App() {
                     if (j.status !== 'running') setMsg(j.advice || '실행할 이미지가 없습니다')
                   } catch (e) { setMsg(`배치 시작 실패: ${e.message}`) }
                 }}>
-                {job.status === 'running' ? `오토라벨 ${job.done ?? 0}/${job.total}` : '▶ 전체 오토라벨'}
+                {job?.status === 'running' ? `오토라벨 ${job.done ?? 0}/${job.total}` : '▶ 전체 오토라벨'}
               </button>
               <button title="전용 모델과 저장된 라벨을 대조해 의심 라벨을 찾고, 클래스별 권장 임계값을 계산합니다 (전용 모델 필요). 이미지가 많으면 백그라운드로 실행됩니다."
                 disabled={qaJob?.status === 'running'}
@@ -814,7 +795,7 @@ function NextStep({ project, images, trainInfo, job, onAutolabel }) {
     step = { n: 1, title: '클래스를 정의하세요', desc: '찾을 객체 이름 + 검출 프롬프트(영문). 예: helmet / safety helmet' }
   else if (!images.length)
     step = { n: 2, title: '이미지를 업로드하세요', desc: '여러 장 한번에 선택 가능' }
-  else if (job.status === 'running')
+  else if (job?.status === 'running')
     step = { n: 3, title: `오토라벨 중… ${job.done ?? 0}/${job.total}`, desc: '완료되면 리뷰 대기로 넘어갑니다' }
   else if (!labeled)
     step = { n: 3, title: '전체 오토라벨을 실행하세요', desc: '모델이 전 이미지에 라벨 초안을 깝니다', action: { label: '▶ 전체 오토라벨 실행', fn: onAutolabel } }
@@ -1059,7 +1040,7 @@ function useJob(projectId, fetchStatus, onFinish, interval = 1500) {
 // 완료가 아닌 종료를 완료로 말하지 않는다 — 잡 공통 종료 메시지 규칙
 function jobEndMessage(s, label, fallback) {
   return s.status === 'failed' ? `${label} 실패: ${s.error}`
-    : s.status === 'interrupted' ? `${label}이(가) 중단됐습니다 (${s.done ?? 0}/${s.total ?? '?'}) — 다시 실행하세요`
+    : s.status === 'interrupted' ? `${label} 중단됨 (${s.done ?? 0}/${s.total ?? '?'} 처리) — ${s.error || '다시 실행하세요'}`
       : s.status === 'idle' ? `${label} 진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요`
         : s.advice || fallback
 }
@@ -1254,28 +1235,14 @@ function LinkImport({ project, setProject, onMsg, onDone }) {
   const [limit, setLimit] = useState('')
   const [requireClass, setRequireClass] = useState('')
   const [info, setInfo] = useState(null)
-  const [job, setJob] = useState(null)
-
-  useEffect(() => {
-    if (job?.status !== 'running') return
-    const t = setInterval(async () => {
-      const s = await api.importStatus(project.id)
-      setJob(s)
-      if (s.status !== 'running') {
-        clearInterval(t)
-        onDone()
-        // 완료가 아닌 종료를 완료로 말하지 않는다 (배치 폴링과 동일한 규칙).
-        // 서버가 재시작하면 sweep이 interrupted로 남긴다 — 5만 장 중 400장만
-        // 연결된 걸 "임포트 완료: 400장"으로 알리면 안 된다.
-        const text = s.status === 'failed' ? `임포트 실패: ${s.error}`
-          : s.status === 'interrupted' ? `임포트가 중단됐습니다 (${s.done ?? 0}장 연결) — ${s.error || '다시 실행하세요'}`
-            : s.status === 'idle' ? '임포트 진행 상황을 잃었습니다 (서버 재시작?) — 다시 실행하세요'
-              : `임포트 완료: ${s.done}장 연결됨`
-        onMsg(text, s.status !== 'completed')
-      }
-    }, 1000)
-    return () => clearInterval(t)
-  }, [job?.status]) // eslint-disable-line
+  // 5만 장 중 400장만 연결된 걸 "임포트 완료: 400장"으로 알리면 안 된다 —
+  // 종료 메시지 규칙은 jobEndMessage가 공통 담당
+  const [job, setJob] = useJob(project.id, () => api.importStatus(project.id), (s) => {
+    onDone()
+    const text = s.status === 'completed'
+      ? `임포트 완료: ${s.done}장 연결됨` : jobEndMessage(s, '임포트', '임포트 완료')
+    onMsg(text, s.status !== 'completed')
+  }, 1000)
 
   return (
     <details className="card" open={open} onToggle={(e) => setOpen(e.target.open)}>

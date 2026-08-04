@@ -595,7 +595,8 @@ test('중단된 임포트를 완료라고 말하지 않는다', async ({ page })
   await page.getByPlaceholder('이미지 폴더 경로 (필수)').fill('/tmp/somewhere')
   await page.getByRole('button', { name: '연결 임포트' }).click()
 
-  await expect(page.getByText(/임포트가 중단됐습니다 \(400장 연결\)/)).toBeVisible()
+  // 공통 종료 메시지 규칙(jobEndMessage) — 처리량을 밝히고 완료라 말하지 않는다
+  await expect(page.getByText(/임포트 중단됨 \(400\//)).toBeVisible()
   await expect(page.getByText(/임포트 완료/)).toHaveCount(0)
 })
 
