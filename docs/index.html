@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>autolabel — 로컬 오토라벨링 도구</title>
+<meta name="description" content="프롬프트 한 줄에서 전용 모델까지. 클라우드 없이 Mac 한 대로 완결되는 오토라벨링 도구.">
+<meta property="og:title" content="autolabel">
+<meta property="og:description" content="프롬프트 한 줄에서 전용 모델까지 — 로컬에서 돌아가는 오토라벨링 도구">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>◳</text></svg>">
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-alt: #f5f5f7;
+    --text: #1d1d1f;
+    --text-dim: #6e6e73;
+    --line: rgba(0, 0, 0, 0.09);
+    --accent: #0071e3;
+    --ok: #1d8f4e;
+    --card: #ffffff;
+    --shadow: 0 4px 24px rgba(0, 0, 0, 0.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000;
+      --bg-alt: #0a0a0c;
+      --text: #f5f5f7;
+      --text-dim: #98989d;
+      --line: rgba(255, 255, 255, 0.12);
+      --accent: #2997ff;
+      --ok: #4ade80;
+      --card: #131316;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Pretendard",
+                 "Apple SD Gothic Neo", "Helvetica Neue", sans-serif;
+    font-size: 17px;
+    line-height: 1.6;
+    letter-spacing: -0.01em;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, kbd {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 0.88em;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 22px; }
+  .narrow { max-width: 720px; }
+
+  /* 상단 바 */
+  nav {
+    position: sticky; top: 0; z-index: 10;
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    border-bottom: 1px solid var(--line);
+  }
+  nav .wrap { display: flex; align-items: center; gap: 26px; height: 48px; }
+  nav .brand { font-weight: 600; letter-spacing: -0.02em; color: var(--text); }
+  nav .links { display: flex; gap: 22px; margin-left: auto; font-size: 14px; }
+  nav .links a { color: var(--text-dim); }
+  nav .links a:hover { color: var(--text); text-decoration: none; }
+
+  /* 히어로 */
+  header { text-align: center; padding: 96px 0 72px; }
+  h1 {
+    font-size: clamp(44px, 8vw, 88px);
+    line-height: 1.04;
+    letter-spacing: -0.035em;
+    font-weight: 700;
+  }
+  .tagline {
+    margin: 22px auto 0; max-width: 640px;
+    font-size: clamp(19px, 2.6vw, 26px);
+    line-height: 1.35; letter-spacing: -0.02em; color: var(--text-dim);
+  }
+  .sub { margin: 18px auto 0; max-width: 560px; color: var(--text-dim); font-size: 16px; }
+  .cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 34px; }
+  .btn {
+    display: inline-block; padding: 12px 24px; border-radius: 980px;
+    font-size: 16px; font-weight: 500; transition: opacity .2s, background .2s;
+  }
+  .btn.primary { background: var(--accent); color: #fff; }
+  .btn.primary:hover { opacity: .86; text-decoration: none; }
+  .btn.ghost { border: 1px solid var(--line); color: var(--text); }
+  .btn.ghost:hover { background: var(--bg-alt); text-decoration: none; }
+
+  /* 흐름 다이어그램 */
+  .flow {
+    margin: 8px auto 0; max-width: 760px;
+    background: var(--bg-alt); border: 1px solid var(--line);
+    border-radius: 18px; padding: 28px 22px;
+  }
+  .flow ol { list-style: none; display: grid; gap: 10px; }
+  .flow li { display: flex; align-items: baseline; gap: 14px; text-align: left; }
+  .flow .n {
+    flex: 0 0 26px; height: 26px; border-radius: 50%;
+    background: var(--card); border: 1px solid var(--line);
+    font-size: 13px; font-weight: 600; color: var(--text-dim);
+    display: grid; place-items: center;
+  }
+  .flow .t { font-size: 16px; }
+  .flow .t b { font-weight: 600; }
+  .flow .t span { color: var(--text-dim); }
+  .flow .loop {
+    margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line);
+    font-size: 14px; color: var(--text-dim); text-align: center;
+  }
+
+  /* 섹션 */
+  section { padding: 84px 0; border-top: 1px solid var(--line); }
+  section.plain { border-top: none; }
+  h2 {
+    font-size: clamp(28px, 4vw, 40px); line-height: 1.15;
+    letter-spacing: -0.028em; font-weight: 700; text-align: center;
+  }
+  .lede {
+    margin: 16px auto 0; max-width: 620px; text-align: center;
+    color: var(--text-dim); font-size: 17px;
+  }
+
+  /* 카드 그리드 */
+  .grid { display: grid; gap: 18px; margin-top: 44px; }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  .g2 { grid-template-columns: repeat(2, 1fr); }
+  @media (max-width: 760px) { .g3, .g2 { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 18px; padding: 26px; box-shadow: var(--shadow);
+  }
+  .card h3 {
+    font-size: 19px; letter-spacing: -0.02em; font-weight: 600; margin-bottom: 8px;
+  }
+  .card p { color: var(--text-dim); font-size: 15.5px; }
+  .card .metric {
+    display: block; font-size: 34px; font-weight: 700; letter-spacing: -0.03em;
+    margin-bottom: 4px;
+  }
+  .card .metric small { font-size: 15px; font-weight: 500; color: var(--text-dim); }
+  .up { color: var(--ok); }
+
+  /* 성능 표 */
+  .tablewrap { margin-top: 40px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 15.5px; min-width: 560px; }
+  th, td { padding: 14px 16px; text-align: left; border-bottom: 1px solid var(--line); }
+  th { font-weight: 600; font-size: 13px; text-transform: uppercase;
+       letter-spacing: 0.04em; color: var(--text-dim); }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+  .note { margin-top: 14px; font-size: 13.5px; color: var(--text-dim); text-align: center; }
+
+  /* 코드 블록 */
+  pre {
+    margin-top: 32px; background: var(--bg-alt); border: 1px solid var(--line);
+    border-radius: 16px; padding: 22px 24px; overflow-x: auto;
+    font-size: 14.5px; line-height: 1.75;
+  }
+  pre .c { color: var(--text-dim); }
+
+  /* 리스트 */
+  ul.plain { list-style: none; margin-top: 28px; display: grid; gap: 12px; }
+  ul.plain li { padding-left: 26px; position: relative; color: var(--text-dim); }
+  ul.plain li::before {
+    content: "→"; position: absolute; left: 0; color: var(--accent);
+  }
+  ul.plain li b { color: var(--text); font-weight: 600; }
+
+  footer {
+    border-top: 1px solid var(--line); padding: 44px 0 60px;
+    font-size: 13.5px; color: var(--text-dim); text-align: center;
+  }
+  footer a { color: var(--text-dim); }
+
+  /* ---------- 모션 ----------
+     원칙: 위치 이동은 8~20px만, 커브는 감속(cubic-bezier(.16,1,.3,1)),
+     스크롤 리빌은 한 번만. prefers-reduced-motion이면 전부 무효화. */
+
+  /* 히어로 등장 — 스크롤 관찰 없이 로드 즉시 순차 */
+  .rise { opacity: 0; transform: translateY(14px); animation: rise .9s cubic-bezier(.16,1,.3,1) forwards; }
+  .d1 { animation-delay: .05s } .d2 { animation-delay: .16s }
+  .d3 { animation-delay: .27s } .d4 { animation-delay: .38s }
+  @keyframes rise { to { opacity: 1; transform: none } }
+
+  /* 스크롤 리빌 — IntersectionObserver가 .in을 붙인다.
+     숨기는 규칙은 .js(스크립트가 살아있음) 아래에만 둔다 — JS가 죽거나
+     옵서버가 안 돌면 내용이 영구히 안 보이는 쪽이 애니메이션보다 큰 사고다 */
+  .js .reveal {
+    opacity: 0; transform: translateY(18px);
+    transition: opacity .7s cubic-bezier(.16,1,.3,1), transform .7s cubic-bezier(.16,1,.3,1);
+  }
+  .js .reveal.in { opacity: 1; transform: none; }
+  /* 그리드·리스트는 자식이 차례로 */
+  .stagger > * { transition-delay: calc(var(--i, 0) * 90ms); }
+
+  /* 카드 호버 — 애플식 미세 부양 */
+  .card {
+    transition: transform .4s cubic-bezier(.16,1,.3,1), box-shadow .4s, border-color .4s;
+    will-change: transform;
+  }
+  .card:hover { transform: translateY(-4px); border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+  @media (prefers-color-scheme: light) {
+    .card:hover { box-shadow: 0 12px 36px rgba(0, 0, 0, 0.1); }
+  }
+
+  /* 버튼 — 누를 때 살짝 눌림 */
+  .btn { transform: translateZ(0); transition: opacity .2s, background .2s, transform .18s cubic-bezier(.16,1,.3,1); }
+  .btn:active { transform: scale(.97); }
+
+  /* 흐름 단계 — 진입 시 순번 원이 채워지고, 호버 시 강조 */
+  .flow li { transition: opacity .5s ease; }
+  .flow .n { transition: background .45s cubic-bezier(.16,1,.3,1), color .45s, border-color .45s, transform .45s; }
+  .flow.in li:nth-child(1) .n { transition-delay: .10s } .flow.in li:nth-child(2) .n { transition-delay: .19s }
+  .flow.in li:nth-child(3) .n { transition-delay: .28s } .flow.in li:nth-child(4) .n { transition-delay: .37s }
+  .flow.in li:nth-child(5) .n { transition-delay: .46s } .flow.in li:nth-child(6) .n { transition-delay: .55s }
+  .flow.in li:nth-child(7) .n { transition-delay: .64s }
+  .flow.in .n { background: var(--accent); color: #fff; border-color: transparent; }
+  .flow li:hover .n { transform: scale(1.14); }
+  /* 4·6번(이 도구의 차별점)은 잔물결 한 번 */
+  .flow.in li[data-key] .n { animation: pulse 1.6s cubic-bezier(.16,1,.3,1) .9s; }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent) }
+    70%  { box-shadow: 0 0 0 12px color-mix(in srgb, var(--accent) 0%, transparent) }
+    100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent) }
+  }
+  /* 되돌아가는 고리 — 화살표가 순환한다는 느낌만 */
+  .flow .loop b { position: relative; }
+  .flow.in .loop b::after {
+    content: ""; position: absolute; left: 0; bottom: -3px; height: 1.5px; width: 100%;
+    background: var(--accent); transform-origin: left;
+    animation: sweep 1.1s cubic-bezier(.16,1,.3,1) .8s both;
+  }
+  @keyframes sweep { from { transform: scaleX(0) } to { transform: scaleX(1) } }
+
+  /* 지표 숫자 — 카운트업 중에는 폭이 흔들리지 않게 */
+  .metric { font-variant-numeric: tabular-nums; }
+
+  /* 표 행 — 진입 시 차례로 (같은 이유로 .js 아래에서만 숨긴다) */
+  .js tbody tr { opacity: 0; transform: translateY(8px);
+                 transition: opacity .55s cubic-bezier(.16,1,.3,1), transform .55s cubic-bezier(.16,1,.3,1); }
+  .js tbody.in tr { opacity: 1; transform: none; }
+  tbody.in tr:nth-child(1) { transition-delay: .04s } tbody.in tr:nth-child(2) { transition-delay: .10s }
+  tbody.in tr:nth-child(3) { transition-delay: .16s } tbody.in tr:nth-child(4) { transition-delay: .22s }
+  tbody.in tr:nth-child(5) { transition-delay: .28s } tbody.in tr:nth-child(6) { transition-delay: .34s }
+  tbody.in tr:nth-child(7) { transition-delay: .40s }
+  tbody tr { transition-property: opacity, transform, background; }
+  tbody tr:hover { background: var(--bg-alt); }
+
+  /* 코드 블록 — 커서 깜빡임으로 "터미널" 느낌 한 스푼 */
+  pre .cursor {
+    display: inline-block; width: 8px; height: 1em; vertical-align: -0.15em;
+    background: var(--accent); animation: blink 1.15s step-end infinite;
+  }
+  @keyframes blink { 0%, 100% { opacity: 1 } 50% { opacity: 0 } }
+
+  /* 상단 스크롤 진행 바 */
+  #progress {
+    position: fixed; top: 0; left: 0; height: 2px; width: 100%; z-index: 20;
+    background: var(--accent); transform: scaleX(0); transform-origin: left;
+    transition: transform .1s linear;
+  }
+
+  /* 접근성 — 모션 최소화 요청이면 전부 정적으로 */
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .rise, .js .reveal, .js tbody tr { opacity: 1 !important; transform: none !important; animation: none !important; }
+    .js .reveal, .js tbody tr, .flow .n, .card, .btn { transition: none !important; }
+    .flow.in .n { background: var(--accent); color: #fff; border-color: transparent; }
+    .flow.in li[data-key] .n, .flow.in .loop b::after, pre .cursor { animation: none !important; }
+    .flow.in .loop b::after { transform: none; }
+    #progress { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<script>
+  // 스타일시트가 .js 아래에서만 리빌 요소를 숨기므로, 스크립트가 살아 있다는
+  // 표시를 렌더 전에 남긴다 (JS 비활성·오류 시 내용은 그냥 보인다)
+  document.documentElement.classList.add('js')
+</script>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top">autolabel</a>
+    <div class="links">
+      <a href="#how">작동 방식</a>
+      <a href="#perf">성능</a>
+      <a href="#start">시작하기</a>
+      <a href="https://github.com/Seung-Won-Yu/autolabel">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<div id="progress"></div>
+
+<header id="top">
+  <div class="wrap">
+    <h1 class="rise d1">라벨링,<br>대부분은 기계가.</h1>
+    <p class="tagline rise d2">프롬프트 한 줄에서 전용 모델까지 — 로컬에서 완결되는 오토라벨링 도구</p>
+    <p class="sub rise d3">클라우드 없음 · 필수 API 키 없음 · 데이터 유출 없음. Mac 한 대로 전 과정을 돌린다.</p>
+    <div class="cta rise d4">
+      <a class="btn primary" href="https://github.com/Seung-Won-Yu/autolabel">GitHub에서 보기</a>
+      <a class="btn ghost" href="#start">설치 명령 보기</a>
+    </div>
+  </div>
+</header>
+
+<section class="plain" id="how">
+  <div class="wrap">
+    <h2 class="reveal">사람은 리뷰만 한다</h2>
+    <p class="lede reveal">기존 도구는 사람이 그리는 화면에 오토라벨을 곁들인다.
+      이 도구는 순서를 뒤집어, 모델이 먼저 깔고 사람이 예외만 확인하는 흐름을 기본으로 만들었다.</p>
+
+    <div class="flow reveal">
+      <ol>
+        <li><span class="n">1</span><span class="t"><b>투입</b> — <span>이미지 업로드 · 폴더 연결(복사 없음) · 비디오 임포트</span></span></li>
+        <li><span class="n">2</span><span class="t"><b>클래스 정의</b> — <span>찾을 것을 이름과 프롬프트로 적는다</span></span></li>
+        <li><span class="n">3</span><span class="t"><b>자동 초안</b> — <span>전용 모델 → SAM 3 → Grounding DINO 순으로 알아서 라우팅</span></span></li>
+        <li data-key><span class="n">4</span><span class="t"><b>문맥 심판</b> — <span>판정 기준을 글로 쓰면 박스마다 ✓ / ✗ / ? + 근거</span></span></li>
+        <li><span class="n">5</span><span class="t"><b>리뷰</b> — <span>위반·불확실·저신뢰만 확인. 고신뢰는 자동 승인</span></span></li>
+        <li data-key><span class="n">6</span><span class="t"><b>자동 학습</b> — <span>승인이 쌓이면 전용 모델 학습, 게이트를 이기면 3번 엔진 교체</span></span></li>
+        <li><span class="n">7</span><span class="t"><b>익스포트</b> — <span>COCO / YOLO zip · 학습된 <code>.pt</code> · Colab 노트북</span></span></li>
+      </ol>
+      <p class="loop">6 → 3으로 돌아가는 고리 = <b>라벨링할수록 라벨링이 쉬워진다</b></p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2 class="reveal">세 가지가 다르다</h2>
+    <div class="grid g3 stagger">
+      <div class="card reveal" style="--i:0">
+        <h3>제로샷이 첫날부터</h3>
+        <p>SAM 3가 텍스트 한 구절로 모든 인스턴스를 찾는다. 문서 서명 도메인에서
+          기존 경로 mAP50 0.000 → <b>0.995</b> — 시드 라벨링 비용이 사실상 사라진다.</p>
+      </div>
+      <div class="card reveal" style="--i:1">
+        <h3>기준으로 판정한다</h3>
+        <p>“사고에 연루된 차량만” 같은 문맥 판정은 검출 모델이 못 푼다.
+          기준문을 읽는 VLM이 박스마다 근거를 달아 예비 판정하고, 사람은 예외만 본다.</p>
+      </div>
+      <div class="card reveal" style="--i:2">
+        <h3>쓸수록 좋아진다</h3>
+        <p>승인 라벨로 전용 모델을 자동 학습하고, 홀드아웃에서 기존 모델을
+          이길 때만 교체한다. 지면 조용히 폐기 — 재학습이 품질을 떨어뜨리지 않는다.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="perf">
+  <div class="wrap">
+    <h2 class="reveal">실측</h2>
+    <p class="lede reveal">전부 고정 홀드아웃 기준 자체 측정치다. M4 Pro · MPS.</p>
+
+    <div class="grid g3 stagger" style="margin-top:40px">
+      <div class="card reveal" style="--i:0">
+        <span class="metric up" data-count="0.995" data-decimals="3">0.000</span>
+        <p><b>문서 서명 제로샷 mAP50</b><br>SAM 3. 같은 데이터 기존 경로는 0.000</p>
+      </div>
+      <div class="card reveal" style="--i:1">
+        <span class="metric"><span data-count="0.8" data-decimals="1">0.0</span><small>초</small></span>
+        <p><b>장당 오토라벨</b><br>박스만. 마스크 포함 1.8초</p>
+      </div>
+      <div class="card reveal" style="--i:2">
+        <span class="metric"><span data-count="9" data-decimals="0">0</span><small>/9</small></span>
+        <p><b>정검출 · 오검출 0</b><br>개 9장 + 함정 6장. 개 닮은 인형에 안 속음</p>
+      </div>
+    </div>
+
+    <div class="tablewrap reveal">
+      <table>
+        <thead>
+          <tr><th>항목</th><th>수치</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>흔한 객체 제로샷 (person, 128장)</td><td>이미지 단위 61 / 62</td></tr>
+          <tr><td>멀티클래스 제로샷 (cup·bowl·table)</td><td>mAP50 0.690</td></tr>
+          <tr><td>콜드스타트 구출 (PCB 결함) — 제로샷 → 승인 42장 → 300장</td><td>≈0 → 0.593 → 0.963</td></tr>
+          <tr><td>문서 서명 — 시드 100장 자동 학습 후 홀드아웃 43장</td><td>mAP50 0.969</td></tr>
+          <tr><td>비디오 트래킹 — 팬 영상 10프레임</td><td>박스 19개 · 9프레임 연속 추적</td></tr>
+          <tr><td>익스포트 → 재임포트 왕복 (128장)</td><td>460 → 460 박스 (무손실)</td></tr>
+          <tr><td>회귀 테스트 (백엔드 / 브라우저)</td><td>49 / 26 전부 통과</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note reveal">핵심 결론: 흔한 객체는 첫날부터 자동, 특수 도메인은 수동 수십 장 투자 후 자동.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap narrow" id="start">
+    <h2 class="reveal">시작하기</h2>
+    <p class="lede reveal">Apple Silicon Mac + Python 3.11 + Node 20 기준. 세 줄이면 끝난다.</p>
+<pre class="reveal"><span class="c"># 1. 최초 1회 — venv · 의존성 · SAM 가중치 · 브라우저 디코더</span>
+./setup.sh
+
+<span class="c"># 2. 실행 — 백엔드 + 프론트 동시, 브라우저 자동 오픈</span>
+./start.sh
+
+<span class="c"># 3. 코드를 고쳤으면 (백엔드 49개 · 브라우저 26개)</span>
+./test.sh &amp;&amp; ./test-e2e.sh<span class="cursor"></span></pre>
+
+    <ul class="plain stagger reveal">
+      <li><b>SAM 3는 선택</b> — <a href="https://huggingface.co/facebook/sam3">facebook/sam3</a> 접근 승인 후
+        <code>models/sam3.pt</code>로 두면 제로샷이 자동 승급된다. 없으면 Grounding DINO + SAM 경로로 동작.</li>
+      <li><b>문맥 심판도 선택</b> — Claude Code CLI가 있으면 구독으로 무료 사용,
+        <code>ANTHROPIC_API_KEY</code>가 있으면 API, 로컬 Ollama도 가능. 없으면 그 기능만 비활성.</li>
+      <li><b>1인 로컬 전제</b> — SQLite + 단일 프로세스. 팀·수십만 장 규모는 큐와 DB 교체가 필요하다.</li>
+      <li><b>라이선스 주의</b> — 전용 모델이 쓰는 YOLO 계열은 AGPL-3.0. 개인·내부 사용은 무방,
+        배포 시 교체 지점은 <code>server/train_worker.py</code>.</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>Segment Anything · Grounding DINO · PerSAM · Autodistill · Confident Learning ·
+      champion/challenger MLOps 패턴</p>
+    <p style="margin-top:10px">
+      <a href="https://github.com/Seung-Won-Yu/autolabel">github.com/Seung-Won-Yu/autolabel</a>
+    </p>
+  </div>
+</footer>
+
+<script>
+(() => {
+  'use strict'
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches
+
+  // 모션 최소화 요청이면 최종 상태로 즉시 고정한다 (CSS가 이미 정적으로
+  // 만들지만, 카운트업 숫자는 JS만 알고 있으므로 여기서 확정해야 한다)
+  if (reduced) {
+    document.querySelectorAll('[data-count]').forEach((el) => {
+      el.textContent = (+el.dataset.count).toFixed(+el.dataset.decimals)
+    })
+    document.querySelectorAll('.reveal').forEach((el) => el.classList.add('in'))
+    document.querySelectorAll('.flow, tbody').forEach((el) => el.classList.add('in'))
+    return
+  }
+
+  // 지표 카운트업 — 감속 커브로 목표값까지. 폭 흔들림은 tabular-nums가 막는다
+  const countUp = (el) => {
+    if (el.dataset.done) return            // 안전망과 옵서버가 겹쳐 불려도 한 번만
+    el.dataset.done = '1'
+    const target = +el.dataset.count
+    const dec = +el.dataset.decimals
+    const final = () => { el.textContent = target.toFixed(dec) }
+    // 숨은 탭·백그라운드에서는 rAF가 멈춘다 — 애니메이션 대신 값만 확정한다
+    // (안 하면 지표가 0.000에 영구 고정된다)
+    if (document.hidden) return final()
+    const dur = 1100
+    const t0 = performance.now()
+    const tick = (now) => {
+      const p = Math.min(1, (now - t0) / dur)
+      const eased = 1 - Math.pow(1 - p, 3)   // easeOutCubic
+      el.textContent = (target * eased).toFixed(dec)
+      if (p < 1) requestAnimationFrame(tick)
+      else final()
+    }
+    requestAnimationFrame(tick)
+    setTimeout(final, dur + 400)             // rAF가 도중에 멈춰도 값은 맞게 끝난다
+  }
+
+  // 스크롤 리빌 — 한 번 보이면 관찰 해제 (되돌아올 때 다시 흔들리지 않게)
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue
+      e.target.classList.add('in')
+      e.target.querySelectorAll?.('[data-count]').forEach(countUp)
+      if (e.target.matches('[data-count]')) countUp(e.target)
+      io.unobserve(e.target)
+    }
+  }, { rootMargin: '0px 0px -12% 0px', threshold: 0.15 })
+
+  const watched = [...document.querySelectorAll('.reveal, .flow, tbody')]
+  watched.forEach((el) => io.observe(el))
+
+  // 안전망 — 옵서버가 한 번도 안 불리는 환경(뷰포트 높이 0으로 렌더되는
+  // 스크린샷·임베드 등)에서 내용이 영구히 숨지 않게, 2.5초 뒤 남은 것은 그냥 보인다
+  setTimeout(() => {
+    for (const el of watched) {
+      if (el.classList.contains('in')) continue
+      el.classList.add('in')
+      el.querySelectorAll?.('[data-count]').forEach(countUp)
+      io.unobserve(el)
+    }
+  }, 2500)
+
+  // 상단 진행 바 — rAF로 합쳐 스크롤 핸들러가 프레임을 넘기지 않게
+  const bar = document.getElementById('progress')
+  let queued = false
+  const paint = () => {
+    queued = false
+    const max = document.documentElement.scrollHeight - innerHeight
+    bar.style.transform = `scaleX(${max > 0 ? scrollY / max : 0})`
+  }
+  addEventListener('scroll', () => {
+    if (queued) return
+    queued = true
+    requestAnimationFrame(paint)
+  }, { passive: true })
+  paint()
+})()
+</script>
+
+</body>
+</html>
