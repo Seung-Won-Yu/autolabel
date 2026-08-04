@@ -9,6 +9,8 @@
 
 클라우드 없음 · API 키 없음 · 데이터 유출 없음 — Apple Silicon 한 대로 전 과정 완결.
 
+**[→ 소개 페이지](https://seung-won-yu.github.io/autolabel/)**
+
 </div>
 
 ---
