@@ -272,17 +272,19 @@
 
   /* ═══ 타임라인 (스크롤 연동) ═══ */
   .tl { position: relative; margin: 54px auto 0; max-width: 820px; padding-left: 46px }
+  /* 선(::before/::after)은 컨테이너의 생성 콘텐츠라 자식보다 나중에 페인트된다 —
+     z-index를 주지 않으면 진행선이 단계 번호(.dot) 위를 덮는다 (실측: 번호 가려짐) */
   .tl::before {
     content: ""; position: absolute; left: 15px; top: 8px; bottom: 8px; width: 2px;
-    background: var(--line);
+    background: var(--line); z-index: 0;
   }
   .tl::after {
     content: ""; position: absolute; left: 15px; top: 8px; width: 2px; height: var(--fill, 0%);
     background: linear-gradient(180deg, var(--accent), var(--accent-2));
     box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 60%, transparent);
-    transition: height .18s linear;
+    transition: height .18s linear; z-index: 0;
   }
-  .step { position: relative; padding: 0 0 34px }
+  .step { position: relative; z-index: 1; padding: 0 0 34px }
   .step:last-child { padding-bottom: 0 }
   .step .dot {
     position: absolute; left: -46px; top: 2px; width: 32px; height: 32px; border-radius: 50%;
