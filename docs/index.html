@@ -300,6 +300,32 @@
   .step .kv { margin-top: 9px; font-size: 13.5px; color: var(--faint) }
   .step .kv b { color: var(--text); font-weight: 600 }
 
+  /* ═══ 비디오 프레임 스트립 ═══ */
+  .frames { margin: 56px auto 0; max-width: 940px }
+  .frames figcaption { text-align: center; margin-bottom: 20px }
+  .frames figcaption b { display: block; font-size: 21px; letter-spacing: -.024em; font-weight: 600 }
+  .frames figcaption span { display: block; margin-top: 8px; color: var(--dim); font-size: 15.5px }
+  .frames .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px }
+  @media (max-width: 780px) { .frames .strip { grid-template-columns: 1fr 1fr } }
+  .frame { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: #0b1020 }
+  .frame svg { display: block; width: 100%; height: auto }
+  .frame span {
+    display: block; padding: 7px 10px; font-size: 11.5px; color: var(--faint);
+    border-top: 1px solid var(--line-2); background: var(--card-2);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .frames .fnote { margin-top: 16px; text-align: center; font-size: 13.5px; color: var(--faint) }
+
+  /* ═══ 기능 밴드 ═══ */
+  .caps { display: flex; flex-wrap: wrap; gap: 9px; justify-content: center; margin-top: 40px }
+  .cap-chip {
+    font-size: 14px; color: var(--dim); padding: 8px 15px; border-radius: 980px;
+    border: 1px solid var(--line); background: var(--card);
+    transition: border-color .3s, color .3s, transform .3s cubic-bezier(.16,1,.3,1);
+  }
+  .cap-chip:hover { color: var(--text); transform: translateY(-2px);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--line)) }
+
   /* ═══ 카드 ═══ */
   .grid { display: grid; gap: 18px; margin-top: 48px }
   .g3 { grid-template-columns: repeat(3, 1fr) }
@@ -448,7 +474,7 @@
   }
   @keyframes mkscan {
     0% { opacity: 0; transform: translateX(0) } 3% { opacity: .85 }
-    16% { opacity: .85; transform: translateX(560px) } 22%,100% { opacity: 0; transform: translateX(560px) }
+    16% { opacity: .85; transform: translateX(596px) } 22%,100% { opacity: 0; transform: translateX(596px) }
   }
   .arow.live .vchip { animation: chipin 8s cubic-bezier(.16,1,.3,1) infinite; transform-origin: center }
   .arow.live:nth-child(3) .vchip { animation-delay: .25s }
@@ -538,6 +564,92 @@
 <a class="skip-link" href="#content">본문으로 건너뛰기</a>
 <div id="progress"></div>
 
+<!-- 공용 스프라이트 — 목업과 비교 슬라이더가 같은 장면을 쓴다.
+     사진이 아니라 그린 장면이지만, 무엇이 찍혔는지 한눈에 읽혀야
+     "박스가 뭘 감쌌는지"가 전달된다 (회색 얼룩은 아무것도 말해주지 않는다). -->
+<svg class="sprites" width="0" height="0" aria-hidden="true" focusable="false">
+  <defs>
+    <linearGradient id="skyG2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b1330"/>
+      <stop offset=".52" stop-color="#2b3c67"/>
+      <stop offset=".86" stop-color="#9c5f4c"/>
+      <stop offset="1" stop-color="#d98b4a"/>
+    </linearGradient>
+    <radialGradient id="sunG2">
+      <stop offset="0" stop-color="#fff0cf"/>
+      <stop offset=".38" stop-color="#ffce8a"/>
+      <stop offset="1" stop-color="#ffb26b" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="groundG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b4a24"/>
+      <stop offset="1" stop-color="#141c0e"/>
+    </linearGradient>
+    <linearGradient id="woodG" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8a6039"/>
+      <stop offset=".55" stop-color="#6b4527"/>
+      <stop offset="1" stop-color="#513320"/>
+    </linearGradient>
+
+    <!-- 서 있는 개 (측면, 왼쪽을 봄) — 로컬 120×118 -->
+    <g id="dogStand" fill="#160f0a">
+      <ellipse cx="66" cy="60" rx="34" ry="20"/>
+      <path d="M36 56q-9-15 2-26 10-10 21-5l6 19z"/>
+      <circle cx="32" cy="33" r="15"/>
+      <path d="M19 34q-13 2-15 9 0 7 9 6l12-4z"/>
+      <path d="M37 20q4-14 13-12 4 7-2 17z"/>
+      <path d="M27 19q-3-13-11-12-4 7 2 16z"/>
+      <rect x="40" y="72" width="10" height="40" rx="5"/>
+      <rect x="55" y="74" width="10" height="38" rx="5"/>
+      <rect x="78" y="72" width="10" height="40" rx="5"/>
+      <rect x="91" y="74" width="10" height="38" rx="5"/>
+      <path d="M99 50q19-6 21-23-3-5-9-2-4 13-17 17z"/>
+    </g>
+
+    <!-- 앉아 있는 개 — 로컬 110×112 -->
+    <g id="dogSit" fill="#1d140d">
+      <path d="M31 110q-7-42 15-59 17-13 32-2 13 11 10 28l5 33z"/>
+      <circle cx="55" cy="33" r="16"/>
+      <path d="M41 35q-13 2-14 10 1 7 10 5l12-5z"/>
+      <path d="M60 19q4-14 13-12 4 7-1 17z"/>
+      <path d="M50 18q-3-13-12-12-3 7 3 16z"/>
+      <rect x="36" y="86" width="11" height="26" rx="5"/>
+      <rect x="70" y="88" width="11" height="24" rx="5"/>
+    </g>
+
+    <!-- 세로 나무 판자 울타리 — 심판이 "개 아님"으로 잡아내는 그 구조물 -->
+    <g id="fence">
+      <rect x="2" y="24" width="146" height="13" rx="3" fill="#4a2f1c"/>
+      <rect x="2" y="88" width="146" height="13" rx="3" fill="#4a2f1c"/>
+      <g fill="url(#woodG)">
+        <rect x="6" y="0" width="26" height="138" rx="3"/>
+        <rect x="44" y="5" width="26" height="133" rx="3"/>
+        <rect x="82" y="0" width="26" height="138" rx="3"/>
+        <rect x="120" y="6" width="26" height="132" rx="3"/>
+      </g>
+    </g>
+
+    <!-- 장면 전체 (900×420) -->
+    <g id="photo">
+      <rect width="900" height="420" fill="url(#skyG2)"/>
+      <circle cx="205" cy="98" r="86" fill="url(#sunG2)" opacity=".85"/>
+      <circle cx="205" cy="98" r="27" fill="#ffe9c4"/>
+      <path d="M0 268q150-52 290-14 130 35 250 6 150-36 360 12v40H0z" fill="#1a2440" opacity=".9"/>
+      <path d="M0 288q190-34 330 2 120 30 250 4 130-26 320 10v34H0z" fill="#141d2f" opacity=".95"/>
+      <rect y="296" width="900" height="124" fill="url(#groundG)"/>
+      <g stroke="#4d5f2a" stroke-width="2" stroke-linecap="round" opacity=".5">
+        <path d="M40 330v-13M74 342v-15M120 326v-11M300 348v-16M352 332v-12M410 352v-14
+                 M560 336v-12M620 356v-16M690 330v-11M760 348v-15M820 332v-12M866 352v-14"/>
+      </g>
+      <ellipse cx="252" cy="318" rx="76" ry="11" fill="#0b1006" opacity=".55"/>
+      <ellipse cx="478" cy="320" rx="56" ry="9" fill="#0b1006" opacity=".5"/>
+      <ellipse cx="655" cy="326" rx="86" ry="10" fill="#0b1006" opacity=".45"/>
+      <use href="#dogStand" x="188" y="196"/>
+      <use href="#dogSit" x="430" y="210"/>
+      <use href="#fence" x="580" y="186"/>
+    </g>
+  </defs>
+</svg>
+
 <nav aria-label="주요 탐색">
   <div class="wrap">
     <a class="brand" href="#top">
@@ -610,53 +722,47 @@
 
         <!-- 중: 캔버스 -->
         <div class="canvas">
-          <svg viewBox="0 0 600 372" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-            <rect width="600" height="372" fill="var(--scene)"/>
-            <!-- 추상 장면 (실제 사진이 아니라 도식) -->
-            <g opacity=".9">
-              <ellipse cx="150" cy="300" rx="118" ry="22" fill="var(--scene-2)"/>
-              <path d="M96 284 q14 -84 54 -84 q40 0 54 84 z" fill="var(--scene-2)"/>
-              <circle cx="150" cy="172" r="32" fill="var(--scene-2)"/>
-              <rect x="300" y="188" width="80" height="96" rx="12" fill="var(--scene-2)"/>
-              <rect x="430" y="146" width="120" height="138" rx="14" fill="var(--scene-2)"/>
-              <rect x="34" y="36" width="86" height="9" rx="4" fill="var(--scene-2)"/>
-              <rect x="34" y="54" width="52" height="9" rx="4" fill="var(--scene-2)"/>
-            </g>
+          <!-- 장면 좌표계(900×420)를 캔버스 비율만큼 잘라 쓴다 — 비교 슬라이더와
+               같은 장면·같은 박스 좌표라 두 화면이 정확히 대응한다 -->
+          <svg viewBox="158 44 596 364" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+            <use href="#photo"/>
             <!-- 스캔 라인 -->
-            <rect class="mk-scan" x="0" y="0" width="3" height="372" fill="var(--accent)"/>
+            <rect class="mk-scan" x="158" y="44" width="3" height="364" fill="#7fd4ff" opacity=".9"/>
             <!-- 자동 박스 -->
-            <g fill="none" stroke-width="2.5">
-              <rect class="mk-box" x="98" y="132" width="106" height="152" rx="6" stroke="var(--accent)"/>
-              <rect class="mk-box b2" x="292" y="180" width="96" height="112" rx="6" stroke="var(--accent)"/>
-              <rect class="mk-box b3" x="424" y="138" width="132" height="152" rx="6" stroke="var(--bad)"/>
+            <g fill="none" stroke-width="3">
+              <rect class="mk-box" x="182" y="190" width="140" height="134" rx="6" stroke="#2997ff"/>
+              <rect class="mk-box b2" x="424" y="204" width="110" height="120" rx="6" stroke="#2997ff"/>
+              <rect class="mk-box b3" x="574" y="180" width="162" height="150" rx="6" stroke="#ff453a"/>
             </g>
             <!-- 라벨 -->
-            <g class="mono" font-size="11" font-weight="700">
+            <g class="mono" font-size="13" font-weight="700">
               <g class="mk-lab">
-                <rect x="98" y="114" width="76" height="17" rx="4" fill="var(--accent)"/>
-                <text x="104" y="126.5" fill="#fff">dog 0.97</text>
+                <rect x="182" y="167" width="86" height="20" rx="5" fill="#2997ff"/>
+                <text x="189" y="181.5" fill="#fff">dog 0.97</text>
               </g>
               <g class="mk-lab l2">
-                <rect x="292" y="162" width="76" height="17" rx="4" fill="var(--accent)"/>
-                <text x="298" y="174.5" fill="#fff">dog 0.81</text>
+                <rect x="424" y="181" width="86" height="20" rx="5" fill="#2997ff"/>
+                <text x="431" y="195.5" fill="#fff">dog 0.81</text>
               </g>
               <g class="mk-lab l3">
-                <rect x="424" y="120" width="76" height="17" rx="4" fill="var(--bad)"/>
-                <text x="430" y="132.5" fill="#fff">dog 0.40</text>
+                <rect x="574" y="157" width="86" height="20" rx="5" fill="#ff453a"/>
+                <text x="581" y="171.5" fill="#fff">dog 0.40</text>
               </g>
             </g>
             <!-- 심판 칩 -->
             <g class="mk-chip">
-              <circle cx="196" cy="140" r="11" fill="var(--ok)"/>
-              <path d="M191 140 l4 4 l7 -8" stroke="#fff" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+              <circle cx="322" cy="190" r="13" fill="#32d74b"/>
+              <path d="M316 190l4.5 4.5 8-9" stroke="#0b1a0e" stroke-width="2.6" fill="none"
+                    stroke-linecap="round" stroke-linejoin="round"/>
             </g>
             <g class="mk-chip c2">
-              <circle cx="380" cy="188" r="11" fill="var(--ok)"/>
-              <path d="M375 188 l4 4 l7 -8" stroke="#fff" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+              <circle cx="534" cy="204" r="13" fill="#32d74b"/>
+              <path d="M528 204l4.5 4.5 8-9" stroke="#0b1a0e" stroke-width="2.6" fill="none"
+                    stroke-linecap="round" stroke-linejoin="round"/>
             </g>
             <g class="mk-chip c3">
-              <circle cx="548" cy="146" r="11" fill="var(--bad)"/>
-              <path d="M544 142 l8 8 M552 142 l-8 8" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/>
+              <circle cx="736" cy="180" r="13" fill="#ff453a"/>
+              <path d="M731 175l10 10M741 175l-10 10" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/>
             </g>
           </svg>
         </div>
@@ -691,51 +797,38 @@
     <div class="compare reveal" id="cmp" style="--p:50%">
       <span class="tag l">원본</span><span class="tag r">자동 라벨 + 심판</span>
       <!-- 전: 원본 -->
-      <svg viewBox="0 0 900 420" aria-hidden="true">
-        <rect width="900" height="420" fill="var(--scene)"/>
-        <g opacity=".92">
-          <ellipse cx="230" cy="336" rx="150" ry="26" fill="var(--scene-2)"/>
-          <path d="M162 312 q18 -100 68 -100 q50 0 68 100 z" fill="var(--scene-2)"/>
-          <circle cx="230" cy="188" r="40" fill="var(--scene-2)"/>
-          <rect x="452" y="212" width="104" height="112" rx="14" fill="var(--scene-2)"/>
-          <rect x="622" y="166" width="158" height="158" rx="16" fill="var(--scene-2)"/>
-          <rect x="56" y="52" width="120" height="12" rx="6" fill="var(--scene-2)"/>
-          <rect x="56" y="76" width="72" height="12" rx="6" fill="var(--scene-2)"/>
-        </g>
-      </svg>
-      <!-- 후: 라벨 + 판정 -->
+      <svg viewBox="0 0 900 420" aria-hidden="true"><use href="#photo"/></svg>
+      <!-- 후: 같은 장면 + 자동 라벨 + 판정 (목업과 동일 좌표) -->
       <div class="after" aria-hidden="true">
         <svg viewBox="0 0 900 420">
-          <rect width="900" height="420" fill="var(--scene)"/>
-          <g opacity=".92">
-            <ellipse cx="230" cy="336" rx="150" ry="26" fill="var(--scene-2)"/>
-            <path d="M162 312 q18 -100 68 -100 q50 0 68 100 z" fill="var(--scene-2)"/>
-            <circle cx="230" cy="188" r="40" fill="var(--scene-2)"/>
-            <rect x="452" y="212" width="104" height="112" rx="14" fill="var(--scene-2)"/>
-            <rect x="622" y="166" width="158" height="158" rx="16" fill="var(--scene-2)"/>
-            <rect x="56" y="52" width="120" height="12" rx="6" fill="var(--scene-2)"/>
-            <rect x="56" y="76" width="72" height="12" rx="6" fill="var(--scene-2)"/>
-          </g>
+          <use href="#photo"/>
           <g fill="none" stroke-width="3">
-            <rect x="160" y="146" width="142" height="168" rx="7" stroke="var(--accent)"/>
-            <rect x="444" y="204" width="120" height="128" rx="7" stroke="var(--accent)"/>
-            <rect x="614" y="158" width="174" height="174" rx="7" stroke="var(--bad)"/>
+            <rect x="182" y="190" width="140" height="134" rx="6" stroke="#2997ff"/>
+            <rect x="424" y="204" width="110" height="120" rx="6" stroke="#2997ff"/>
+            <rect x="574" y="180" width="162" height="150" rx="6" stroke="#ff453a"/>
           </g>
           <g class="mono" font-size="14" font-weight="700">
-            <rect x="160" y="122" width="94" height="21" rx="5" fill="var(--accent)"/>
-            <text x="167" y="137.5" fill="#fff">dog 0.97</text>
-            <rect x="444" y="180" width="94" height="21" rx="5" fill="var(--accent)"/>
-            <text x="451" y="195.5" fill="#fff">dog 0.81</text>
-            <rect x="614" y="134" width="94" height="21" rx="5" fill="var(--bad)"/>
-            <text x="621" y="149.5" fill="#fff">dog 0.40</text>
+            <rect x="182" y="165" width="92" height="21" rx="5" fill="#2997ff"/>
+            <text x="189" y="180.5" fill="#fff">dog 0.97</text>
+            <rect x="424" y="179" width="92" height="21" rx="5" fill="#2997ff"/>
+            <text x="431" y="194.5" fill="#fff">dog 0.81</text>
+            <rect x="574" y="155" width="92" height="21" rx="5" fill="#ff453a"/>
+            <text x="581" y="170.5" fill="#fff">dog 0.40</text>
           </g>
           <g>
-            <circle cx="294" cy="154" r="14" fill="var(--ok)"/>
-            <path d="M287 154 l5 5 l9 -10" stroke="#fff" stroke-width="2.6" fill="none" stroke-linecap="round"/>
-            <circle cx="556" cy="212" r="14" fill="var(--ok)"/>
-            <path d="M549 212 l5 5 l9 -10" stroke="#fff" stroke-width="2.6" fill="none" stroke-linecap="round"/>
-            <circle cx="780" cy="166" r="14" fill="var(--bad)"/>
-            <path d="M774 160 l12 12 M786 160 l-12 12" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/>
+            <circle cx="322" cy="190" r="14" fill="#32d74b"/>
+            <path d="M315.5 190l5 5 8.5-9.5" stroke="#0b1a0e" stroke-width="2.8" fill="none"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="534" cy="204" r="14" fill="#32d74b"/>
+            <path d="M527.5 204l5 5 8.5-9.5" stroke="#0b1a0e" stroke-width="2.8" fill="none"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="736" cy="180" r="14" fill="#ff453a"/>
+            <path d="M730 174l12 12M742 174l-12 12" stroke="#fff" stroke-width="2.8" stroke-linecap="round"/>
+          </g>
+          <!-- 위반 근거를 장면 안에서 바로 읽히게 -->
+          <g>
+            <rect x="470" y="352" width="404" height="34" rx="9" fill="rgba(8,10,16,.78)"/>
+            <text x="486" y="374" font-size="15" fill="#ffd9d6">심판 ✗ — 개가 아니라 세로 나무 판자 구조물</text>
           </g>
         </svg>
       </div>
@@ -824,6 +917,38 @@
         <div class="kv">실측 PCB: 제로샷 ≈0 → 42장 <b>0.593</b> → 300장 <b>0.963</b></div>
       </div>
     </div>
+
+    <!-- 비디오: 한 번 잡으면 프레임을 넘어 따라간다 -->
+    <figure class="frames reveal">
+      <figcaption>
+        <b>비디오는 프레임마다 그리지 않는다</b>
+        <span>SAM 3 메모리 전파가 같은 객체를 이어 추적하고, 프레임별 초안 라벨로 저장된다
+          — 같은 객체는 <code>meta.track_id</code>로 묶인다</span>
+      </figcaption>
+      <div class="strip">
+        <div class="frame"><svg viewBox="160 156 260 196" aria-hidden="true"><use href="#photo"/>
+          <rect x="182" y="190" width="140" height="134" rx="6" fill="none" stroke="#2997ff" stroke-width="3"/>
+          <rect x="182" y="167" width="96" height="20" rx="5" fill="#2997ff"/>
+          <text x="189" y="181.5" class="mono" font-size="13" font-weight="700" fill="#fff">track #1</text>
+        </svg><span>frame 001</span></div>
+        <div class="frame"><svg viewBox="168 156 260 196" aria-hidden="true"><use href="#photo"/>
+          <rect x="182" y="190" width="140" height="134" rx="6" fill="none" stroke="#2997ff" stroke-width="3"/>
+          <rect x="182" y="167" width="96" height="20" rx="5" fill="#2997ff"/>
+          <text x="189" y="181.5" class="mono" font-size="13" font-weight="700" fill="#fff">track #1</text>
+        </svg><span>frame 004</span></div>
+        <div class="frame"><svg viewBox="176 156 260 196" aria-hidden="true"><use href="#photo"/>
+          <rect x="182" y="190" width="140" height="134" rx="6" fill="none" stroke="#2997ff" stroke-width="3"/>
+          <rect x="182" y="167" width="96" height="20" rx="5" fill="#2997ff"/>
+          <text x="189" y="181.5" class="mono" font-size="13" font-weight="700" fill="#fff">track #1</text>
+        </svg><span>frame 007</span></div>
+        <div class="frame"><svg viewBox="184 156 260 196" aria-hidden="true"><use href="#photo"/>
+          <rect x="182" y="190" width="140" height="134" rx="6" fill="none" stroke="#2997ff" stroke-width="3"/>
+          <rect x="182" y="167" width="96" height="20" rx="5" fill="#2997ff"/>
+          <text x="189" y="181.5" class="mono" font-size="13" font-weight="700" fill="#fff">track #1</text>
+        </svg><span>frame 010</span></div>
+      </div>
+      <p class="fnote">실측: 팬 영상 10프레임 → 박스 19개, 한 트랙이 9프레임 연속 유지</p>
+    </figure>
   </div>
 </section>
 
@@ -946,6 +1071,26 @@
         <p>손상 파일 건너뛰기, 온톨로지에 없는 클래스 제외, 이미지 누락 —
           조용히 통과시키지 않고 개수로 노출한다.</p>
       </div>
+    </div>
+
+    <p class="lede reveal" style="margin-top:64px">그리고 라벨링에 필요한 나머지 전부</p>
+    <div class="caps reveal">
+      <span class="cap-chip">예시 박스 1개 → 유사 객체 전부</span>
+      <span class="cap-chip">SAM 클릭 마스크</span>
+      <span class="cap-chip">타일링 추론</span>
+      <span class="cap-chip">계층 라벨 (person.head)</span>
+      <span class="cap-chip">프롬프트 실험</span>
+      <span class="cap-chip">누락 라벨 찾기</span>
+      <span class="cap-chip">라벨 의심 랭킹</span>
+      <span class="cap-chip">권장 임계값 자동 계산</span>
+      <span class="cap-chip">능동 샘플 추천</span>
+      <span class="cap-chip">통계적 배치 검수</span>
+      <span class="cap-chip">일괄 승인·거부</span>
+      <span class="cap-chip">100단계 되돌리기</span>
+      <span class="cap-chip">학습 이력·롤백</span>
+      <span class="cap-chip">외부 <code>.pt</code> 등록</span>
+      <span class="cap-chip">Colab 학습 노트북</span>
+      <span class="cap-chip">COCO · YOLO zip</span>
     </div>
   </div>
 </section>
