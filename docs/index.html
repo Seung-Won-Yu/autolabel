@@ -482,6 +482,33 @@
   @keyframes chipin { 0%,26% { opacity: 0; transform: scale(.3) } 34%,88% { opacity: 1; transform: scale(1) }
                       95%,100% { opacity: 0; transform: scale(.3) } }
 
+  /* ═══ OG 캡처 모드 (?og) — docs/og.png 재생성용 1200×630 레이아웃 ═══
+     헤드리스 크롬으로 이 페이지를 그대로 찍는다. 별도 소스를 두면 페이지가
+     바뀔 때마다 OG가 낡는다 — 같은 마크업에서 뽑아야 늘 최신이다. */
+  html.og, html.og body { width: 1200px; height: 630px; overflow: hidden }
+  html.og nav, html.og section, html.og footer, html.og .final,
+  html.og .badges, html.og .cta, html.og .caption, html.og #progress { display: none !important }
+  html.og .hero { display: flex; align-items: center; gap: 34px; padding: 0 44px; height: 630px }
+  html.og .hero .wrap { flex: 0 0 430px; padding: 0; text-align: left; max-width: none }
+  html.og .hero .eyebrow, html.og .hero .kicker { text-align: left }
+  html.og h1 { font-size: 62px; line-height: 1.02 }
+  html.og .tagline { margin: 18px 0 0; font-size: 19px; max-width: 400px }
+  html.og .band { margin: 26px 0 0; justify-content: flex-start; max-width: none; flex-wrap: nowrap }
+  html.og .band div { padding: 0 13px } html.og .band div:first-child { padding-left: 0 }
+  html.og .band b { font-size: 24px } html.og .band span { font-size: 11px; white-space: nowrap }
+  /* 사이드바가 창 높이를 정한다 — 목록을 줄여야 캔버스가 커 보인다 */
+  html.og .side .thumb + .thumb + .thumb + .thumb { display: none }
+  html.og .app { min-height: 312px; grid-template-columns: 168px 1fr 186px }
+  html.og .mk-scan { display: none }  /* 정지 이미지에 스캔선은 노이즈 */
+  /* 정지 캡처는 루프 위상에 좌우되면 안 된다 — 완성 상태로 고정 */
+  html.og .mk-box, html.og .mk-lab, html.og .mk-chip, html.og .arow.live .vchip {
+    animation: none !important; opacity: 1 !important; stroke-dashoffset: 0 !important;
+    transform: none !important;
+  }
+  html.og .hero .wrap { flex: 0 0 396px }
+  html.og .stage { flex: 1 1 auto; margin: 0; padding: 0; perspective: none }
+  html.og .window { max-width: none; transform: none !important }
+
   #progress { position: fixed; top: 0; left: 0; height: 2px; width: 100%; z-index: 50;
     background: linear-gradient(90deg, var(--accent), var(--accent-2));
     transform: scaleX(0); transform-origin: left; transition: transform .1s linear }
@@ -555,6 +582,8 @@
   // JS 자체가 꺼지면 내용은 원래부터 보인다. 이후 인터랙션 코드가 실패해도
   // watchdog이 리빌 요소를 되살려 마케팅 본문이 빈 화면으로 남지 않게 한다.
   document.documentElement.classList.add('js')
+  // ?og — OG 이미지 캡처 모드 (docs/og.png 재생성용, 아래 CSS가 1200×630으로 조판)
+  if (location.search.includes('og')) document.documentElement.classList.add('og')
   setTimeout(() => {
     document.querySelectorAll('.reveal, tbody').forEach((el) => el.classList.add('in'))
     document.querySelectorAll('.fill').forEach((el) => { el.style.width = el.dataset.w + '%' })
