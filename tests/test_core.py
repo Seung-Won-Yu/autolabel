@@ -8,9 +8,10 @@ import os
 import pytest
 
 from server import sampling
+from server.ensemble import agreement_counts, fuse_foundation_detections, pilot_should_continue
 from server.parts import parse_ontology
-from server.tiling import merge_nms, tile_boxes
-from server.train_worker import pick_arch, pick_imgsz
+from server.tiling import merge_nms, suppress_trusted_overlaps, tile_boxes
+from server.train_worker import epoch_progress, pick_arch, pick_imgsz
 
 
 # ---------- acceptance sampling ----------
@@ -55,12 +56,64 @@ def test_pick_arch_is_conservative_for_small_data():
     assert pick_arch(50, override="yolo11m") == "yolo11m"
 
 
+def test_epoch_progress_uses_real_elapsed_time_for_eta():
+    """첫 epoch 실측 속도로 ETA를 만들고 마지막에는 정확히 0이 된다."""
+    first = epoch_progress(0, 10, started_at=100, now=110)
+    assert first == {
+        "epoch": 1, "epochs": 10, "progress": 0.1,
+        "elapsed_sec": 10, "eta_sec": 90,
+    }
+    middle = epoch_progress(4, 10, started_at=100, now=150)
+    assert middle["progress"] == 0.5 and middle["eta_sec"] == 50
+    assert epoch_progress(9, 10, started_at=100, now=220)["eta_sec"] == 0
+
+
 def test_pick_imgsz_keeps_default_for_small_data(tmp_path):
     """해상도 상향은 실측에서 소량 데이터에 일관되게 손해였다."""
     (tmp_path / "labels" / "train").mkdir(parents=True)
     (tmp_path / "labels" / "train" / "a.txt").write_text("0 0.5 0.5 0.01 0.01\n")
     assert pick_imgsz(tmp_path, n_images=100) == 640
     assert pick_imgsz(tmp_path, n_images=5000) == 1280
+
+
+def test_champion_gate_requires_same_val_comparison():
+    from server.train_worker import should_promote
+
+    assert should_promote(0.6, None, champion_required=False, champion_eval_ok=True)
+    assert not should_promote(0.2, None, champion_required=False, champion_eval_ok=True)
+    assert should_promote(0.61, 0.60, champion_required=True, champion_eval_ok=True)
+    assert not should_promote(0.59, 0.60, champion_required=True, champion_eval_ok=True)
+    # champion 평가가 실패했는데 과거 저장 점수로 대신 비교하면 시험지가 달라진다.
+    assert not should_promote(0.9, None, champion_required=True, champion_eval_ok=False)
+
+
+def test_operational_calibration_and_checkpoint_choice():
+    from types import SimpleNamespace
+
+    from server.train_worker import choose_deploy_checkpoint, operational_calibration
+
+    metrics = SimpleNamespace(box=SimpleNamespace(
+        f1_curve=[[0.1, 0.8, 0.5], [0.2, 0.3, 0.9]],
+        px=[0.01, 0.2, 0.6], ap_class_index=[0, 1]))
+    thresholds, f1 = operational_calibration(metrics, ["a", "b"])
+    assert thresholds == {"a": 0.2, "b": 0.6}
+    assert f1 == pytest.approx(0.85)
+    assert choose_deploy_checkpoint(0.4, 0.8) == "last"
+    assert choose_deploy_checkpoint(0.8, 0.79) == "best"
+
+
+def test_sam_embedding_cache_is_bounded_lru(monkeypatch):
+    """이미지를 넘겨 볼수록 SAM 임베딩이 무한히 RAM에 쌓이면 안 된다."""
+    from server import ml
+
+    monkeypatch.setattr(ml, "EMBED_CACHE_MAX", 2)
+    ml._embed_cache.clear()
+    ml._embed_cache_put("a", {"key": "a"})
+    ml._embed_cache_put("b", {"key": "b"})
+    assert ml._embed_cache_get("a")["key"] == "a"  # a가 최근 사용으로 승급
+    ml._embed_cache_put("c", {"key": "c"})
+    assert list(ml._embed_cache) == ["a", "c"]  # 가장 오래된 b 퇴출
+    ml._embed_cache.clear()
 
 
 # ---------- 계층 온톨로지 ----------
@@ -95,6 +148,309 @@ def test_merge_nms_dedupes_same_class_overlap():
     out = merge_nms(dets)
     assert len(out) == 2
     assert out[0]["confidence"] == 0.9  # 높은 신뢰도가 살아남음
+
+
+def test_human_overlap_suppression_keeps_other_classes():
+    trusted = [{"class_name": "object", "bbox": [0, 0, 100, 100]}]
+    dets = [
+        {"class_name": "object", "bbox": [10, 10, 20, 20]},  # 포함된 중복
+        {"class_name": "object", "bbox": [200, 200, 20, 20]},
+        {"class_name": "object.part", "bbox": [10, 10, 20, 20]},
+    ]
+    kept, suppressed = suppress_trusted_overlaps(dets, trusted)
+    assert suppressed == 1
+    assert [d["class_name"] for d in kept] == ["object", "object.part"]
+
+
+def test_foundation_ensemble_marks_consensus_and_keeps_disagreements():
+    sam3 = [
+        {"class_name": "crack", "bbox": [10, 10, 20, 20], "confidence": 0.8},
+        {"class_name": "dent", "bbox": [60, 60, 10, 10], "confidence": 0.7},
+    ]
+    gdino = [
+        {"class_name": "crack", "bbox": [11, 11, 20, 20], "confidence": 0.6},
+        # 위치가 겹쳐도 클래스가 다르면 같은 객체로 합치지 않는다.
+        {"class_name": "scratch", "bbox": [60, 60, 10, 10], "confidence": 0.9},
+    ]
+    result = fuse_foundation_detections(sam3, gdino)
+
+    assert len(result) == 3
+    assert agreement_counts(result) == {"consensus": 1, "sam3_only": 1, "gdino_only": 1}
+    consensus = next(d for d in result
+                     if d["meta"]["ensemble"]["agreement"] == "consensus")
+    assert consensus["bbox"] == sam3[0]["bbox"]
+    assert consensus["confidence"] == 0.6  # 서로 다른 척도라 보수적인 낮은 값
+    assert consensus["meta"]["ensemble"]["match_iou"] > 0.8
+    assert consensus["meta"]["ensemble"]["sam3_bbox"] == sam3[0]["bbox"]
+    assert consensus["meta"]["ensemble"]["gdino_bbox"] == gdino[0]["bbox"]
+    assert result[-1] == consensus  # 불일치 후보가 검수 목록의 앞쪽
+
+
+def test_foundation_ensemble_matches_each_candidate_only_once():
+    sam3 = [
+        {"class_name": "crack", "bbox": [10, 10, 20, 20], "confidence": 0.9},
+        {"class_name": "crack", "bbox": [12, 12, 20, 20], "confidence": 0.8},
+    ]
+    gdino = [{"class_name": "crack", "bbox": [11, 11, 20, 20], "confidence": 0.7}]
+    result = fuse_foundation_detections(sam3, gdino)
+    assert agreement_counts(result) == {"consensus": 1, "sam3_only": 1, "gdino_only": 0}
+
+
+def test_ensemble_pilot_stops_when_models_do_not_agree():
+    weak = {"consensus": 0, "sam3_only": 8, "gdino_only": 2}
+    assert pilot_should_continue(weak, 2) is None
+    assert pilot_should_continue(weak, 3) is False
+    useful = {"consensus": 2, "sam3_only": 5, "gdino_only": 3}
+    assert pilot_should_continue(useful, 3) is True
+
+
+def test_recall_profile_uses_low_candidate_threshold_and_tta(monkeypatch):
+    """누락 최소화는 온톨로지 승인 기준을 바꾸지 않고 후보만 관대하게 뽑는다."""
+    from PIL import Image
+
+    from server import main
+    from server import tiling
+
+    captured = {}
+    monkeypatch.setattr(main.train, "active_model", lambda _pid: {"map50": 0.5})
+    monkeypatch.setattr(tiling, "should_tile", lambda _image: False)
+
+    def fake_detect(_image, _student, ontology, augment=False):
+        captured.update(ontology=ontology, augment=augment)
+        return []
+
+    monkeypatch.setattr(main.ml, "detect_student", fake_detect)
+    ontology = [{"name": "defect", "threshold": 0.35}]
+    _dets, engine = main._detect_auto(
+        1, Image.new("RGB", (640, 640)), ontology,
+        profile="recall", candidate_conf=0.10)
+
+    assert captured["ontology"][0]["threshold"] == 0.10
+    assert ontology[0]["threshold"] == 0.35  # 저장 설정은 건드리지 않는다
+    assert captured["augment"] is True
+    assert "recall(conf 0.1,TTA)" in engine
+
+
+def test_cold_start_runs_sam3_and_gdino_as_ensemble(monkeypatch):
+    from PIL import Image
+
+    from server import main, tiling
+
+    monkeypatch.setattr(main.train, "active_model", lambda _pid: None)
+    monkeypatch.setattr(main.ml, "sam3_available", lambda: True)
+    monkeypatch.setattr(tiling, "should_tile", lambda _image: False)
+    monkeypatch.setattr(main.ml, "detect_sam3", lambda *_args: [
+        {"class_name": "defect", "bbox": [10, 10, 20, 20], "confidence": 0.8}])
+    monkeypatch.setattr(main.ml, "detect", lambda *_args: [
+        {"class_name": "defect", "bbox": [11, 11, 20, 20], "confidence": 0.6}])
+
+    dets, engine = main._detect_auto(
+        1, Image.new("RGB", (640, 640)), [{"name": "defect", "threshold": 0.35}])
+
+    assert engine == "ensemble(sam3+gdino)"
+    assert agreement_counts(dets)["consensus"] == 1
+
+
+def test_cold_start_keeps_gdino_when_sam3_fails(monkeypatch):
+    from PIL import Image
+
+    from server import main, tiling
+
+    monkeypatch.setattr(main.train, "active_model", lambda _pid: None)
+    monkeypatch.setattr(main.ml, "sam3_available", lambda: True)
+    monkeypatch.setattr(tiling, "should_tile", lambda _image: False)
+    monkeypatch.setattr(main.ml, "detect_sam3", lambda *_args: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(main.ml, "detect", lambda *_args: [
+        {"class_name": "defect", "bbox": [10, 10, 20, 20], "confidence": 0.7}])
+
+    dets, engine = main._detect_auto(
+        1, Image.new("RGB", (640, 640)), [{"name": "defect", "threshold": 0.35}])
+
+    assert engine == "foundation(sam3 실패)"
+    assert agreement_counts(dets)["gdino_only"] == 1
+
+
+def test_pilot_selected_sam3_skips_gdino(monkeypatch):
+    from PIL import Image
+
+    from server import main, tiling
+
+    monkeypatch.setattr(main.ml, "sam3_available", lambda: True)
+    monkeypatch.setattr(tiling, "should_tile", lambda _image: False)
+    monkeypatch.setattr(main.ml, "detect_sam3", lambda *_args: [
+        {"class_name": "defect", "bbox": [10, 10, 20, 20], "confidence": 0.8}])
+    monkeypatch.setattr(main.ml, "detect", lambda *_args: pytest.fail("GDINO should be skipped"))
+
+    dets, engine = main._detect_auto(
+        1, Image.new("RGB", (640, 640)), [{"name": "defect"}], engine="sam3")
+    assert len(dets) == 1
+    assert engine == "sam3(pilot 선택)"
+
+
+def test_pilot_selected_sam3_failure_falls_back_to_gdino(monkeypatch):
+    from PIL import Image
+
+    from server import foundation, tiling
+
+    monkeypatch.setattr(foundation.ml, "sam3_available", lambda: True)
+    monkeypatch.setattr(tiling, "should_tile", lambda _image: False)
+    monkeypatch.setattr(
+        foundation.ml, "detect_sam3",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("transient failure")))
+    monkeypatch.setattr(foundation.ml, "detect", lambda *_args: [
+        {"class_name": "defect", "bbox": [10, 10, 20, 20], "confidence": 0.6}])
+
+    dets, engine = foundation.detect(
+        Image.new("RGB", (640, 640)), [{"name": "defect"}], engine="sam3")
+
+    assert len(dets) == 1
+    assert dets[0]["meta"]["foundation_engine"] == "gdino"
+    assert engine == "foundation(sam3 선택 후 실패)"
+
+
+def test_reviewed_foundation_profile_selects_lower_work_engine(client):
+    """삭제(FP)와 새로 그리기(FN)를 승인 정답과 비교해 클래스 경로를 고른다."""
+    from server import foundation
+    from server.db import get_db
+
+    project = client.post("/api/projects", json={
+        "name": "foundation-calibration",
+        "ontology": [{"name": "defect", "prompt": "surface defect"}],
+    }).json()
+    conn = get_db()
+    for i in range(3):
+        iid = conn.execute(
+            "INSERT INTO images (project_id,file_name,width,height,status) "
+            "VALUES (?,?,?,?,?)",
+            (project["id"], f"{i}.jpg", 200, 200, "approved")).lastrowid
+        conn.execute(
+            "INSERT INTO annotations (image_id,class_name,bbox,source) VALUES (?,?,?,?)",
+            (iid, "defect", "[10,10,20,20]", "human"))
+        fused = fuse_foundation_detections(
+            [{"class_name": "defect", "bbox": [10, 10, 20, 20], "confidence": 0.8}],
+            [{"class_name": "defect", "bbox": [100, 100, 20, 20], "confidence": 0.7}],
+        )
+        assert foundation.replace_audit(
+            conn, project["id"], iid, fused, "ensemble(sam3+gdino)")
+    conn.commit()
+    profile = foundation.build_profile(conn, project["id"], project["ontology"])
+    conn.close()
+
+    assert profile["status"] == "ready"
+    assert profile["reviewed_images"] == 3
+    cls = profile["classes"][0]
+    assert cls["selection"] == "sam3"
+    assert cls["sam3"]["review_cost"] == 0
+    assert cls["gdino"]["review_cost"] == 12  # FP 3 + 누락 3*3
+
+
+def test_class_routes_limit_prompts_to_selected_engine(monkeypatch):
+    from PIL import Image
+
+    from server import foundation, tiling
+
+    calls = {}
+    monkeypatch.setattr(foundation.ml, "sam3_available", lambda: True)
+    monkeypatch.setattr(tiling, "should_tile", lambda _image: False)
+
+    def sam(_image, ontology):
+        calls["sam3"] = [c["name"] for c in ontology]
+        return []
+
+    def gdino(_image, ontology):
+        calls["gdino"] = [c["name"] for c in ontology]
+        return []
+
+    monkeypatch.setattr(foundation.ml, "detect_sam3", sam)
+    monkeypatch.setattr(foundation.ml, "detect", gdino)
+    _dets, used = foundation.detect(
+        Image.new("RGB", (100, 100)),
+        [{"name": "crack"}, {"name": "dent"}],
+        engine="routed", class_routes={"crack": "sam3", "dent": "gdino"})
+
+    assert calls == {"sam3": ["crack"], "gdino": ["dent"]}
+    assert used == "routed(sam3+gdino)"
+
+
+def test_routed_engine_failure_falls_back_without_dropping_selected_class(monkeypatch):
+    from PIL import Image
+
+    from server import foundation, tiling
+
+    gdino_calls = []
+    monkeypatch.setattr(foundation.ml, "sam3_available", lambda: True)
+    monkeypatch.setattr(tiling, "should_tile", lambda _image: False)
+    monkeypatch.setattr(
+        foundation.ml, "detect_sam3",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("sam3 unavailable")))
+
+    def gdino(_image, ontology):
+        names = [item["name"] for item in ontology]
+        gdino_calls.append(names)
+        return [{"class_name": name, "bbox": [0, 0, 10, 10], "confidence": 0.5}
+                for name in names]
+
+    monkeypatch.setattr(foundation.ml, "detect", gdino)
+    dets, used = foundation.detect(
+        Image.new("RGB", (100, 100)),
+        [{"name": "crack"}, {"name": "dent"}],
+        engine="routed", class_routes={"crack": "sam3", "dent": "gdino"})
+
+    assert gdino_calls == [["dent"], ["crack"]]
+    assert {det["class_name"] for det in dets} == {"crack", "dent"}
+    assert used == "routed(gdino)"
+
+
+def test_student_detector_passes_low_threshold_into_yolo():
+    """후단 필터가 0.10이어도 YOLO 기본 0.25에서 후보를 먼저 버리면 소용없다."""
+    from PIL import Image
+
+    from server import ml
+
+    captured = {}
+
+    class FakeModel:
+        def predict(self, _image, **kwargs):
+            captured.update(kwargs)
+            return [type("Result", (), {"boxes": []})()]
+
+    ml._students["fake-low-conf.pt"] = FakeModel()
+    try:
+        ml.detect_student(
+            Image.new("RGB", (32, 32)),
+            {"path": "fake-low-conf.pt", "meta": {"names": ["defect"]}},
+            [{"name": "defect", "threshold": 0.10}], augment=True)
+    finally:
+        ml._students.pop("fake-low-conf.pt", None)
+
+    assert captured["conf"] == 0.10
+    assert captured["augment"] is True
+
+
+def test_student_detector_uses_model_calibrated_threshold():
+    """AP가 높아도 confidence 척도가 낮은 모델은 기본 0.3에서 0건이 될 수 있다."""
+    from PIL import Image
+
+    from server import ml
+
+    captured = {}
+
+    class FakeModel:
+        def predict(self, _image, **kwargs):
+            captured.update(kwargs)
+            return [type("Result", (), {"boxes": []})()]
+
+    ml._students["fake-calibrated.pt"] = FakeModel()
+    try:
+        ml.detect_student(
+            Image.new("RGB", (32, 32)),
+            {"path": "fake-calibrated.pt", "meta": {
+                "names": ["defect"], "calibrated_thresholds": {"defect": 0.04}}},
+            [{"name": "defect", "threshold": 0.30}])
+    finally:
+        ml._students.pop("fake-calibrated.pt", None)
+
+    assert captured["conf"] == 0.04
 
 
 def test_train_status_detects_dead_worker_after_server_restart(tmp_path, monkeypatch):
@@ -191,6 +547,25 @@ def test_plan_splits_never_starves_train():
     assert list(plan.values()).count("train") >= 10, plan
 
 
+def test_plan_splits_keeps_source_groups_together():
+    """같은 영상의 인접 프레임이 학습과 평가 양쪽에 섞이면 점수가 부풀려진다."""
+    from server.train import plan_splits
+
+    assigned = dict.fromkeys(range(100))
+    groups = {i: f"video:{i // 5}" for i in assigned}  # 영상 20개, 프레임 5장씩
+    plan = plan_splits(assigned, groups)
+    for group in set(groups.values()):
+        splits = {plan[i] for i, g in groups.items() if g == group}
+        assert len(splits) == 1, (group, splits)
+    assert set(plan.values()) == {"train", "val", "test"}
+
+    # migration 전 이미 갈라져 있던 그룹도 한 split으로 복구한다.
+    assigned = {0: "train", 1: "val", 2: "test", 3: None}
+    groups = dict.fromkeys(assigned, "same-video")
+    fixed = plan_splits(assigned, groups)
+    assert len(set(fixed.values())) == 1
+
+
 def test_worker_status_update_never_clears_pid_os(tmp_path, monkeypatch):
     """워커의 상태 병합이 런처가 남긴 pid_os를 지우면 안 된다.
 
@@ -283,6 +658,15 @@ def test_batch_verdict_routes_by_detection_rate():
     empty = _batch_verdict({"hit": 0, "found": 0}, 10)
     assert empty["verdict"] == "empty"
     assert "프롬프트" in empty["advice"]  # 다음 수를 반드시 제시해야 한다
+
+
+def test_batch_large_box_uses_xywh_not_xyxy():
+    """bbox는 [x,y,w,h]다. x/y를 너비/높이에서 빼면 우측 박스를 놓친다."""
+    from PIL import Image
+    from server.main import _box_area_ratio
+
+    image = Image.new("RGB", (200, 100))
+    assert _box_area_ratio([100, 10, 180, 90], image) == 0.81
 
 
 def test_drop_frame_filling_removes_degenerate_boxes():

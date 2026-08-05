@@ -4,6 +4,8 @@
 전용 모델 오토라벨 → 심판 → 누락 제안 → 자동 승인 → 통계 검수 → 익스포트
 """
 import io
+import json
+import os
 import sys
 import time
 import zipfile
@@ -67,14 +69,15 @@ imgs = requests.get(f"{API}/projects/{pid}/images").json()
 check("연결 임포트", st["status"] == "completed" and len(imgs) == 120, f"{len(imgs)}장")
 check("라벨 함께 임포트", sum(i["ann_count"] for i in imgs) > 0,
       f"박스 {sum(i['ann_count'] for i in imgs)}개")
-up_dir = ROOT / "data" / "uploads" / str(pid)
+up_dir = Path(os.environ.get("AUTOLABEL_DATA") or ROOT / "data") / "uploads" / str(pid)
 check("디스크 복사 없음", not up_dir.exists() or not any(up_dir.iterdir()))
 
 # 3. 제로샷 베이스라인
 print("\n[3] 제로샷 (전용 모델 없는 상태)")
 z = requests.post(f"{API}/images/{imgs[0]['id']}/autolabel", json={"masks": False}).json()
 check("제로샷 동작", "detections" in z, f"엔진={z.get('engine')} 검출={len(z.get('detections', []))}")
-check("파운데이션 경로 사용", "foundation" in str(z.get("engine")))
+check("파운데이션/제로샷 경로 사용",
+      any(name in str(z.get("engine")) for name in ("foundation", "sam3")))
 
 # 4. 시드 승인 → 자동 학습
 print("\n[4] 시드 승인 → 자동 파인튜닝")
@@ -95,9 +98,13 @@ check("전용 모델 활성", active is not None,
 # 5. 전용 모델로 오토라벨
 print("\n[5] 전용 모델 오토라벨")
 rest = [i for i in imgs[100:]]
-r = requests.post(f"{API}/images/{rest[0]['id']}/autolabel", json={"masks": False}).json()
-check("학생 엔진 사용", "student" in str(r.get("engine")), r.get("engine"))
-check("검출 성공", len(r.get("detections", [])) > 0, f"{len(r.get('detections', []))}개")
+student_results = [requests.post(
+    f"{API}/images/{im['id']}/autolabel", json={"masks": False}).json() for im in rest]
+coverage = sum(bool(r.get("detections")) for r in student_results)
+check("학생 엔진 사용", all("student" in str(r.get("engine")) for r in student_results),
+      student_results[0].get("engine"))
+check("새 데이터 검출 커버리지", coverage >= max(1, int(len(rest) * 0.6)),
+      f"{coverage}/{len(rest)}장")
 
 # 6. 심판 (QA)
 print("\n[6] 라벨 심판")
@@ -151,7 +158,23 @@ check("익스포트 누락 0", z.headers.get("X-Images-Missing") == "0",
 mdl = requests.get(f"{API}/projects/{pid}/model")
 check("모델 .pt 다운로드", mdl.status_code == 200, f"{len(mdl.content) // 1024}KB")
 nb = requests.get(f"{API}/projects/{pid}/colab-notebook")
-check("Colab 노트북", nb.status_code == 200)
+nb_source = ""
+if nb.status_code == 200:
+    parsed_nb = json.loads(nb.content)
+    nb_source = "\n".join("".join(c["source"]) for c in parsed_nb["cells"])
+check("Colab 노트북", nb.status_code == 200 and "split=eval_split" in nb_source)
+training_zip = requests.get(f"{API}/projects/{pid}/training-dataset.zip")
+training_names = (zipfile.ZipFile(io.BytesIO(training_zip.content)).namelist()
+                  if training_zip.content[:2] == b"PK" else [])
+training_images = [n for n in training_names if n.startswith("images/")]
+training_yaml = (zipfile.ZipFile(io.BytesIO(training_zip.content)).read("data.yaml").decode()
+                 if training_names else "")
+check("Colab 승인 데이터 격리",
+      training_zip.status_code == 200 and len(training_images) == 100,
+      f"승인 100장 / 패키지 {len(training_images)}장")
+check("Colab train/val/test 분리",
+      all(x in training_yaml for x in
+          ("train: images/train", "val: images/val", "test: images/test")))
 
 print("\n" + "=" * 60)
 print(f"결과: {ok}개 통과 / {fail}개 실패")

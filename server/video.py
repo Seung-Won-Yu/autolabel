@@ -43,6 +43,7 @@ def extract_frames(video_path: Path, pid: int, data_dir: Path,
     pdir = data_dir / str(pid)
     pdir.mkdir(parents=True, exist_ok=True)
     stem = video_path.stem.removeprefix("src_")  # 저장 시 붙인 충돌 방지 프리픽스 제거
+    group_key = f"video:{video_path.name}:{video_path.stat().st_mtime_ns}"
     ids: list[int] = []
     idx = 0
     try:
@@ -54,8 +55,8 @@ def extract_frames(video_path: Path, pid: int, data_dir: Path,
                 h, w = frame.shape[:2]
                 fname = f"{stem}_f{idx:06d}.jpg"
                 cur = conn.execute(
-                    "INSERT INTO images (project_id, file_name, width, height) "
-                    "VALUES (?,?,?,?)", (pid, fname, w, h))
+                    "INSERT INTO images (project_id, file_name, width, height, group_key) "
+                    "VALUES (?,?,?,?,?)", (pid, fname, w, h, group_key))
                 iid = cur.lastrowid
                 cv2.imwrite(str(pdir / f"{iid}_{fname}"), frame)
                 ids.append(iid)

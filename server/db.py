@@ -62,6 +62,33 @@ CREATE TABLE IF NOT EXISTS models (
     meta TEXT NOT NULL DEFAULT '{}',
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+-- 사람이 삭제·수정한 제로샷 후보도 나중에 엔진 품질 계산에 써야 한다.
+-- annotations는 현재 정답만 유지하므로, "그때 어떤 엔진을 실제로 돌렸는지"와
+-- 원본 후보를 별도 감사 로그로 남긴다. 이미지별 최신 실행만 보존한다.
+CREATE TABLE IF NOT EXISTS foundation_audits (
+    image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    sam3_ran INTEGER NOT NULL DEFAULT 0,
+    gdino_ran INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS foundation_candidates (
+    id INTEGER PRIMARY KEY,
+    image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    engine TEXT NOT NULL CHECK(engine IN ('sam3', 'gdino')),
+    class_name TEXT NOT NULL,
+    bbox TEXT NOT NULL,
+    confidence REAL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_foundation_audit_project
+    ON foundation_audits(project_id, sam3_ran, gdino_ran);
+CREATE INDEX IF NOT EXISTS idx_foundation_candidates_image
+    ON foundation_candidates(image_id, engine, class_name);
 """
 
 
@@ -95,6 +122,8 @@ def init_db():
         "ALTER TABLE models ADD COLUMN test_map50 REAL",
         # VLM 문맥 심판용 판정 기준 문서 (예: '사고 연루 차량만 accident_vehicle')
         "ALTER TABLE projects ADD COLUMN rubric TEXT NOT NULL DEFAULT ''",
+        # 같은 영상·연속 촬영 묶음이 train/val/test에 갈라지는 평가 누출 방지
+        "ALTER TABLE images ADD COLUMN group_key TEXT",
     ):
         try:
             conn.execute(stmt)

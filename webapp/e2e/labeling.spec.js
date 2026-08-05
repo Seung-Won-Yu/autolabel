@@ -65,6 +65,23 @@ test('열려 있는 프로젝트에 이미지를 넣으면 캔버스가 자동�
   await expect(page.getByText('좌측에서 이미지를 선택하세요')).toHaveCount(0)
 })
 
+test('이미지를 열고 넘기기만 해서는 SAM 임베딩을 계산하지 않는다', async ({ page }) => {
+  const { id, name } = await newProject(page, 'lazy-sam', ONE_CLASS)
+  await uploadImage(page, id, 'first.png')
+  await uploadImage(page, id, 'second.png')
+  let embeds = 0
+  page.on('request', (request) => {
+    if (request.url().includes('/embed')) embeds++
+  })
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+  await page.keyboard.press('ArrowRight')
+  await page.waitForTimeout(300)
+  expect(embeds).toBe(0)
+})
+
 test('드래그로 박스를 그리면 저장되고 어노테이션 패널에 뜬다', async ({ page }) => {
   const { id, name } = await newProject(page, 'drag-box', ONE_CLASS)
   const iid = await uploadImage(page, id)
@@ -119,6 +136,21 @@ test('클래스를 지우면 캔버스 도구 힌트가 사라지지 않는다',
   await page.getByRole('button', { name: '×' }).first().click()
   await expect(page.getByText('클래스 (0)')).toBeVisible()
   await expect(page.locator('canvas').first()).toBeVisible()
+})
+
+test('클래스 연속 편집은 debounce 저장되고 상태가 보인다', async ({ page }) => {
+  const { id, name } = await newProject(page, 'ontology-save', ONE_CLASS)
+  await page.goto('/')
+  await page.getByText(name).click()
+
+  const input = page.getByPlaceholder('클래스').first()
+  await input.fill('signature-final')
+  await expect(page.locator('.ontology-actions')).toContainText(/저장 중|저장됨/)
+  await expect.poll(async () => {
+    const r = await page.request.get(`${API}/projects/${id}`)
+    return (await r.json()).ontology[0].name
+  }).toBe('signature-final')
+  await expect(page.locator('.ontology-actions')).toContainText('저장됨')
 })
 
 test('이미지 목록이 스크롤 없이 보이고 캔버스가 컨테이너에 딱 맞는다', async ({ page }) => {
@@ -264,6 +296,66 @@ test('목록은 보이는 구간만 DOM에 올린다 (창 렌더링)', async ({ 
     sc.scrollTop = sc.scrollHeight
   })
   await expect(page.locator('.ilist li').last()).toContainText(`w${N - 1}.png`)
+})
+
+test('배치 검수는 뽑힌 표본만 보여주고 장별 판정을 집계한다', async ({ page }) => {
+  const { id, name } = await newProject(page, 'sampling', ONE_CLASS)
+  const ids = []
+  for (let i = 0; i < 5; i++) {
+    const iid = await uploadImage(page, id, `sample-${i}.png`)
+    ids.push(iid)
+    await page.request.put(`${API}/images/${iid}/status`, { data: { status: 'prelabeled' } })
+  }
+  const sampled = [ids[1], ids[3]]
+  await page.route('**/api/projects/*/acceptance-plan', (route) => route.fulfill({ json: {
+    lot_size: 5, sample_size: 2, saving: 0.6, max_defects: 1,
+    target_error_rate: 0.05, confidence: 0.95, status: 'prelabeled',
+    lot_token: 'fixed-lot', sample_image_ids: sampled,
+  } }))
+  let submitted
+  await page.route('**/api/projects/*/acceptance-result', async (route) => {
+    submitted = route.request().postDataJSON()
+    await route.fulfill({ json: { accepted: false, message: '배치 반려' } })
+  })
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('.ilist li')).toHaveCount(5)
+  await page.locator('.setup-toggle').click()
+  await page.getByRole('button', { name: '📊 배치 검수' }).click()
+
+  await expect(page.locator('.sample-banner')).toContainText('검수 표본 2장')
+  await expect(page.locator('.ilist li')).toHaveCount(2)
+  await expect(page.locator('.ilist li').nth(0)).toContainText('sample-1.png')
+  await expect(page.locator('.ilist li').nth(1)).toContainText('sample-3.png')
+  await expect(page.getByRole('button', { name: '✓ 승인' })).toBeDisabled()
+  const verdict = page.getByRole('button', { name: /배치 판정/ })
+  await expect(verdict).toBeDisabled()
+
+  await page.getByRole('button', { name: '✓ 정상 · 다음' }).click()
+  await expect(page.locator('.sampling-progress')).toContainText('판정 1/2')
+  await expect(page.locator('.ilist li.active')).toContainText('sample-3.png')
+  await page.getByRole('button', { name: '✗ 라벨 오류 · 다음' }).click()
+  await expect(page.locator('.sampling-progress')).toContainText('오류 1')
+  await expect(verdict).toBeEnabled()
+  await verdict.click()
+  await expect.poll(() => submitted?.defects).toBe(1)
+  await expect(page.locator('.sample-banner')).toHaveCount(0)
+})
+
+test('모바일 폭에서도 가로 넘침 없이 캔버스를 사용할 수 있다', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  const { id, name } = await newProject(page, 'mobile', ONE_CLASS)
+  await uploadImage(page, id)
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.locator('canvas').first()).toBeVisible()
+  await expect.poll(() => page.evaluate(() =>
+    document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0)
+  await expect.poll(() => page.locator('canvas').first().evaluate((el) => el.offsetWidth))
+    .toBeGreaterThan(340)
+  await expect(page.locator('html')).toHaveAttribute('lang', 'ko')
 })
 
 test('창 렌더링에서도 현재 이미지가 목록에 남는다', async ({ page }) => {
@@ -535,6 +627,138 @@ test('추론 응답이 이미지 전환 후 도착하면 버린다', async ({ pa
   await page.waitForTimeout(2500)
   const r = await page.request.get(`${API}/images/${second}/annotations`)
   expect(await r.json()).toEqual([])
+})
+
+test('단건 오토라벨 재실행은 모델 초안을 교체하고 사람 라벨을 지킨다', async ({ page }) => {
+  const { id, name } = await newProject(page, 'replace-draft', ONE_CLASS)
+  const iid = await uploadImage(page, id)
+  await page.request.put(`${API}/images/${iid}/annotations`, { data: { annotations: [
+    { class_name: 'sig', bbox: [10, 10, 30, 30], source: 'human' },
+    { class_name: 'sig', bbox: [60, 60, 20, 20], confidence: 0.8, source: 'model' },
+  ] } })
+  await page.route('**/api/images/*/autolabel', (route) => route.fulfill({ json: {
+    detections: [
+      { class_name: 'sig', bbox: [12, 12, 25, 25], confidence: 0.9 }, // 사람 박스 중복
+      { class_name: 'sig', bbox: [70, 10, 20, 20], confidence: 0.7 },
+    ],
+    engine: 'student(fake)', profile: 'balanced',
+  } }))
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await expect(page.getByText('어노테이션 (2)')).toBeVisible()
+
+  const run = page.getByRole('button', { name: '이 이미지 오토라벨' })
+  await run.click()
+  await expect(page.getByText('어노테이션 (2)')).toBeVisible()
+  await expect(page.getByText(/기존 초안 1개 교체.*사람 라벨 중복 1개 억제/)).toBeVisible()
+  await run.click()
+  await expect(page.getByText('어노테이션 (2)')).toBeVisible()
+
+  await expect.poll(async () => {
+    const r = await page.request.get(`${API}/images/${iid}/annotations`)
+    return (await r.json()).length
+  }, { timeout: 10_000 }).toBe(2)
+})
+
+test('누락 최소화 토글은 recall 프로필로 전용 모델을 호출한다', async ({ page }) => {
+  const { id, name } = await newProject(page, 'recall-profile', ONE_CLASS)
+  await uploadImage(page, id)
+  await page.route('**/api/projects/*/train/status', (route) => route.fulfill({ json: {
+    job: { status: 'idle' },
+    active_model: { id: 1, map50: 0.5, train_images: 42 },
+  } }))
+  let profile = null
+  await page.route('**/api/images/*/autolabel', (route) => {
+    profile = route.request().postDataJSON().profile
+    return route.fulfill({ json: {
+      detections: [], engine: 'student(fake)+recall', profile,
+    } })
+  })
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  const toggle = page.getByRole('button', { name: '○ 누락 최소화' })
+  await expect(toggle).toBeVisible()
+  await toggle.click()
+  await page.getByRole('button', { name: '이 이미지 오토라벨' }).click()
+
+  await expect.poll(() => profile).toBe('recall')
+  await expect(page.getByRole('button', { name: '◎ 누락 최소화 ON' })).toBeVisible()
+})
+
+test('학습센터는 설정을 접어도 준비도와 예상 분할을 보여준다', async ({ page }) => {
+  const { name } = await newProject(page, 'training-ready', ONE_CLASS)
+  await page.route('**/api/projects/*/train/status', (route) => route.fulfill({ json: {
+    job: { status: 'idle' }, active_model: null,
+  } }))
+  await page.route('**/api/projects/*/train/readiness', (route) => route.fulfill({ json: {
+    approved: 12, last_trained: 0, new_since_last: 12,
+    min_manual: 4, min_auto: 8, next_auto_at: 8, remaining_auto: 0,
+    ready_manual: true, ready_auto: true, has_model: false,
+    recommended_arch: 'yolo11n', expected_epochs: 60,
+    split_counts: { train: 6, val: 4, test: 2 }, class_count: 1, blockers: [],
+  } }))
+
+  await page.goto('/')
+  await page.getByText(name).click()
+  await page.getByRole('button', { name: /설정 · 도구/ }).click()
+
+  await expect(page.getByText('학습센터')).toBeVisible()
+  await expect(page.getByText('12장', { exact: true })).toBeVisible()
+  await expect(page.getByText('6/4/2')).toBeVisible()
+  await expect(page.getByRole('button', { name: '로컬 학습 시작' })).toBeEnabled()
+})
+
+test('학습 중에는 실제 epoch·진행률·ETA와 단계가 열린 채 표시된다', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  const { name } = await newProject(page, 'training-live', ONE_CLASS)
+  await page.route('**/api/projects/*/train/status', (route) => route.fulfill({ json: {
+    job: {
+      status: 'running', phase: 'training', epoch: 12, epochs: 60, progress: 0.2,
+      elapsed_sec: 300, eta_sec: 1100, approved: 24, arch: 'yolo11n',
+    },
+    active_model: { id: 1, map50: 0.71, train_images: 16, meta: { operational_f1: 0.68 } },
+  } }))
+  await page.route('**/api/projects/*/train/readiness', (route) => route.fulfill({ json: {
+    approved: 24, min_manual: 4, min_auto: 8, next_auto_at: 21, remaining_auto: 0,
+    ready_manual: true, ready_auto: true, recommended_arch: 'yolo11n', expected_epochs: 60,
+    split_counts: { train: 12, val: 7, test: 5 }, class_count: 1, blockers: [],
+  } }))
+
+  await page.goto('/')
+  await page.getByText(name).click()
+
+  await expect(page.getByText('모델 학습 · 12/60 epoch')).toBeVisible()
+  await expect(page.getByText('12/60 epoch', { exact: true })).toBeVisible()
+  await expect(page.getByText('18분 20초')).toBeVisible()
+  await expect(page.getByRole('progressbar', { name: '전체 학습 진행률' })).toHaveAttribute('aria-valuenow', '22')
+  await expect(page.getByLabel('학습 진행 단계')).toContainText('기존 모델 비교')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390)
+})
+
+test('학습 완료 후 새 모델 미적용 이유와 검증 지표를 분명히 보여준다', async ({ page }) => {
+  const { name } = await newProject(page, 'training-kept', ONE_CLASS)
+  await page.route('**/api/projects/*/train/status', (route) => route.fulfill({ json: {
+    job: {
+      status: 'completed', phase: 'completed', promoted: false, map50: 0.62,
+      test_map50: 0.58, operational_f1: 0.55, checkpoint: 'last', elapsed_sec: 640,
+    },
+    active_model: { id: 1, map50: 0.7, train_images: 20, meta: { operational_f1: 0.67, checkpoint: 'best' } },
+  } }))
+  await page.route('**/api/projects/*/train/readiness', (route) => route.fulfill({ json: {
+    approved: 25, min_manual: 4, min_auto: 8, next_auto_at: 25, remaining_auto: 0,
+    ready_manual: true, ready_auto: true, recommended_arch: 'yolo11n', expected_epochs: 60,
+    split_counts: { train: 13, val: 7, test: 5 }, class_count: 1, blockers: [],
+  } }))
+
+  await page.goto('/')
+  await page.getByText(name).click()
+
+  await expect(page.getByText('새 모델 대신 기존 모델을 유지했습니다')).toBeVisible()
+  await expect(page.getByText('새 모델이 품질 하한 또는 기존 모델 비교를 넘지 못해 안전하게 교체하지 않았습니다.')).toBeVisible()
+  await expect(page.getByText('0.580', { exact: true })).toBeVisible()
+  await expect(page.getByText('last.pt', { exact: true })).toBeVisible()
 })
 
 test('저장 비행 중의 편집이 유실되지 않는다', async ({ page }) => {

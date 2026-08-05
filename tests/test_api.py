@@ -15,6 +15,50 @@ def _project(client, name="t", ontology=None):
     return r.json()["id"]
 
 
+def _model_bundle(path: Path, *, classes=None, val_map50=0.5,
+                  test_map50=None, split_counts=None, class_metrics=None,
+                  member="best.pt"):
+    """Colab이 내려줄 모델+성능표 번들의 최소 테스트 픽스처."""
+    classes = classes or ["person"]
+    split_counts = split_counts or {"train": 60, "val": 30, "test": 0}
+    manifest = {
+        "schema_version": 1,
+        "classes": classes,
+        "architecture": "yolo11n",
+        "approved_images": sum(split_counts.values()),
+        "split_counts": split_counts,
+        "epochs_requested": 60,
+        "metrics": {
+            "val_map50": val_map50,
+            "val_map50_95": 0.25 if val_map50 is not None else None,
+            "test_map50": test_map50,
+            "test_map50_95": 0.2 if test_map50 is not None else None,
+        },
+    }
+    if class_metrics is not None:
+        manifest["class_metrics"] = class_metrics
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(member, b"fake-yolo-weights")
+        z.writestr("autolabel-model.json", json.dumps(manifest))
+    return manifest
+
+
+def test_cors_allows_local_app_and_blocks_external_sites(client):
+    local = client.options("/api/projects", headers={
+        "Origin": "http://127.0.0.1:5173",
+        "Access-Control-Request-Method": "GET",
+    })
+    assert local.status_code == 200
+    assert local.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+
+    external = client.options("/api/projects", headers={
+        "Origin": "https://malicious.example",
+        "Access-Control-Request-Method": "GET",
+    })
+    assert external.status_code == 400
+    assert "access-control-allow-origin" not in external.headers
+
+
 def test_project_crud_and_ontology(client):
     pid = _project(client)
     assert any(p["id"] == pid for p in client.get("/api/projects").json())
@@ -25,6 +69,17 @@ def test_project_crud_and_ontology(client):
 
     assert client.delete(f"/api/projects/{pid}").json()["ok"]
     assert not any(p["id"] == pid for p in client.get("/api/projects").json())
+
+
+def test_foundation_profile_endpoint_starts_as_learning(client):
+    pid = _project(client, "foundation-profile")
+    r = client.get(f"/api/projects/{pid}/foundation-profile")
+    assert r.status_code == 200
+    profile = r.json()
+    assert profile["status"] == "learning"
+    assert profile["reviewed_images"] == 0
+    assert profile["remaining_images"] == 3
+    assert profile["classes"][0]["selection"] == "comparing"
 
 
 def test_upload_annotate_export_roundtrip(client, make_image, tmp_path):
@@ -103,8 +158,22 @@ def test_linked_import_reads_yolo_labels_without_copying(client, make_image, tmp
 
 
 def test_auto_approve_respects_threshold(client, make_image, tmp_path):
-    """고신뢰만 승인하고 저신뢰는 남겨야 한다."""
+    """검증·캘리브레이션된 전용 모델에서도 고신뢰만 승인한다."""
     pid = _project(client, "approve")
+    from server.db import get_db
+    conn = get_db()
+    mid = conn.execute(
+        "INSERT INTO models (project_id,path,map50,test_map50,train_images,active,meta) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (pid, "/tmp/verified.pt", 0.8, 0.78, 100, 1,
+         json.dumps({"quality_status": "verified"}))).lastrowid
+    conn.commit()
+    conn.close()
+    ontology = [{"name": "person", "prompt": "person", "threshold": 0.35,
+                 "approval_threshold": 0.65, "approval_precision": 0.95,
+                 "approval_support": 12, "approval_source": "qa_val",
+                 "approval_model_id": mid}]
+    client.put(f"/api/projects/{pid}/ontology", json={"ontology": ontology})
     ids = []
     for i, conf in enumerate([0.9, 0.3]):
         img = make_image(tmp_path / f"ap{i}", f"{i}.jpg")
@@ -113,7 +182,8 @@ def test_auto_approve_respects_threshold(client, make_image, tmp_path):
                               files=[("files", (f"{i}.jpg", f, "image/jpeg"))]).json()["saved"][0]
         client.put(f"/api/images/{iid}/annotations", json={"annotations": [
             {"class_name": "person", "bbox": [1, 1, 10, 10],
-             "confidence": conf, "source": "model"}]})
+             "confidence": conf, "source": "model",
+             "meta": {"engine": "student", "model_id": mid}}]})
         client.put(f"/api/images/{iid}/status", json={"status": "prelabeled"})
         ids.append(iid)
 
@@ -124,6 +194,61 @@ def test_auto_approve_respects_threshold(client, make_image, tmp_path):
     client.post(f"/api/projects/{pid}/auto-approve", json={"min_conf": 0.7})
     states = {r["id"]: r["status"] for r in client.get(f"/api/projects/{pid}/images").json()}
     assert states[ids[0]] == "approved" and states[ids[1]] == "prelabeled"
+
+
+def test_auto_approve_blocks_foundation_and_uncalibrated_models(client, make_image, tmp_path):
+    """SAM/GDINO의 높은 confidence와 미캘리브레이션 학생 모델은 자동승인 금지."""
+    pid = _project(client, "approve-safe")
+    img = make_image(tmp_path / "unsafe", "unsafe.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("unsafe.jpg", f, "image/jpeg"))]).json()["saved"][0]
+    client.put(f"/api/images/{iid}/annotations", json={"annotations": [{
+        "class_name": "person", "bbox": [1, 1, 10, 10], "confidence": 0.99,
+        "source": "model", "meta": {"engine": "sam3"}}]})
+    client.put(f"/api/images/{iid}/status", json={"status": "prelabeled"})
+
+    unsafe = client.post(f"/api/projects/{pid}/auto-approve",
+                         json={"dry_run": True}).json()
+    assert unsafe["approved"] == 0 and unsafe["skipped_unsafe_model"] == 1
+    assert "자동 승인하지 않습니다" in unsafe["blocked_reason"]
+
+    from server.db import get_db
+    conn = get_db()
+    mid = conn.execute(
+        "INSERT INTO models (project_id,path,map50,test_map50,train_images,active,meta) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (pid, "/tmp/student.pt", 0.8, 0.78, 100, 1,
+         json.dumps({"quality_status": "verified"}))).lastrowid
+    conn.execute("UPDATE annotations SET meta=? WHERE image_id=?",
+                 (json.dumps({"engine": "student", "model_id": mid}), iid))
+    conn.commit()
+    conn.close()
+    client.put(f"/api/projects/{pid}/ontology", json={"ontology": [{
+        "name": "person", "prompt": "person", "threshold": 0.35,
+        "approval_threshold": 0.7, "approval_precision": 0.95,
+        "approval_support": 20, "approval_source": "qa_val",
+        "approval_model_id": mid + 1,
+    }]})
+
+    uncalibrated = client.post(f"/api/projects/{pid}/auto-approve",
+                               json={"dry_run": True}).json()
+    assert uncalibrated["approved"] == 0
+    assert uncalibrated["skipped_uncalibrated"] == 1
+    assert "QA 분석" in uncalibrated["blocked_reason"]
+
+
+def test_auto_approve_never_approves_empty_without_negative_calibration(client, make_image, tmp_path):
+    pid = _project(client, "approve-empty")
+    img = make_image(tmp_path / "empty", "empty.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("empty.jpg", f, "image/jpeg"))]).json()["saved"][0]
+    client.put(f"/api/images/{iid}/status", json={"status": "prelabeled"})
+
+    dry = client.post(f"/api/projects/{pid}/auto-approve",
+                      json={"dry_run": True, "require_labeled": False}).json()
+    assert dry["approved"] == 0 and dry["skipped_no_label"] == 1
 
 
 def test_bulk_status_and_next_to_label(client, make_image, tmp_path):
@@ -145,6 +270,21 @@ def test_bulk_status_and_next_to_label(client, make_image, tmp_path):
     assert rec["total_candidates"] == 0
 
 
+def test_approval_below_training_minimum_does_not_schedule_timer(
+        client, make_image, tmp_path):
+    from server import train
+
+    pid = _project(client, "no-premature-train")
+    img = make_image(tmp_path / "no-premature", "a.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("a.jpg", f, "image/jpeg"))]).json()["saved"][0]
+
+    response = client.put(f"/api/images/{iid}/status", json={"status": "approved"}).json()
+    assert response["train"] == {"status": "skipped", "approved": 1, "need": 8}
+    assert pid not in train._timers
+
+
 def test_acceptance_plan_and_result(client, make_image, tmp_path):
     pid = _project(client, "accept")
     for i in range(40):
@@ -160,8 +300,63 @@ def test_acceptance_plan_and_result(client, make_image, tmp_path):
 
     res = client.post(f"/api/projects/{pid}/acceptance-result", json={
         "sample_size": plan["sample_size"], "defects": 0,
-        "max_defects": plan["max_defects"], "apply": True}).json()
+        "max_defects": plan["max_defects"], "apply": True,
+        "status": plan["status"], "lot_token": plan["lot_token"]}).json()
     assert res["accepted"] and res["approved_images"] == 40
+
+
+def test_acceptance_rejects_changed_lot(client, make_image, tmp_path):
+    """검수 계획 뒤 들어온 이미지를 검사 없이 함께 승인하면 안 된다."""
+    pid = _project(client, "accept-snapshot")
+
+    def add(name):
+        img = make_image(tmp_path / "acc-snap", name)
+        with open(img, "rb") as f:
+            iid = client.post(f"/api/projects/{pid}/images",
+                              files=[("files", (name, f, "image/jpeg"))]).json()["saved"][0]
+        client.put(f"/api/images/{iid}/status", json={"status": "prelabeled"})
+        return iid
+
+    add("before.jpg")
+    plan = client.post(f"/api/projects/{pid}/acceptance-plan", json={}).json()
+    late = add("late.jpg")
+    r = client.post(f"/api/projects/{pid}/acceptance-result", json={
+        "sample_size": plan["sample_size"], "defects": 0,
+        "max_defects": plan["max_defects"], "status": plan["status"],
+        "lot_token": plan["lot_token"], "apply": True,
+    })
+    assert r.status_code == 409
+    states = {im["id"]: im["status"] for im in client.get(
+        f"/api/projects/{pid}/images").json()}
+    assert states[late] == "prelabeled" and set(states.values()) == {"prelabeled"}
+
+
+def test_api_rejects_invalid_status_and_cross_project_ids(client, make_image, tmp_path):
+    """오타 상태와 프로젝트 경계를 넘는 일괄 작업은 데이터 상태를 오염시킨다."""
+    pids, ids = [], []
+    for i in range(2):
+        pid = _project(client, f"scope-{i}")
+        pids.append(pid)
+        img = make_image(tmp_path / f"scope-{i}", "a.jpg")
+        with open(img, "rb") as f:
+            ids.append(client.post(f"/api/projects/{pid}/images",
+                       files=[("files", ("a.jpg", f, "image/jpeg"))]).json()["saved"][0])
+
+    assert client.put(f"/api/images/{ids[0]}/status", json={"status": "typo"}).status_code == 400
+    assert client.put(f"/api/images/{ids[0]}/annotations", json={"annotations": [{
+        "class_name": "person", "bbox": [1, 1, -2, 3]}]}).status_code == 400
+    assert client.post("/api/images/bulk-status", json={
+        "image_ids": ids, "status": "approved"}).status_code == 400
+    assert client.post(f"/api/projects/{pids[0]}/autolabel", json={
+        "image_ids": [ids[1]], "masks": False}).status_code == 400
+    assert client.put("/api/projects/999999/ontology", json={"ontology": []}).status_code == 404
+    assert client.post(f"/api/projects/{pids[0]}/acceptance-plan", json={
+        "target_error_rate": 0}).status_code == 400
+
+    img = make_image(tmp_path / "missing-project", "a.jpg")
+    with open(img, "rb") as f:
+        assert client.post("/api/projects/999999/images",
+                           files=[("files", ("a.jpg", f, "image/jpeg"))]).status_code == 404
 
 
 def test_rejected_images_are_excluded_from_export(client, make_image, tmp_path):
@@ -277,10 +472,19 @@ def test_export_works_with_non_ascii_project_name(client, make_image, tmp_path):
     nb = client.get(f"/api/projects/{pid}/colab-notebook")
     assert nb.status_code == 200
     nb.headers["content-disposition"].encode("latin-1")
+    cells = nb.json()["cells"]
+    code = "\n".join("".join(cell.get("source", [])) for cell in cells
+                     if cell["cell_type"] == "code")
+    assert "pathlib.Path(model.trainer.best)" in code
+    assert "test_res.nt_per_class" in code and "'class_metrics': class_metrics" in code
+    assert "shutil.rmtree(bundle)" in code
+    assert "YOLO('out/train/weights/best.pt')" not in code
+    assert cells[-2]["source"] == ["from google.colab import files\n",
+                                    "files.download('autolabel-model.zip')"]
 
 
 def test_model_import_and_rollback(client, tmp_path):
-    """외부 .pt 등록 → 두 번째 등록으로 교체 → 첫 모델로 롤백."""
+    """외부 .pt는 검증 후 비활성 등록되고, 명시 적용·롤백만 활성화한다."""
     pid = _project(client, "models")
     a, b = tmp_path / "a.pt", tmp_path / "b.pt"
     a.write_bytes(b"fake-weights-a")
@@ -288,17 +492,187 @@ def test_model_import_and_rollback(client, tmp_path):
 
     r1 = client.post(f"/api/projects/{pid}/models/import", json={
         "path": str(a), "names": ["person"], "map50": 0.5}).json()
-    assert client.get(f"/api/projects/{pid}/train/status").json()["active_model"]["id"] == r1["id"]
+    assert r1["quality_status"] == "provisional" and not r1["active"]
+    assert client.get(f"/api/projects/{pid}/train/status").json()["active_model"] is None
+    assert client.post(f"/api/projects/{pid}/models/{r1['id']}/activate").json()["ok"]
 
-    # 두 번째 등록이 챔피언을 교체해야 한다 (활성은 항상 하나)
+    # 두 번째 등록도 현재 챔피언을 조용히 교체하면 안 된다.
     r2 = client.post(f"/api/projects/{pid}/models/import", json={
         "path": str(b), "names": ["person"], "map50": 0.7}).json()
     models = client.get(f"/api/projects/{pid}/models").json()
-    assert [m["id"] for m in models if m["active"]] == [r2["id"]], models
+    assert [m["id"] for m in models if m["active"]] == [r1["id"]], models
+    assert client.post(f"/api/projects/{pid}/models/{r2['id']}/activate").json()["ok"]
 
     # 롤백
     assert client.post(f"/api/projects/{pid}/models/{r1['id']}/activate").json()["ok"]
     assert client.get(f"/api/projects/{pid}/train/status").json()["active_model"]["id"] == r1["id"]
+
+
+def test_unverified_active_model_can_still_be_downloaded(client, tmp_path):
+    """사용자가 강제 적용한 raw .pt도 다운로드 경로 자체는 깨지면 안 된다."""
+    from server.db import get_db
+
+    pid = _project(client, "download-unverified")
+    weights = tmp_path / "raw.pt"
+    weights.write_bytes(b"raw-weights")
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO models (project_id,path,map50,train_images,active,meta) "
+        "VALUES (?,?,?,?,?,?)",
+        (pid, str(weights), None, 0, 1, json.dumps({"quality_status": "unverified"})))
+    conn.commit()
+    conn.close()
+
+    response = client.get(f"/api/projects/{pid}/model")
+    assert response.status_code == 200 and response.content == b"raw-weights"
+    disposition = response.headers["content-disposition"]
+    assert "model_p" in disposition and "unverified.pt" in disposition
+
+
+def test_model_bundle_is_validated_copied_and_not_auto_activated(client, tmp_path):
+    """Colab 번들은 클래스·성능표를 읽고 관리 경로에 복사한 뒤 대기시킨다."""
+    pid = _project(client, "bundle")
+    bundle = tmp_path / "autolabel-model.zip"
+    _model_bundle(bundle, val_map50=0.62,
+                  split_counts={"train": 60, "val": 30, "test": 0})
+
+    r = client.post(f"/api/projects/{pid}/models/import", json={"path": str(bundle)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["quality_status"] == "provisional"
+    assert not body["active"] and body["metrics"]["val_map50"] == 0.62
+    assert client.get(f"/api/projects/{pid}/train/status").json()["active_model"] is None
+
+    model = client.get(f"/api/projects/{pid}/models").json()[0]
+    stored = Path(model["path"])
+    assert stored.exists() and stored != bundle and stored.read_bytes() == b"fake-yolo-weights"
+    assert model["train_images"] == 90
+    assert model["meta"]["quality_status"] == "provisional"
+
+
+def test_model_bundle_blocks_bad_quality_class_mismatch_and_zip_escape(client, tmp_path):
+    pid = _project(client, "bundle-guards")
+
+    mismatch = tmp_path / "mismatch.zip"
+    _model_bundle(mismatch, classes=["cat"])
+    r = client.post(f"/api/projects/{pid}/models/import", json={"path": str(mismatch)})
+    assert r.status_code == 400 and "클래스" in r.text
+
+    failed = tmp_path / "failed.zip"
+    _model_bundle(failed, val_map50=0.01)
+    body = client.post(f"/api/projects/{pid}/models/import", json={"path": str(failed)}).json()
+    assert body["quality_status"] == "failed" and not body["active"]
+    blocked = client.post(f"/api/projects/{pid}/models/{body['id']}/activate")
+    assert blocked.status_code == 409 and "품질" in blocked.text
+
+    escaped = tmp_path / "escaped.zip"
+    _model_bundle(escaped, member="../best.pt")
+    r = client.post(f"/api/projects/{pid}/models/import", json={"path": str(escaped)})
+    assert r.status_code == 400 and "안전하지" in r.text
+
+
+def test_model_bundle_blocks_weak_class_hidden_by_good_average(client, tmp_path):
+    """전체 평균이 좋아도 실사용 클래스 하나가 무너지면 전문 모델로 적용하지 않는다."""
+    pid = _project(client, "class-gate", ontology=[
+        {"name": "crazing", "prompt": "crazing", "threshold": 0.35},
+        {"name": "scratches", "prompt": "scratches", "threshold": 0.35},
+    ])
+    bundle = tmp_path / "weak-class.zip"
+    class_metrics = {
+        "crazing": {"test_map50": 0.064, "test_map50_95": 0.018,
+                    "test_instances": 8},
+        "scratches": {"test_map50": 0.619, "test_map50_95": 0.274,
+                      "test_instances": 11},
+    }
+    _model_bundle(bundle, classes=["crazing", "scratches"], val_map50=0.59,
+                  test_map50=0.52, split_counts={"train": 70, "val": 30, "test": 20},
+                  class_metrics=class_metrics)
+
+    body = client.post(f"/api/projects/{pid}/models/import",
+                       json={"path": str(bundle)}).json()
+    assert body["quality_status"] == "failed" and not body["active"]
+    assert "crazing 0.064" in body["quality_reason"]
+    assert body["class_metrics"] == class_metrics
+    assert client.post(f"/api/projects/{pid}/models/{body['id']}/activate").status_code == 409
+
+
+def test_model_bundle_can_be_selected_in_browser_without_pasting_a_path(client, tmp_path):
+    pid = _project(client, "browser-upload")
+    bundle = tmp_path / "autolabel-model.zip"
+    _model_bundle(bundle, val_map50=0.62,
+                  split_counts={"train": 60, "val": 30, "test": 0})
+
+    response = client.post(f"/api/projects/{pid}/models/import-upload", files={
+        "file": (bundle.name, bundle.read_bytes(), "application/zip")})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["quality_status"] == "provisional" and not body["active"]
+    assert Path(body["path"]).read_bytes() == b"fake-yolo-weights"
+    model = client.get(f"/api/projects/{pid}/models").json()[0]
+    assert model["meta"]["source_bundle"] == "autolabel-model.zip"
+    assert not list(Path(tmp_path).parent.glob(".model-upload-*"))
+
+
+def test_training_worker_starts_from_code_root(client, tmp_path, monkeypatch):
+    """데이터 저장 루트를 바꿔도 워커의 cwd까지 바뀌면 server 모듈을 못 찾는다."""
+    import os
+
+    from server import train
+
+    pid = _project(client, "worker-cwd")
+    monkeypatch.setattr(train, "RUNS", tmp_path / "runs")
+    train._procs.clear()
+    captured = {}
+
+    class FakeProc:
+        pid = os.getpid()
+
+        def poll(self):
+            return None
+
+    def fake_popen(args, **kwargs):
+        captured.update(args=args, cwd=kwargs["cwd"])
+        return FakeProc()
+
+    monkeypatch.setattr(train.subprocess, "Popen", fake_popen)
+    result = client.post(f"/api/projects/{pid}/train").json()
+
+    assert result["status"] == "running"
+    assert captured["cwd"] == train.CODE_ROOT
+    assert (captured["cwd"] / "server" / "train_worker.py").exists()
+
+
+def test_training_readiness_previews_split_and_trigger(client, make_image, tmp_path):
+    """학습을 시작하기 전에 UI가 실제 분할과 다음 자동 조건을 알 수 있어야 한다."""
+    pid = _project(client, "readiness")
+    files = []
+    for i in range(8):
+        path = make_image(tmp_path, f"ready-{i}.jpg")
+        files.append(("files", (path.name, path.read_bytes(), "image/jpeg")))
+    saved = client.post(f"/api/projects/{pid}/images", files=files).json()["saved"]
+    # 상태 API는 자동 학습 디바운스를 예약하므로, 이 읽기 전용 준비도 테스트는
+    # DB 상태만 바꿔 백그라운드 워커가 우연히 뜨지 않게 격리한다.
+    from server.db import get_db
+    conn = get_db()
+    conn.executemany("UPDATE images SET status='approved' WHERE id=?",
+                     [(iid,) for iid in saved])
+    conn.commit()
+    conn.close()
+
+    r = client.get(f"/api/projects/{pid}/train/readiness")
+    assert r.status_code == 200
+    ready = r.json()
+    assert ready["approved"] == 8
+    assert sum(ready["split_counts"].values()) == 8
+    assert ready["split_counts"]["train"] >= 4
+    assert ready["ready_manual"] and ready["ready_auto"]
+    assert ready["stage"] == "experiment" and not ready["professional_ready"]
+    assert ready["split_counts"]["test"] == 0
+    assert any("홀드아웃" in warning for warning in ready["warnings"])
+    assert ready["remaining_auto"] == 0 and ready["next_auto_at"] == 8
+    assert ready["recommended_arch"] == "yolo11n" and ready["expected_epochs"] == 60
+
+    assert client.get("/api/projects/999999/train/readiness").status_code == 404
 
 
 def test_rollback_to_unknown_model_is_rejected(client, tmp_path):
@@ -313,6 +687,8 @@ def test_rollback_to_unknown_model_is_rejected(client, tmp_path):
     w.write_bytes(b"fake-weights")
     client.post(f"/api/projects/{pid}/models/import", json={
         "path": str(w), "names": ["person"], "map50": 0.5})
+    model = client.get(f"/api/projects/{pid}/models").json()[0]
+    assert client.post(f"/api/projects/{pid}/models/{model['id']}/activate").status_code == 200
     before = client.get(f"/api/projects/{pid}/train/status").json()["active_model"]
 
     assert client.post(f"/api/projects/{pid}/models/999999/activate").status_code == 404
@@ -384,8 +760,9 @@ def test_batch_autolabel_default_skips_reviewed_images(client, make_image, tmp_p
 
     seen = {}
 
-    def fake_run(pid_, image_ids, ontology, masks):
+    def fake_run(pid_, image_ids, ontology, masks, profile="balanced", candidate_conf=0.10):
         seen["ids"] = image_ids
+        seen["profile"] = profile
         from server import jobs as _jobs_mod
         _jobs_mod.update("autolabel", pid_, status="completed")
 
@@ -397,6 +774,7 @@ def test_batch_autolabel_default_skips_reviewed_images(client, make_image, tmp_p
             break
         time.sleep(0.05)
     assert set(seen["ids"]) == {ids["prelabeled"], ids["unlabeled"]}, seen
+    assert seen["profile"] == "balanced"
 
     # 명시적으로 지목하면 승인 이미지도 재실행할 수 있어야 한다 (의도된 탈출구)
     r = client.post(f"/api/projects/{pid}/autolabel",
@@ -409,6 +787,52 @@ def test_batch_autolabel_default_skips_reviewed_images(client, make_image, tmp_p
     r = client.post(f"/api/projects/{pid}/autolabel", json={}).json()
     assert r["status"] == "completed" and r["total"] == 0
     assert "덮어쓰지 않습니다" in r["advice"]
+
+
+def test_batch_autolabel_preserves_human_boxes_and_records_engine(
+        client, make_image, tmp_path, monkeypatch):
+    """재실행은 사람 라벨을 중복시키지 않고 실제 엔진·프로필을 기록한다."""
+    from server import main
+
+    ontology = [
+        {"name": "defect", "threshold": 0.35},
+        {"name": "defect.part", "threshold": 0.35},
+    ]
+    pid = _project(client, "batch-merge", ontology)
+    img = make_image(tmp_path / "batch-merge", "a.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("a.jpg", f, "image/jpeg"))]).json()["saved"][0]
+    client.put(f"/api/images/{iid}/annotations", json={"annotations": [
+        {"class_name": "defect", "bbox": [0, 0, 100, 100], "source": "human"},
+        {"class_name": "defect", "bbox": [300, 300, 20, 20], "source": "model"},
+    ]})
+
+    monkeypatch.setattr(main, "_detect_auto", lambda *_args, **_kw: ([
+        {"class_name": "defect", "bbox": [10, 10, 20, 20], "confidence": 0.9},
+        {"class_name": "defect", "bbox": [200, 200, 20, 20], "confidence": 0.8},
+        {"class_name": "defect.part", "bbox": [10, 10, 20, 20], "confidence": 0.7},
+    ], "student(fake)+recall"))
+
+    main._run_batch(pid, [iid], ontology, False, "recall", 0.1)
+    anns = client.get(f"/api/images/{iid}/annotations").json()
+
+    assert len(anns) == 3, anns
+    assert sum(a["source"] == "human" for a in anns) == 1
+    assert not any(a["source"] == "model" and a["bbox"] == [10, 10, 20, 20]
+                   and a["class_name"] == "defect" for a in anns)
+    model_anns = [a for a in anns if a["source"] == "model"]
+    assert all(a["meta"]["engine"] == "student(fake)+recall" for a in model_anns)
+    assert all(a["meta"]["profile"] == "recall" for a in model_anns)
+
+    one = client.post(f"/api/images/{iid}/autolabel", json={
+        "profile": "recall", "candidate_conf": 0.1, "masks": False}).json()
+    assert one["profile"] == "recall"
+    assert all(d["meta"]["engine"] == "student(fake)+recall" for d in one["detections"])
+    assert all(d["meta"]["profile"] == "recall" for d in one["detections"])
+
+    bad = client.post(f"/api/images/{iid}/autolabel", json={"profile": "magic"})
+    assert bad.status_code == 400
 
 
 def test_export_skips_labels_of_removed_classes(client, make_image, tmp_path):
@@ -589,6 +1013,48 @@ def test_vlm_judge_stores_verdicts_and_reuses_cache(client, make_image, tmp_path
     assert len(calls) == 6
 
 
+def test_annotation_save_keeps_ids_and_background_vlm(client, make_image, tmp_path):
+    """여러 이미지가 있어도 반복 저장이 행 id와 백그라운드 VLM 판정을 지킨다.
+
+    DELETE+INSERT 방식은 다른 이미지가 더 높은 rowid를 가진 순간 저장한 행의
+    id가 바뀐다. 화면은 이전 id를 계속 보내므로 첫 저장에서 병합된 VLM 판정이
+    두 번째 저장에서 사라졌다.
+    """
+    pid = _project(client, "stable-ann-id")
+    ids = []
+    for i in range(2):
+        img = make_image(tmp_path / "stable", f"{i}.jpg")
+        with open(img, "rb") as f:
+            ids.append(client.post(
+                f"/api/projects/{pid}/images",
+                files=[("files", (f"{i}.jpg", f, "image/jpeg"))]).json()["saved"][0])
+
+    first = client.put(f"/api/images/{ids[0]}/annotations", json={"annotations": [{
+        "class_name": "person", "bbox": [10, 10, 30, 30], "source": "model",
+        "meta": {"vlm": {"verdict": "pass", "reason": "ok", "rubric_sha": "abc",
+                         "box": [[10, 10, 30, 30], "person"]}},
+    }]}).json()["annotations"][0]
+    # 다른 이미지의 행이 더 높은 rowid를 소유하도록 만든다.
+    client.put(f"/api/images/{ids[1]}/annotations", json={"annotations": [{
+        "class_name": "person", "bbox": [1, 1, 10, 10], "source": "model"}]})
+
+    stale_client_copy = {
+        "id": first["id"], "class_name": "person",
+        "bbox": [10, 10, 30, 30], "source": "model",
+    }
+    for _ in range(2):
+        saved = client.put(f"/api/images/{ids[0]}/annotations",
+                           json={"annotations": [stale_client_copy]}).json()["annotations"][0]
+        assert saved["id"] == first["id"]
+        assert saved["meta"]["vlm"]["verdict"] == "pass"
+
+    # 박스를 고치면 이전 박스를 판정한 VLM 결과는 유효하지 않다.
+    stale_client_copy["bbox"] = [12, 10, 30, 30]
+    changed = client.put(f"/api/images/{ids[0]}/annotations",
+                         json={"annotations": [stale_client_copy]}).json()["annotations"][0]
+    assert "vlm" not in changed["meta"]
+
+
 def test_vlm_claude_code_adapter_parses_headless_output(monkeypatch, tmp_path):
     """Claude Code 헤드리스 어댑터 — 구독으로 호출하는 경로.
 
@@ -675,11 +1141,74 @@ def test_capabilities_reports_model_availability(client):
 
 
 def test_colab_notebook_is_valid_json(client):
+    import ast
+
     pid = _project(client, "colab")
     r = client.get(f"/api/projects/{pid}/colab-notebook")
     nb = json.loads(r.content)
     assert nb["nbformat"] == 4 and nb["metadata"]["accelerator"] == "GPU"
     assert any("ultralytics" in "".join(c["source"]) for c in nb["cells"])
+    source = "\n".join("".join(c["source"]) for c in nb["cells"])
+    assert "승인 학습 데이터.zip" in source
+    assert "autolabel-model.json" in source and "autolabel-model.zip" in source
+    assert "val_map50" in source and "test_map50" in source
+    assert "epochs=60" in source  # 작은 데이터 UI 추천값과 노트북 기본값이 같아야 한다
+    assert "d.setdefault('train', 'images')" not in source
+    bundle_cell = next(c for c in nb["cells"] if "autolabel-model.json" in "".join(c["source"]))
+    ast.parse("".join(bundle_cell["source"]))
+
+    assert client.get(f"/api/projects/{pid}/colab-notebook?arch=bad;rm&epochs=100").status_code == 400
+    assert client.get(f"/api/projects/{pid}/colab-notebook?epochs=0").status_code == 400
+
+
+def test_training_dataset_uses_only_approved_fixed_splits(client, make_image, tmp_path):
+    """Colab 패키지에는 검수 전 초안이 들어가면 안 되고 train/val은 달라야 한다."""
+    from server.db import get_db
+
+    pid = _project(client, "approved-training")
+    approved_ids = []
+    for i in range(12):
+        img = make_image(tmp_path / "approved-training", f"approved-{i}.jpg")
+        with open(img, "rb") as f:
+            iid = client.post(f"/api/projects/{pid}/images",
+                              files=[("files", (img.name, f, "image/jpeg"))]).json()["saved"][0]
+        approved_ids.append(iid)
+        client.put(f"/api/images/{iid}/annotations", json={"annotations": [{
+            "class_name": "person", "bbox": [10, 20, 100, 80], "source": "human",
+        }]})
+    draft = make_image(tmp_path / "approved-training", "review-pending.jpg")
+    with open(draft, "rb") as f:
+        draft_id = client.post(f"/api/projects/{pid}/images",
+                               files=[("files", (draft.name, f, "image/jpeg"))]).json()["saved"][0]
+    client.put(f"/api/images/{draft_id}/annotations", json={"annotations": [{
+        "class_name": "person", "bbox": [1, 2, 3, 4], "source": "model",
+    }]})
+    conn = get_db()
+    conn.executemany("UPDATE images SET status='approved' WHERE id=?",
+                     [(iid,) for iid in approved_ids])
+    conn.execute("UPDATE images SET status='prelabeled' WHERE id=?", (draft_id,))
+    conn.commit()
+    conn.close()
+
+    r = client.get(f"/api/projects/{pid}/training-dataset.zip")
+    assert r.status_code == 200
+    z = zipfile.ZipFile(io.BytesIO(r.content))
+    members = set(z.namelist())
+    yaml = z.read("data.yaml").decode()
+    assert "path: ." in yaml
+    assert "train: images/train" in yaml
+    assert "val: images/val" in yaml
+    assert "test: images/test" in yaml
+    image_members = {n for n in members if n.startswith("images/")}
+    assert len(image_members) == len(approved_ids)
+    assert not any("review-pending" in n for n in members)
+    train_names = {Path(n).name for n in image_members if n.startswith("images/train/")}
+    val_names = {Path(n).name for n in image_members if n.startswith("images/val/")}
+    assert train_names and val_names and train_names.isdisjoint(val_names)
+
+    from server import train
+    exported_count, _ = train._export_yolo_dataset(pid, tmp_path / "training-export-direct")
+    assert exported_count == len(approved_ids)  # test 홀드아웃도 재학습 기준 장수에 포함
 
 
 def test_images_list_reports_vlm_flags_and_project_progress(client, make_image, tmp_path):
@@ -717,6 +1246,37 @@ def test_batch_verdict_partial_coverage_is_not_condemned():
     assert "대상이 없다면 정상" in v["advice"]
     assert _batch_verdict({"hit": 15, "found": 20}, 15)["verdict"] == "good"
     assert _batch_verdict({"hit": 0, "found": 0}, 15)["verdict"] == "empty"
+
+
+def test_batch_verdict_flags_class_holes_and_full_frame_boxes():
+    """높은 검출률이 곧 정확도라는 오판을 막는다."""
+    from server.main import _batch_verdict
+
+    v = _batch_verdict({
+        "hit": 22, "found": 55, "large_boxes": 10,
+        "class_counts": {"pitted_surface": 28, "inclusion": 13,
+                         "patches": 10, "scratches": 4},
+    }, 30, ["crazing", "inclusion", "patches", "pitted_surface",
+            "rolled-in_scale", "scratches"])
+
+    assert v["verdict"] == "partial"
+    assert v["missing_classes"] == ["crazing", "rolled-in_scale"]
+    assert v["large_boxes"] == 10
+
+
+def test_batch_verdict_prioritizes_low_agreement_candidates():
+    from server.main import _batch_verdict
+
+    v = _batch_verdict({
+        "hit": 10, "found": 12, "class_counts": {"defect": 12},
+        "agreement_counts": {"consensus": 2, "sam3_only": 6, "gdino_only": 4},
+        "ensemble_pilot": {"images": 3, "decision": "sam3"},
+    }, 10, ["defect"])
+    assert v["verdict"] == "partial"
+    assert "합의가 2/12개로 낮음" in v["advice"]
+    assert "나머지는 SAM3로 자동 전환" in v["advice"]
+    assert v["agreement_counts"]["gdino_only"] == 4
+    assert "검출률만으로" in v["advice"]
 
 
 def test_import_without_images_dir_is_400_not_500(client):

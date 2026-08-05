@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Canvas from './Canvas'
 import { api, classColor } from './api'
-import { ensureEmbed, resetEmbed, loadDecoder } from './sam'
+import { ensembleReviewSummary, mergeAutolabelDrafts } from './autolabel'
+import { modelImprovementPlan, modelQuality, rankedClassMetrics, readinessLabel } from './modelQuality'
+import { resetEmbed } from './sam'
 
 export default function App() {
   const [projects, setProjects] = useState([])
@@ -15,12 +17,16 @@ export default function App() {
   const [toast, setToast] = useState(null)
   const [tool, setTool] = useState('box')
   const [trainInfo, setTrainInfo] = useState({ job: { status: 'idle' }, active_model: null })
+  const [modelRevision, setModelRevision] = useState(0)
   const [showHelp, setShowHelp] = useState(false)
   const [filter, setFilter] = useState('all')
   const [sortMode, setSortMode] = useState('none')
   const [lastQa, setLastQa] = useState(null)
   const [suggest, setSuggest] = useState([]) // 현재 이미지의 누락 라벨 제안
   const [sampling, setSampling] = useState(null) // 진행 중인 통계 검수 계획
+  // 전용 모델 후보를 낮은 임계값+TTA로 더 많이 뽑는다. 자동 승인 기준과는
+  // 분리된 검수용 초안 모드라 기본은 빠른 balanced를 유지한다.
+  const [recallMode, setRecallMode] = useState(false)
   // 설정·도구는 라벨링을 시작하면 접는다 — 매번 쓰는 건 이미지 목록이다
   const [setupOpen, setSetupOpen] = useState(true)
   // 캔버스에서 숨긴 클래스 — 밀집 장면에서 한 종류만 보며 고칠 수 있게
@@ -50,9 +56,18 @@ export default function App() {
     all: () => true,
     flagged: (im) => (im.vlm_flags ?? 0) > 0,
   }
-  let visible = images.filter(FILTER_PRED[filter] ?? ((im) => im.status === filter))
-  if (sortMode === 'conf') visible = [...visible].sort((a, b) => (a.min_conf ?? 2) - (b.min_conf ?? 2))
-  else if (sortMode === 'qa') visible = [...visible].sort((a, b) => (b.qa_score ?? -1) - (a.qa_score ?? -1))
+  let visible
+  if (sampling) {
+    // 통계 검수 중에는 뽑힌 표본만, 계획의 순서 그대로 보여준다. 전체
+    // 리뷰대기 목록을 그대로 두면 사용자는 표본이 아닌 이미지를 검사하고도
+    // 불량 수에 포함하게 되어 검수 통계 자체가 무효가 된다.
+    const byId = new Map(images.map((im) => [im.id, im]))
+    visible = (sampling.sample_image_ids || []).map((id) => byId.get(id)).filter(Boolean)
+  } else {
+    visible = images.filter(FILTER_PRED[filter] ?? ((im) => im.status === filter))
+    if (sortMode === 'conf') visible = [...visible].sort((a, b) => (a.min_conf ?? 2) - (b.min_conf ?? 2))
+    else if (sortMode === 'qa') visible = [...visible].sort((a, b) => (b.qa_score ?? -1) - (a.qa_score ?? -1))
+  }
   visibleRef.current = visible
   imagesRef.current = images
   currentRef.current = current
@@ -90,7 +105,7 @@ export default function App() {
         : jobEndMessage(s, '배치', '배치 완료')
       // 읽고 판단해야 하는 안내는 사라지지 않게 둔다
       setMsg(text, bad || (s.verdict && s.verdict !== 'good'))
-    })
+    }, 1500, true)
 
   // QA 심판 잡 — 결과 본문(result)은 완료 상태에 붙어 온다
   const [qaJob, setQaJob] = useJob(
@@ -108,15 +123,27 @@ export default function App() {
     return () => clearTimeout(t)
   }, [toast])
 
-  useEffect(() => { loadDecoder().catch(() => {}) }, [])
-
   useEffect(() => {
     if (!project) return
-    const poll = () => api.trainStatus(project.id).then(setTrainInfo).catch(() => {})
+    let cancelled = false
+    let timer
+    const poll = async () => {
+      try {
+        const next = await api.trainStatus(project.id)
+        if (cancelled) return
+        setTrainInfo(next)
+        // epoch/ETA는 실제 상태라 실행 중에는 촘촘히, 대기 중에는 조용히 갱신한다.
+        timer = setTimeout(poll, next.job?.status === 'running' ? 1000 : 5000)
+      } catch {
+        if (!cancelled) timer = setTimeout(poll, 5000)
+      }
+    }
     poll()
-    const t = setInterval(poll, 5000)
-    return () => clearInterval(t)
+    return () => { cancelled = true; clearTimeout(timer) }
   }, [project?.id]) // eslint-disable-line
+
+  // 프로젝트별 추론 정책이므로 다른 프로젝트로 넘어가면 안전한 기본값으로.
+  useEffect(() => setRecallMode(false), [project?.id])
 
   const refreshProjects = () => api.listProjects().then(setProjects)
   useEffect(() => { refreshProjects() }, [])
@@ -138,18 +165,36 @@ export default function App() {
       const list = await api.getAnnotations(first.id)
       setCurrent(first)
       setAnns(list.map((a) => ({ ...a, _key: `db-${a.id}` })))
-      ensureEmbed(first.id).catch(() => {})
     }
   }
 
   const saveAnns = useCallback(async (imageId, list) => {
     // id는 유지해서 보낸다 — 서버가 백그라운드로 채운 meta.vlm(유료 판정)을
     // 이 사본에 없어도 id 기준으로 보존 병합할 수 있게
-    await api.saveAnnotations(imageId, list.map(({ _key, ...a }) => a))
+    const saved = await api.saveAnnotations(imageId, list.map(({ _key, ...a }) => a))
+    // 새 어노테이션은 첫 저장 전까지 DB id가 없다. 서버가 돌려준 id를 화면의
+    // 안정적인 _key에 연결하지 않으면 다음 자동저장에서 다시 새 행으로 취급돼,
+    // 그 사이 백그라운드 VLM이 기록한 판정을 지울 수 있다.
+    const byKey = new Map(list.map((a, i) => [a._key, saved.annotations?.[i]]))
+    const syncIds = (source) => source.map((a) => {
+      const row = byKey.get(a._key)
+      return row ? { ...a, id: row.id, meta: row.meta } : a
+    })
     // 저장 비행 중 새 편집이 있었으면(annsRef가 이미 다른 참조) dirty를 지우지
     // 않는다 — 지우면 그 편집의 자동저장 타이머와 이탈 경고가 전부 조용히
     // 건너뛰어, "저장됨" 토스트를 보고 닫은 탭에서 마지막 편집이 사라진다
-    if (annsRef.current === list) dirty.current = false
+    if (annsRef.current === list) {
+      const synced = syncIds(list)
+      annsRef.current = synced
+      setAnns(synced)
+      dirty.current = false
+    } else {
+      // 비행 중 편집 내용은 유지하되, 방금 생긴 DB id만 _key 기준으로 합친다.
+      // 이 id가 있어야 다음 저장이 INSERT가 아니라 UPDATE가 된다.
+      const synced = syncIds(annsRef.current)
+      annsRef.current = synced
+      setAnns(synced)
+    }
     // 사이드바 메타(개수·최저 conf)도 즉시 맞춘다 — 박스를 지웠는데 옛 숫자가
     // 남아 있으면 검수 우선순위 판단이 틀어진다
     const confs = list.map((a) => a.confidence).filter((c) => c != null)
@@ -188,7 +233,6 @@ export default function App() {
     setSuggest([])
     dirty.current = false
     // 이력은 지우지 않는다 — 이미지를 넘긴 뒤에도 되돌릴 수 있어야 한다
-    ensureEmbed(im.id).catch(() => {})
     return true // 이 열기가 최신으로 완료됨 (경합 시 false)
   }, [saveAnns])
 
@@ -380,8 +424,8 @@ export default function App() {
       }
       if (e.key === 'ArrowRight') moveImage(1)
       else if (e.key === 'ArrowLeft') moveImage(-1)
-      else if (e.key === 'a' || e.key === 'A') setStatus('approved')
-      else if (e.key === 'x' || e.key === 'X') setStatus('rejected')
+      else if ((e.key === 'a' || e.key === 'A') && !sampling) setStatus('approved')
+      else if ((e.key === 'x' || e.key === 'X') && !sampling) setStatus('rejected')
       else if (e.key === 'Delete' || e.key === 'Backspace') {
         if (selectedId) { setAnnsDirty(anns.filter((a) => a._key !== selectedId)); setSelectedId(null) }
       } else if ((e.key === 's' || e.key === 'S') && current) saveAnns(current.id, anns)
@@ -436,6 +480,7 @@ export default function App() {
   }
 
   const approved = images.filter((im) => im.status === 'approved').length
+  const activeQuality = trainInfo.active_model ? modelQuality(trainInfo.active_model) : null
 
   return (
     <div className="app">
@@ -448,13 +493,14 @@ export default function App() {
         </div>
         <span className="spacer" />
         {saveError && (
-          <span className="chip danger" title="서버에 저장하지 못했습니다. 5초마다 재시도합니다 — 창을 닫으면 변경이 사라집니다">
+          <span className="chip danger" role="alert" title="서버에 저장하지 못했습니다. 5초마다 재시도합니다 — 창을 닫으면 변경이 사라집니다">
             ⚠ 저장 안 됨 — 재시도 중
           </span>
         )}
         {trainInfo.active_model && (
-          <span className="chip" title="오토라벨이 이 전용 모델을 사용 중">
-            전용 모델 mAP50 {trainInfo.active_model.map50?.toFixed(2)}
+          <span className={`chip model-${activeQuality.tone}`}
+            title={trainInfo.active_model.meta?.quality_reason || activeQuality.label}>
+            {activeQuality.label} · mAP50 {trainInfo.active_model.map50?.toFixed(2) ?? '—'}
           </span>
         )}
         <button onClick={() => setShowHelp(true)}>단축키 (?)</button>
@@ -467,43 +513,69 @@ export default function App() {
             onAutolabel={async () => {
               if (!project.ontology.length) return setMsg('클래스를 먼저 정의하세요')
               try {
-                const j = await api.autolabelBatch(project.id, { masks: false })
+                const j = await api.autolabelBatch(project.id, {
+                  masks: false,
+                  profile: trainInfo.active_model && recallMode ? 'recall' : 'balanced',
+                })
                 setJob(j)
                 // 대상 0장이면 폴링이 돌지 않아 안내가 사라진다 — 즉시 알린다
                 if (j.status !== 'running') setMsg(j.advice || '실행할 이미지가 없습니다')
               } catch (e) { setMsg(`배치 시작 실패: ${e.message}`) }
             }}
           />
+          {!trainInfo.active_model && (
+            <FoundationProfile projectId={project.id} approved={approved}
+              jobStatus={job?.status} />
+          )}
           {sampling && (
-            <SamplingPanel plan={sampling} onClose={() => setSampling(null)}
+            <SamplingPanel plan={sampling} current={current} sampleImages={visible}
+              onOpen={openImage} onClose={() => setSampling(null)}
               onSubmit={async (defects) => {
-                const r = await api.acceptanceResult(project.id, {
-                  sample_size: sampling.sample_size, defects,
-                  max_defects: sampling.max_defects,
-                  target_error_rate: sampling.target_error_rate,
-                  confidence: sampling.confidence,
-                })
-                setImages(await api.listImages(project.id))
-                setMsg(r.message + (r.approved_images ? ` · ${r.approved_images}장 승인됨` : ''))
-                if (r.accepted) setSampling(null)
+                try {
+                  const r = await api.acceptanceResult(project.id, {
+                    sample_size: sampling.sample_size, defects,
+                    max_defects: sampling.max_defects,
+                    target_error_rate: sampling.target_error_rate,
+                    confidence: sampling.confidence,
+                    status: sampling.status,
+                    lot_token: sampling.lot_token,
+                  })
+                  setImages(await api.listImages(project.id))
+                  setSampling(null)
+                  setFilter(r.accepted ? 'approved' : 'prelabeled')
+                  setMsg(r.message + (r.approved_images ? ` · ${r.approved_images}장 승인됨` : ''), !r.accepted)
+                } catch (e) {
+                  setMsg(`배치 판정 실패: ${e.message} · 배치가 바뀌었다면 취소 후 새 계획을 만드세요`, true)
+                }
               }} />
           )}
+
+          <TrainPanel trainInfo={trainInfo} approved={approved} pid={project.id} onMsg={setMsg}
+            modelRefreshKey={modelRevision}
+            onModelChange={async () => {
+              setTrainInfo(await api.trainStatus(project.id))
+              setModelRevision((revision) => revision + 1)
+            }}
+            onTrigger={async () => {
+              setTrainInfo({ ...trainInfo, job: await api.triggerTrain(project.id) })
+            }} />
 
           {/* 설정·도구는 접힌다. 예전엔 이게 전부 펼쳐진 채 이미지 목록 위에
               쌓여 있어서 좌측 패널이 10화면 높이가 됐고, 정작 라벨링에 매번
               쓰는 이미지 목록은 화면 밖에서 시작했다. */}
-          <button className="setup-toggle" onClick={() => setSetupOpen(!setupOpen)}>
+          <button className="setup-toggle" aria-expanded={setupOpen} aria-controls="setup-tools"
+            onClick={() => setSetupOpen(!setupOpen)}>
             <span>{setupOpen ? '▾' : '▸'} 설정 · 도구</span>
-            <small>클래스 · 업로드 · 오토라벨 · 익스포트 · 학습</small>
+            <small>클래스 · 업로드 · 오토라벨 · 익스포트</small>
           </button>
           {setupOpen && (
-            <div className="setup-body">
+            <div className="setup-body" id="setup-tools">
           <OntologyEditor project={project} setProject={setProject} />
           <UploadBox project={project} onMsg={setMsg}
             onUploaded={async () => setImages(await api.listImages(project.id))} />
           <VideoUpload project={project} onMsg={setMsg}
             onDone={async () => setImages(await api.listImages(project.id))} />
-          <LinkImport project={project} setProject={setProject} onMsg={setMsg}
+          <LinkImport project={project} onMsg={setMsg}
             onDone={async () => setImages(await api.listImages(project.id))} />
           <PromptLab project={project} setProject={setProject} onMsg={setMsg}
             hasImages={images.length > 0} />
@@ -529,7 +601,10 @@ export default function App() {
                 onClick={async () => {
                   if (!project.ontology.length) return setMsg('클래스를 먼저 정의하세요')
                   try {
-                    const j = await api.autolabelBatch(project.id, { masks: false })
+                    const j = await api.autolabelBatch(project.id, {
+                      masks: false,
+                      profile: trainInfo.active_model && recallMode ? 'recall' : 'balanced',
+                    })
                     setJob(j)
                     if (j.status !== 'running') setMsg(j.advice || '실행할 이미지가 없습니다')
                   } catch (e) { setMsg(`배치 시작 실패: ${e.message}`) }
@@ -557,33 +632,46 @@ export default function App() {
                   onClick={async () => {
                     const next = project.ontology.map((c) => {
                       const t = lastQa.recommended_thresholds[c.name]
-                      return t?.tau != null ? { ...c, threshold: t.tau } : c
+                      return t?.tau != null ? {
+                        ...c,
+                        threshold: t.tau,
+                        approval_threshold: t.tau,
+                        approval_precision: t.precision,
+                        approval_support: t.support,
+                        approval_source: 'qa_val',
+                        approval_model_id: lastQa.model_id,
+                      } : c
                     })
                     await api.saveOntology(project.id, next)
                     setProject({ ...project, ontology: next })
-                    setMsg('권장 임계값 적용됨 — 다음 오토라벨부터 반영')
-                  }}>✓ 권장 임계값 적용</button>
+                    setMsg('QA 검증 임계값 적용됨 — 다음 오토라벨과 검증 모델 자동 승인에 반영')
+                  }}>✓ QA 임계값 적용</button>
               </div>
             )}
             <div className="row">
-              <button className="ok" title="모든 박스가 임계값 이상인 리뷰 대기 이미지를 한 번에 승인합니다"
+              <button className="ok" title="홀드아웃 검증 모델이 예측하고 QA에서 클래스별 정밀도 95%를 확인한 초안만 승인합니다"
                 onClick={async () => {
                   const dry = await api.autoApprove(project.id, { min_conf: 0.7, dry_run: true })
-                  if (!dry.approved) return setMsg(`자동 승인 대상 없음 (대기 ${dry.pending}장)`)
-                  if (!confirm(`리뷰 대기 ${dry.pending}장 중 ${dry.approved}장이 고신뢰(≥0.7)입니다. 승인할까요?\n(저신뢰 ${dry.skipped_low_confidence}장은 남겨둡니다)`)) return
+                  if (!dry.approved) return setMsg(
+                    dry.blocked_reason || `자동 승인 대상 없음 (대기 ${dry.pending}장)`, true)
+                  if (!confirm(
+                    `리뷰 대기 ${dry.pending}장 중 검증 조건을 통과한 ${dry.approved}장을 승인할까요?\n` +
+                    `(저신뢰 ${dry.skipped_low_confidence}장 · 미검증 ${dry.skipped_unsafe_model}장 · 미캘리브레이션 ${dry.skipped_uncalibrated}장은 남깁니다)`
+                  )) return
                   const r = await api.autoApprove(project.id, { min_conf: 0.7 })
                   setImages(await api.listImages(project.id))
-                  setMsg(`${r.approved}장 자동 승인 (커버리지 ${(r.coverage * 100).toFixed(0)}%) — 나머지만 리뷰하세요`)
-                }}>⚡ 고신뢰 자동 승인</button>
+                  setMsg(`${r.approved}장 검증 자동 승인 (커버리지 ${(r.coverage * 100).toFixed(0)}%) — 나머지만 직접 리뷰하세요`)
+                }}>⚡ 검증 모델 자동 승인</button>
               <button title="전수 검사 대신 통계적으로 필요한 만큼만 검사해 배치를 승인합니다"
                 onClick={async () => {
                   const p = await api.acceptancePlan(project.id)
                   if (!p.sample_size) return setMsg('리뷰 대기 이미지 없음')
                   setSampling(p)
-                  setFilter('prelabeled')
+                  const first = images.find((im) => im.id === p.sample_image_ids?.[0])
+                  if (first) await openImage(first)
                   setMsg(`검수 계획: ${p.lot_size}장 중 ${p.sample_size}장만 검사 ` +
                     `(불량 ${p.max_defects}개까지 허용, 검수 ${(p.saving * 100).toFixed(0)}% 절감). ` +
-                    `표본을 확인한 뒤 결과를 입력하세요`)
+                    `표본만 표시했습니다. 각 장을 정상/오류로 판정하세요`)
                 }}>📊 배치 검수</button>
               <button title="모델이 헷갈리는 이미지를 먼저 보여줍니다 (라벨 예산 최적화)"
                 onClick={async () => {
@@ -604,20 +692,13 @@ export default function App() {
                 <a href={api.modelUrl(project.id)}>
                   <button title="현재 활성 전용 모델 가중치 (.pt) — 다른 곳에서 바로 추론 가능">모델 .pt</button></a>
               )}
-              <a href={`/api/projects/${project.id}/colab-notebook`}>
-                <button title="로컬로 감당 안 되는 대규모 학습용 — Colab 노트북을 받아 GPU에서 학습 후 .pt를 다시 등록">
-                  ☁ Colab 학습
-                </button></a>
             </div>
           </div>
-          <TrainPanel trainInfo={trainInfo} approved={approved} pid={project.id} onMsg={setMsg}
-            onTrigger={async () => {
-            setTrainInfo({ ...trainInfo, job: await api.triggerTrain(project.id) })
-          }} />
             </div>
           )}
           <ImageList
             visible={visible} current={current} onOpen={openImage}
+            sampleMode={!!sampling}
             filter={filter} setFilter={setFilter}
             sortMode={sortMode} setSortMode={setSortMode}
             onDelete={async (im) => {
@@ -661,6 +742,13 @@ export default function App() {
               <button className={tool === 'sam' ? 'active' : ''} onClick={() => setTool('sam')} title="클릭으로 마스크 (M)">✦ SAM</button>
               <button className={tool === 'ex' ? 'active' : ''} onClick={() => setTool('ex')} title="예시 박스 → 유사 객체 전부 (E)">≡ 예시</button>
             </div>
+            {trainInfo.active_model && (
+              <button className={recallMode ? 'active' : ''}
+                title="낮은 후보 임계값(0.10)+증강 추론으로 누락을 줄입니다. 후보와 검수량은 늘고 속도는 느려집니다. 자동 승인 기준은 바뀌지 않습니다."
+                onClick={() => setRecallMode((v) => !v)}>
+                {recallMode ? '◎ 누락 최소화 ON' : '○ 누락 최소화'}
+              </button>
+            )}
             <button onClick={async () => {
               if (!current) return
               // 추론은 수 초 걸리고 그 사이 →로 이미지를 넘기는 게 리뷰의 기본
@@ -669,13 +757,23 @@ export default function App() {
               // 이미지가 그대로일 때만 반영한다.
               const iid = current.id
               setMsg('오토라벨 중…')
-              const r = await api.autolabelOne(iid, project.ontology)
+              const r = await api.autolabelOne(iid, project.ontology, {
+                profile: trainInfo.active_model && recallMode ? 'recall' : 'balanced',
+              })
               if (currentRef.current?.id !== iid) {
                 return setMsg('이미지를 이동해 오토라벨 결과를 버렸습니다 — 그 이미지에서 다시 실행하세요', true)
               }
-              setAnnsDirty([...annsRef.current, ...r.detections.map((d, i) => ({
-                ...d, _key: `auto-${Date.now()}-${i}`, source: 'model' }))])
-              setMsg(`오토라벨 ${r.detections.length}개 (${r.engine.split('(')[0]})`)
+              const merged = mergeAutolabelDrafts(
+                annsRef.current,
+                r.detections.map((d, i) => ({
+                  ...d, _key: `auto-${Date.now()}-${i}`, source: 'model',
+                })))
+              setAnnsDirty(merged.annotations)
+              const note = [
+                merged.replaced ? `기존 초안 ${merged.replaced}개 교체` : '',
+                merged.suppressed ? `사람 라벨 중복 ${merged.suppressed}개 억제` : '',
+              ].filter(Boolean).join(' · ')
+              setMsg(`오토라벨 ${r.detections.length - merged.suppressed}개 (${r.engine.split('(')[0]})${note ? ` · ${note}` : ''}`)
             }}>이 이미지 오토라벨</button>
             {trainInfo.active_model && (
               <button title="전용 모델이 찾았는데 라벨에 없는 박스를 점선으로 보여줍니다 (누락 라벨 찾기)"
@@ -693,8 +791,10 @@ export default function App() {
                     : '누락 의심 없음 — 라벨이 모델과 일치합니다')
                 }}>🔍 누락 찾기</button>
             )}
-            <button className="ok" onClick={() => setStatus('approved')} title="승인 후 다음 (A)">✓ 승인</button>
-            <button className="bad" onClick={() => setStatus('rejected')} title="거부 후 다음 (X)">✗ 거부</button>
+            <button className="ok" disabled={!!sampling} onClick={() => setStatus('approved')}
+              title={sampling ? '표본 검수 중에는 왼쪽의 정상/오류 판정을 사용하세요' : '승인 후 다음 (A)'}>✓ 승인</button>
+            <button className="bad" disabled={!!sampling} onClick={() => setStatus('rejected')}
+              title={sampling ? '표본 검수 중에는 왼쪽의 정상/오류 판정을 사용하세요' : '거부 후 다음 (X)'}>✗ 거부</button>
           </div>
 
           <div className="toolhint">
@@ -758,7 +858,8 @@ export default function App() {
       </div>
 
       {toast && (
-        <div className={`toast${toast.sticky ? ' sticky' : ''}`}>
+        <div className={`toast${toast.sticky ? ' sticky' : ''}`} role="status"
+          aria-live="polite" aria-atomic="true">
           <span>{toast.text}</span>
           {toast.sticky && <button className="x" title="닫기" onClick={() => setToast(null)}>×</button>}
         </div>
@@ -769,6 +870,16 @@ export default function App() {
 }
 
 const MIN_APPROVED = 8
+
+const TRAIN_PHASES = {
+  starting: '학습 준비', export: '데이터 분할·내보내기', training: '모델 학습',
+  validation: 'validation 검증', holdout: 'holdout 검증', gating: '기존 모델 비교',
+  completed: '적용 결정',
+}
+
+function trainingPhaseLabel(phase) {
+  return TRAIN_PHASES[phase] || '상태 확인 중'
+}
 
 // 심판 결과 한 줄 요약 — 라벨 오류율과 다음 행동
 function qaSummary(r) {
@@ -788,6 +899,7 @@ function NextStep({ project, images, trainInfo, job, onAutolabel }) {
   const labeled = images.filter((im) => im.ann_count > 0).length
   const pending = images.filter((im) => im.status === 'prelabeled').length
   const model = trainInfo.active_model
+  const quality = model ? modelQuality(model) : null
   const training = trainInfo.job?.status === 'running'
 
   let step
@@ -802,23 +914,94 @@ function NextStep({ project, images, trainInfo, job, onAutolabel }) {
   else if (pending)
     step = { n: 4, title: `리뷰 ${pending}장 남음`, desc: '맞으면 A(승인), 틀리면 고친 뒤 A. 필요 없으면 X(거부)' }
   else if (training)
-    step = { n: 5, title: '전용 모델 학습 중…', desc: `${trainInfo.job.phase} — 끝나면 오토라벨이 더 정확해집니다` }
+    step = { n: 5, title: `전용 모델 학습 중${trainInfo.job.epoch ? ` · ${trainInfo.job.epoch}/${trainInfo.job.epochs} epoch` : '…'}`,
+      desc: `${trainingPhaseLabel(trainInfo.job.phase)} — 학습센터에서 진행률과 남은 시간을 확인하세요` }
   else if (approved < MIN_APPROVED)
     step = { n: 5, title: `전용 모델까지 승인 ${approved}/${MIN_APPROVED}장`, desc: `${MIN_APPROVED - approved}장 더 승인하면 자동으로 학습이 시작됩니다` }
   else if (!model)
     step = { n: 5, title: '학습 준비 완료', desc: '"지금 학습"을 누르거나 승인을 더 쌓으세요' }
+  else if (!quality.usable)
+    step = { n: 5, title: `활성 모델 ${quality.label}`, desc: '학습센터에서 성능표가 포함된 Colab 결과를 가져오고 검증된 후보를 적용하세요' }
   else
-    step = { n: 6, title: `전용 모델 가동 중 (mAP50 ${model.map50?.toFixed(2)})`, desc: '이미지를 더 넣고 오토라벨 → 리뷰를 반복하면 정확도가 계속 올라갑니다' }
+    step = { n: 6, title: `${quality.label} 가동 중 (mAP50 ${model.map50?.toFixed(2) ?? '—'})`, desc: '이미지를 더 넣고 오토라벨 → 리뷰를 반복하면 정확도가 계속 올라갑니다' }
 
   return (
     <div className="nextstep">
       <div className="ns-head">지금 할 일 · {step.n}단계</div>
       <div className="ns-title">{step.title}</div>
       <div className="ns-desc">{step.desc}</div>
+      {job?.status === 'completed' && job.ensemble_pilot?.images > 0 && (
+        <div className={`ensemble-pilot-result ${job.ensemble_pilot.decision}`}>
+          <b>초기 {job.ensemble_pilot.images}장 교차 시험</b>
+          <span>{job.ensemble_pilot.decision === 'ensemble'
+            ? 'SAM3·GDINO 합의가 확인되어 두 모델을 계속 사용했습니다.'
+            : '합의가 낮아 나머지는 SAM3로 자동 전환했습니다.'}</span>
+        </div>
+      )}
       {step.action && (
         <button className="primary" style={{ marginTop: 8, width: '100%' }}
           onClick={step.action.fn}>{step.action.label}</button>
       )}
+    </div>
+  )
+}
+
+const FOUNDATION_LABELS = {
+  comparing: ['비교 중', 'neutral'],
+  sam3: ['SAM3', 'sam3'],
+  gdino: ['GDINO', 'gdino'],
+  ensemble: ['둘 함께', 'ensemble'],
+}
+
+function FoundationProfile({ projectId, approved, jobStatus }) {
+  const [profile, setProfile] = useState(null)
+
+  useEffect(() => {
+    let cancelled = false
+    api.foundationProfile(projectId)
+      .then((result) => { if (!cancelled) setProfile(result) })
+      .catch(() => { if (!cancelled) setProfile(null) })
+    return () => { cancelled = true }
+  }, [projectId, approved, jobStatus])
+
+  if (!profile) return null
+  const ready = profile.status === 'ready'
+  const baseReviewed = Math.min(profile.reviewed_images, profile.required_images)
+  const reviewLabel = profile.reviewed_images > profile.required_images
+    ? `기본 ${baseReviewed}/${profile.required_images}장 · 누적 ${profile.reviewed_images}장`
+    : `기본 ${baseReviewed}/${profile.required_images}장`
+  return (
+    <div className={`card foundation-profile ${profile.status}`}>
+      <div className="foundation-head">
+        <b>초기 엔진 학습</b>
+        <span>{reviewLabel}</span>
+      </div>
+      <div className="progress mini" aria-label={`기본 교차 검수 ${baseReviewed}/${profile.required_images}장`}>
+        <div className="progress-fill" style={{
+          width: `${Math.min(100, profile.reviewed_images / profile.required_images * 100)}%`,
+        }} />
+      </div>
+      <p className="foundation-guide">
+        {ready
+          ? '다음 배치부터 클래스별로 검수 작업이 적었던 엔진을 자동 사용합니다.'
+          : profile.remaining_images
+            ? `교차 시험 후보를 고쳐 승인하세요. ${profile.remaining_images}장 더 보면 자동 선택합니다.`
+            : '정답 객체가 적은 클래스는 표본을 더 승인하는 동안 계속 비교합니다.'}
+      </p>
+      {profile.reviewed_images > 0 && (
+        <div className="foundation-classes">
+          {profile.classes.map((item) => {
+            const [label, tone] = FOUNDATION_LABELS[item.selection] || FOUNDATION_LABELS.comparing
+            return (
+              <div className="foundation-class" key={item.name}>
+                <span title={`정답 객체 ${item.support}개`}>{item.name}</span>
+                <b className={`foundation-choice ${tone}`}>{label}</b>
+              </div>
+            )
+          })}
+        </div>
+      )}
+      <small>기준: 오검출 삭제 1 · 누락 새로 그리기 3</small>
     </div>
   )
 }
@@ -835,6 +1018,12 @@ function AnnPanel({ anns, ontology, selectedId, setSelectedId, hoverId, setHover
     setHidden(next)
   }
   const shown = anns.filter((a) => !hidden.has(a.class_name))
+  const ensemble = ensembleReviewSummary(anns)
+  const ensembleUi = {
+    consensus: { label: '둘 합의', title: 'SAM3와 Grounding DINO가 같은 클래스·객체로 합의' },
+    sam3_only: { label: 'S만', title: 'SAM3만 찾은 후보 — 우선 검수' },
+    gdino_only: { label: 'G만', title: 'Grounding DINO만 찾은 후보 — 우선 검수' },
+  }
   // 캔버스에서 박스를 클릭하면 패널의 해당 행으로 스크롤
   useEffect(() => {
     if (!selectedId || !listRef.current) return
@@ -862,6 +1051,13 @@ function AnnPanel({ anns, ontology, selectedId, setSelectedId, hoverId, setHover
           </div>
         </>
       )}
+      {ensemble.total > 0 && (
+        <div className="ensemble-review-summary" role="status">
+          <div><span className="ensemble-chip consensus">둘 합의 {ensemble.consensus}</span>
+            <span className="ensemble-chip solo">단독 {ensemble.reviewFirst}</span></div>
+          <small>{ensemble.reviewFirst ? '단독 후보가 목록 앞쪽입니다 · 먼저 수정·삭제하세요' : '두 모델이 모든 후보에 합의했습니다 · 표본 확인은 필요합니다'}</small>
+        </div>
+      )}
       {anns.length === 0 && <div className="hint">아직 없음 — 오토라벨 또는 드래그로 시작</div>}
       {shown.map((a, i) => (
         <div key={a._key} data-key={a._key}
@@ -881,6 +1077,12 @@ function AnnPanel({ anns, ontology, selectedId, setSelectedId, hoverId, setHover
             {ontology.map((c) => <option key={c.name}>{c.name}</option>)}
           </select>
           <small>{a.confidence != null ? a.confidence.toFixed(2) : ''} {a.source === 'model' ? '🤖' : '✍️'}{a.segmentation ? ' ▦' : ''}</small>
+          {a.meta?.ensemble?.agreement && (
+            <span className={`ensemble-chip row ${a.meta.ensemble.agreement}`}
+              title={ensembleUi[a.meta.ensemble.agreement]?.title || '앙상블 후보'}>
+              {ensembleUi[a.meta.ensemble.agreement]?.label || '후보'}
+            </span>
+          )}
           {a.meta?.vlm && (
             <span className={`vchip ${a.meta.vlm.verdict}`}
               title={`문맥 심판: ${a.meta.vlm.reason}`}>
@@ -895,6 +1097,27 @@ function AnnPanel({ anns, ontology, selectedId, setSelectedId, hoverId, setHover
 }
 
 function HelpOverlay({ onClose }) {
+  const dialogRef = useRef(null)
+  const returnFocus = useRef(document.activeElement)
+  useEffect(() => {
+    const dialog = dialogRef.current
+    const focusTarget = returnFocus.current
+    dialog?.focus()
+    const trap = (e) => {
+      if (e.key !== 'Tab' || !dialog) return
+      const focusable = [...dialog.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+        .filter((el) => !el.disabled)
+      if (!focusable.length) return
+      const first = focusable[0], last = focusable[focusable.length - 1]
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+    }
+    dialog?.addEventListener('keydown', trap)
+    return () => {
+      dialog?.removeEventListener('keydown', trap)
+      focusTarget?.focus?.()
+    }
+  }, [])
   const keys = [
     ['A / X', '승인 / 거부 후 다음 이미지'], ['← →', '이미지 이동'],
     ['B / M / E', '박스 / SAM 클릭 / 예시 찾기'], ['1~9', '클래스 선택 (박스 선택 중이면 재할당)'],
@@ -907,8 +1130,9 @@ function HelpOverlay({ onClose }) {
   ]
   return (
     <div className="overlay" onClick={onClose}>
-      <div className="help" onClick={(e) => e.stopPropagation()}>
-        <div className="panel-title">단축키</div>
+      <div className="help" role="dialog" aria-modal="true" aria-labelledby="help-title"
+        tabIndex={-1} ref={dialogRef} onClick={(e) => e.stopPropagation()}>
+        <div className="panel-title" id="help-title">단축키</div>
         <table><tbody>
           {keys.map(([k, v]) => <tr key={k}><td><kbd>{k}</kbd></td><td>{v}</td></tr>)}
         </tbody></table>
@@ -956,14 +1180,58 @@ function ProjectPicker({ projects, onOpen, onDeleted }) {
 
 function OntologyEditor({ project, setProject }) {
   const [rows, setRows] = useState(project.ontology)
+  const [state, setState] = useState('saved')
+  const rowsRef = useRef(project.ontology)
+  const dirtyRef = useRef(false)
+  const timerRef = useRef(null)
+  const saveQueue = useRef(Promise.resolve())
   // 임계값 적용·프롬프트 실험 등 에디터 밖에서 온톨로지가 바뀌면 로컬
   // 스냅샷도 따라간다 — 안 하면 다음 키 입력의 save가 이전 스냅샷 전체를
   // PUT해 그 변경을 조용히 되돌린다
-  useEffect(() => { setRows(project.ontology) }, [project.ontology])
-  const save = async (next) => {
+  const persist = useCallback((snapshot) => {
+    setState('saving')
+    // 요청을 직렬화한다. 키 입력 A의 느린 응답이 더 최신 B를 나중에 덮는
+    // 온톨로지 전체 PUT 레이스를 막는다.
+    const run = saveQueue.current.catch(() => {}).then(
+      () => api.saveOntology(project.id, snapshot))
+    saveQueue.current = run
+    run.then(() => {
+      if (rowsRef.current === snapshot) {
+        dirtyRef.current = false
+        setState('saved')
+      }
+    }).catch(() => {
+      if (rowsRef.current === snapshot) setState('error')
+    })
+    return run
+  }, [project.id])
+  useEffect(() => {
+    rowsRef.current = project.ontology
+    dirtyRef.current = false
+    setRows(project.ontology)
+    setState('saved')
+    return () => {
+      clearTimeout(timerRef.current)
+      // 프로젝트를 즉시 나가도 마지막 편집을 직렬 큐 끝에 붙여 보낸다.
+      if (dirtyRef.current) {
+        const snapshot = rowsRef.current
+        saveQueue.current = saveQueue.current.catch(() => {}).then(
+          () => api.saveOntology(project.id, snapshot))
+      }
+    }
+  }, [project.id]) // eslint-disable-line
+  const update = (next) => {
+    rowsRef.current = next
+    dirtyRef.current = true
     setRows(next)
-    await api.saveOntology(project.id, next)
-    setProject({ ...project, ontology: next })
+    setProject((p) => ({ ...p, ontology: next }))
+    setState('dirty')
+    clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => persist(next), 500)
+  }
+  const save = () => {
+    clearTimeout(timerRef.current)
+    return persist(rowsRef.current)
   }
   return (
     <details open>
@@ -973,15 +1241,22 @@ function OntologyEditor({ project, setProject }) {
         <div className="row" key={i}>
           <i className="dot" style={{ background: classColor(rows, c.name) }} />
           <input style={{ width: 66 }} value={c.name} placeholder="클래스"
-            onChange={(e) => save(rows.map((r, j) => (j === i ? { ...r, name: e.target.value } : r)))} />
+            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, name: e.target.value } : r)))} />
           <input style={{ flex: 1, minWidth: 60 }} value={c.prompt} placeholder="프롬프트"
-            onChange={(e) => save(rows.map((r, j) => (j === i ? { ...r, prompt: e.target.value } : r)))} />
+            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, prompt: e.target.value } : r)))} />
           <input style={{ width: 58 }} type="number" step="0.05" min="0" max="1" value={c.threshold}
-            onChange={(e) => save(rows.map((r, j) => (j === i ? { ...r, threshold: +e.target.value } : r)))} />
-          <button className="x" onClick={() => save(rows.filter((_, j) => j !== i))}>×</button>
+            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, threshold: +e.target.value } : r)))} />
+          <button className="x" onClick={() => update(rows.filter((_, j) => j !== i))}>×</button>
         </div>
       ))}
-      <button onClick={() => save([...rows, { name: '', prompt: '', threshold: 0.35 }])}>+ 클래스</button>
+      <div className="row ontology-actions">
+        <button onClick={() => update([...rows, { name: '', prompt: '', threshold: 0.35 }])}>+ 클래스</button>
+        <button className={state === 'dirty' || state === 'error' ? 'primary' : ''}
+          disabled={state === 'saved' || state === 'saving'} onClick={save}>
+          {state === 'saving' ? '저장 중…' : state === 'saved' ? '저장됨' : '변경 저장'}
+        </button>
+        {state === 'error' && <small className="bad-text" role="alert">저장 실패 — 다시 시도하세요</small>}
+      </div>
     </details>
   )
 }
@@ -1013,12 +1288,14 @@ function UploadBox({ project, onUploaded, onMsg }) {
 // 이미 갈라졌다 (비디오만 idle 분기 누락). 종료 처리(onDone)만 각자 전달한다.
 // 새로 연 화면에서 버튼이 '실행' 대기로 보이면 진행 중인 작업을 이중 실행하거나
 // 죽은 줄 알기 때문에, 마운트 시 running이면 복원한다 (논블로킹).
-function useJob(projectId, fetchStatus, onFinish, interval = 1500) {
+function useJob(projectId, fetchStatus, onFinish, interval = 1500, restoreFinished = false) {
   const [job, setJob] = useState(null)
 
   useEffect(() => {
     setJob(null) // 프로젝트 전환 시 이전 프로젝트 잡 표시 제거
-    fetchStatus().then((s) => { if (s.status === 'running') setJob(s) }).catch(() => {})
+    fetchStatus().then((s) => {
+      if (s.status === 'running' || (restoreFinished && s.status !== 'idle')) setJob(s)
+    }).catch(() => {})
   }, [projectId]) // eslint-disable-line
 
   useEffect(() => {
@@ -1111,7 +1388,7 @@ function PromptLab({ project, setProject, onMsg, hasImages }) {
   if (!project.ontology.length) return null
   return (
     <div className="card">
-      <div className="panel-title" style={{ cursor: 'pointer' }} onClick={() => {
+      <button className="panel-title disclosure" aria-expanded={open} onClick={() => {
         setOpen(!open)
         if (!open && !text) {
           // 현재 프롬프트를 첫 줄에 두어 "지금보다 나은가"를 바로 볼 수 있게
@@ -1121,7 +1398,7 @@ function PromptLab({ project, setProject, onMsg, hasImages }) {
         }
       }}>
         {open ? '▾' : '▶'} 프롬프트 실험 (어떤 표현이 잘 잡히나)
-      </div>
+      </button>
       {open && (
         <>
           <p className="hint">
@@ -1227,7 +1504,7 @@ function VlmJudge({ project, setProject, onMsg, onDone }) {
 }
 
 // 대용량 데이터셋 연결 — 복사 없이 폴더 참조 + 기존 라벨 임포트
-function LinkImport({ project, setProject, onMsg, onDone }) {
+function LinkImport({ project, onMsg, onDone }) {
   const [open, setOpen] = useState(false)
   const [imagesDir, setImagesDir] = useState('')
   const [labelsDir, setLabelsDir] = useState('')
@@ -1291,90 +1568,394 @@ function LinkImport({ project, setProject, onMsg, onDone }) {
           {info.format === 'yolo' && <><br />YOLO 라벨은 <b>왼쪽 클래스 목록 순서</b>대로 id가 매핑됩니다 (0번=첫 클래스)</>}
         </div>
       )}
-      <ModelImport project={project} onMsg={onMsg} />
     </details>
   )
 }
 
-// 외부에서 학습한 .pt를 전용 모델로 등록
-function ModelImport({ project, onMsg }) {
+// Colab 결과를 후보로 검증한 뒤 사용자가 별도로 적용한다.
+function ModelImport({ pid, onMsg, onChanged }) {
   const [path, setPath] = useState('')
+  const [file, setFile] = useState(null)
+  const [candidate, setCandidate] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const quality = candidate
+    ? modelQuality({ meta: { quality_status: candidate.quality_status } }) : null
+  const classRows = rankedClassMetrics(candidate?.class_metrics)
+  const acceptCandidate = async (load) => {
+    setBusy(true)
+    try {
+      const result = await load()
+      setCandidate(result)
+      onMsg(`모델 후보 등록 · ${result.quality_reason}`, result.quality_status !== 'verified')
+      await onChanged?.()
+    } catch (e) { onMsg(`모델 가져오기 실패: ${e.message}`, true) }
+    finally { setBusy(false) }
+  }
   return (
-    <div style={{ marginTop: 10, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
-      <div className="hint">외부 학습 모델 등록 (.pt) — 클래스명은 자동 추출</div>
-      <div className="row">
-        <input placeholder="/path/to/best.pt" value={path}
-          onChange={(e) => setPath(e.target.value)} style={{ flex: 1, minWidth: 100 }} />
-        <button disabled={!path} onClick={async () => {
-          const r = await api.importModel(project.id, { path })
-          onMsg(r.names ? `모델 등록됨 · 클래스: ${r.names.join(', ')}` : '등록 실패')
-        }}>등록</button>
+    <div className="model-import">
+      <div className="model-import-title"><b>3. Colab 결과 가져오기</b><small>등록 후 검증 결과를 보고 적용합니다</small></div>
+      <div className="row model-file-row">
+        <input className="model-file-input" aria-label="Colab 모델 번들 파일" type="file"
+          accept=".zip,.pt" onChange={(e) => { setFile(e.target.files?.[0] || null); setCandidate(null) }} />
+        <button disabled={!file || busy}
+          onClick={() => acceptCandidate(() => api.importModelFile(pid, file))}>
+          {busy ? '검증 중…' : '선택 파일 검증'}</button>
       </div>
+      <div className="hint">Colab에서 받은 <code>autolabel-model.zip</code>을 선택하세요. 기존 .pt는 성능표가 없어 검증 필요 후보로만 등록됩니다.</div>
+      <details className="model-path-import">
+        <summary>로컬 경로 직접 입력</summary>
+        <div className="row">
+          <input aria-label="Colab 모델 번들 경로" placeholder="/Users/.../autolabel-model.zip"
+            value={path} onChange={(e) => { setPath(e.target.value); setCandidate(null) }} />
+          <button disabled={!path.trim() || busy}
+            onClick={() => acceptCandidate(() => api.importModel(pid, { path: path.trim() }))}>
+            경로 검증</button>
+        </div>
+      </details>
+      {candidate && (
+        <div className={`model-candidate model-${quality.tone}`} role="status">
+          <div className="model-candidate-head"><b>{quality.label}</b><span>후보 #{candidate.id}</span></div>
+          <div>{candidate.quality_reason}</div>
+          <div className="model-candidate-metrics">
+            <span>val mAP50 <b>{metric(candidate.metrics?.val_map50)}</b></span>
+            <span>test mAP50 <b>{metric(candidate.metrics?.test_map50)}</b></span>
+            <span>분할 <b>{candidate.split_counts?.train}/{candidate.split_counts?.val}/{candidate.split_counts?.test}</b></span>
+          </div>
+          {classRows.length > 0 && <div className="model-class-metrics">
+            <small>클래스별 test mAP50 · 낮은 순</small>
+            <div>{classRows.map((row) => <span key={row.name}
+              className={row.test_map50 < 0.1 ? 'weak' : ''}>
+              <b>{row.name}</b><strong>{metric(row.test_map50)}</strong>
+              <em>{row.test_instances}개 결함</em>
+            </span>)}</div>
+          </div>}
+          {quality.usable ? (
+            <button className="primary" disabled={candidate.active} onClick={async () => {
+              try {
+                await api.activateModel(pid, candidate.id)
+                setCandidate({ ...candidate, active: true })
+                await onChanged?.()
+                onMsg(`${quality.label} #${candidate.id}을 오토라벨에 적용했습니다`)
+              } catch (e) { onMsg(`모델 적용 실패: ${e.message}`, true) }
+            }}>{candidate.active ? '✓ 적용됨' : '이 후보를 오토라벨에 적용'}</button>
+          ) : <div className="model-blocked">적용 차단 · 라벨을 보강해 Colab 학습을 다시 실행하세요</div>}
+        </div>
+      )}
     </div>
   )
 }
 
-function TrainPanel({ trainInfo, onTrigger, approved = 0, pid, onMsg = () => {} }) {
-  const { job, active_model } = trainInfo
-  const running = job.status === 'running'
-  const pct = Math.min(100, (approved / MIN_APPROVED) * 100)
+const TRAIN_STEPS = ['데이터 준비', '모델 학습', '성능 검증', '기존 모델 비교', '적용 결정']
+
+function trainStepIndex(job) {
+  if (job.status === 'completed') return 4
+  if (['starting', 'export'].includes(job.phase)) return 0
+  if (job.phase === 'training') return 1
+  if (['validation', 'holdout'].includes(job.phase)) return 2
+  if (job.phase === 'gating') return 3
+  return 0
+}
+
+function trainOverallProgress(job) {
+  if (job.status === 'completed') return 100
+  if (job.phase === 'starting') return 2
+  if (job.phase === 'export') return 8
+  if (job.phase === 'training') return Math.round(10 + (job.progress || 0) * 62)
+  if (job.phase === 'validation') return 78
+  if (job.phase === 'holdout') return 86
+  if (job.phase === 'gating') return 94
+  return 0
+}
+
+function formatDuration(seconds) {
+  if (seconds == null) return '계산 중'
+  const sec = Math.max(0, Math.round(seconds))
+  if (sec < 60) return `${sec}초`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}분 ${sec % 60}초`
+  return `${Math.floor(min / 60)}시간 ${min % 60}분`
+}
+
+function metric(value) {
+  return value == null ? '—' : Number(value).toFixed(3)
+}
+
+function ModelImprovementCard({ model }) {
+  const plan = modelImprovementPlan(model)
+  if (!plan) return null
+  const titleId = `model-plan-${model.id || 'latest'}`
   return (
-    <div className="card">
-      <div className="panel-title">전용 모델 (내 데이터로 학습)</div>
-      <div className="hint">
-        {active_model
-          ? <>지금 이 모델이 오토라벨 담당 · mAP50 <b>{active_model.map50?.toFixed(3)}</b> · 승인 {active_model.train_images}장으로 학습</>
-          : <>승인 라벨이 <b>{MIN_APPROVED}장</b> 모이면 자동으로 학습이 시작됩니다 (현재 {approved}장)</>}
+    <section className={`model-prescription model-${plan.tone}`} aria-labelledby={titleId}>
+      <div className="model-prescription-head">
+        <div><small>최신 후보 #{model.id}</small><b id={titleId}>{plan.title}</b></div>
+        <span>{plan.actions.length ? `${plan.actions.length}개 조치` : '운영 검수 단계'}</span>
       </div>
-      {!active_model && (
-        <div className="progress mini"><div className="progress-fill" style={{ width: `${pct}%` }} />
-          <span>{approved}/{MIN_APPROVED}</span></div>
+      <p>{plan.summary}</p>
+      {plan.actions.length > 0 && (
+        <div className="model-prescription-actions">
+          {plan.actions.map((action) => (
+            <div key={`${action.className}-${action.kind}`} className={`prescription-action ${action.kind}`}>
+              <div className="prescription-action-head">
+                <b>{action.className}</b><span>{action.reason}</span>
+              </div>
+              <div className="prescription-target">
+                <strong>승인 라벨 {action.recommendedImages}장부터</strong>
+                {action.score != null && <small>test mAP50 {metric(action.score)}</small>}
+                {action.instances != null && <small>시험 결함 {action.instances}개</small>}
+              </div>
+              <p>{action.guidance}</p>
+            </div>
+          ))}
+        </div>
       )}
-      <div className="row">
-        <button disabled={running} onClick={onTrigger}
-          title="승인 라벨로 지금 즉시 학습합니다 (조건 미달이어도 강제 실행)">
-          {running ? `학습 중 (${job.phase || '…'})` : '지금 학습'}
-        </button>
-        {job.status === 'failed' && <small className="bad-text">실패: {job.error}</small>}
-        {job.status === 'completed' && (
-          <small className={job.promoted ? 'ok-text' : 'warn-text'}>
-            {job.promoted ? `승격 (mAP50 ${job.map50})` : `게이트 탈락 (${job.map50})`}
-          </small>
-        )}
-      </div>
-      <ModelHistory pid={pid} refreshKey={job.status} onMsg={onMsg} />
+      <div className="prescription-holdout"><b>평가 데이터 고정</b><span>{plan.holdoutNote}</span></div>
+      <div className="prescription-next"><span>다음 순서</span><b>{plan.nextStep}</b></div>
+      {plan.actions.length > 0 && <small className="prescription-disclaimer">권장 장수는 성능 보장값이 아닌 다음 실험의 시작량입니다.</small>}
+    </section>
+  )
+}
+
+function LatestModelDiagnosis({ pid, refreshKey }) {
+  const [latest, setLatest] = useState(undefined)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let alive = true
+    setFailed(false)
+    api.listModels(pid).then((models) => {
+      if (alive) setLatest(models[0] || null)
+    }).catch(() => { if (alive) setFailed(true) })
+    return () => { alive = false }
+  }, [pid, refreshKey])
+  if (failed) return <div className="warn-text model-plan-load">최신 모델 진단을 불러오지 못했습니다.</div>
+  if (latest === undefined) return <div className="model-plan-loading" aria-live="polite">최신 학습 결과 분석 중…</div>
+  if (latest === null) return (
+    <div className="model-plan-empty">
+      <b>첫 모델을 학습하면 다음 행동을 자동으로 안내합니다</b>
+      <span>클래스별 성능·시험 표본 수를 보고 보강 대상을 정합니다.</span>
     </div>
+  )
+  return <ModelImprovementCard model={latest} />
+}
+
+function TrainPanel({ trainInfo, onTrigger, approved = 0, pid, onMsg = () => {}, onModelChange, modelRefreshKey }) {
+  const { job = { status: 'idle' }, active_model } = trainInfo
+  const activeQuality = active_model ? modelQuality(active_model) : null
+  const running = job.status === 'running'
+  const [readiness, setReadiness] = useState(null)
+  const [readinessError, setReadinessError] = useState(false)
+  // 라벨 0장부터 전체 학습센터를 펼치면 이미지 목록이 화면 아래로 밀린다.
+  // 요약은 항상 보이되, 실제 학습 가능 시점이나 주의가 필요한 작업에서 연다.
+  const [open, setOpen] = useState(false)
+
+  useEffect(() => setOpen(false), [pid])
+
+  useEffect(() => {
+    let alive = true
+    setReadiness(null)
+    setReadinessError(false)
+    api.trainReadiness(pid).then((r) => { if (alive) setReadiness(r) })
+      .catch(() => { if (alive) setReadinessError(true) })
+    return () => { alive = false }
+  }, [pid, approved, job.status])
+
+  useEffect(() => {
+    if (running || job.status === 'failed' || job.status === 'completed'
+      || (!active_model && readiness?.ready_manual)) {
+      setOpen(true)
+    }
+  }, [running, job.status, active_model, readiness?.ready_manual])
+
+  const ready = readiness || {
+    approved, min_manual: 4, min_auto: MIN_APPROVED, next_auto_at: MIN_APPROVED,
+    remaining_auto: Math.max(0, MIN_APPROVED - approved), ready_manual: approved >= 4,
+    recommended_arch: approved < 800 ? 'yolo11n' : 'yolo11s', expected_epochs: approved < 100 ? 60 : 100,
+    split_counts: { train: approved, val: 0, test: 0 }, class_count: 0,
+    stage: approved >= 4 ? 'experiment' : 'collecting', professional_ready: false, warnings: [],
+  }
+  const currentStep = trainStepIndex(job)
+  const overall = trainOverallProgress(job)
+  const nowSec = Date.now() / 1000
+  const liveElapsed = running && job.started_at ? nowSec - job.started_at : job.elapsed_sec
+  const liveEta = job.eta_sec == null ? null
+    : Math.max(0, job.eta_sec - (running && job.updated_at ? nowSec - job.updated_at : 0))
+  const statusTone = job.status === 'failed' ? 'bad' : running ? 'running'
+    : job.status === 'completed' ? (job.promoted ? 'ok' : 'warn')
+      : active_model ? activeQuality.tone : 'idle'
+  const summary = running
+    ? `${trainingPhaseLabel(job.phase)}${job.epoch ? ` · ${job.epoch}/${job.epochs} epoch` : ''}`
+    : job.status === 'failed' ? '학습 실패 · 확인 필요'
+      : job.status === 'completed' ? (job.promoted ? '새 모델 적용 완료' : '기존 모델 유지')
+        : active_model
+          ? (activeQuality.status === 'verified' ? '검증된 전용 모델 가동 중'
+            : activeQuality.status === 'provisional' ? '실험 모델 가동 중'
+              : activeQuality.status === 'failed' ? '품질 미달 모델 사용 중' : '모델 검증 필요')
+          : `${readinessLabel(ready)} · 승인 ${approved}장`
+
+  return (
+    <details className={`training-center card ${statusTone}`} open={open}
+      onToggle={(e) => setOpen(e.currentTarget.open)}>
+      <summary className="training-summary">
+        <span className={`train-status-dot ${statusTone}`} aria-hidden="true" />
+        <span className="training-summary-copy"><b>학습센터</b><small>{summary}</small></span>
+        <span className="training-chevron" aria-hidden="true">{open ? '▾' : '▸'}</span>
+      </summary>
+
+      <div className="training-body">
+        {running && (
+          <div className="train-live" aria-live="polite">
+            <div className="train-steps" aria-label="학습 진행 단계">
+              {TRAIN_STEPS.map((label, i) => (
+                <div key={label} className={`train-step ${i < currentStep ? 'done' : ''} ${i === currentStep ? 'current' : ''}`}>
+                  <span>{i < currentStep ? '✓' : i + 1}</span><small>{label}</small>
+                </div>
+              ))}
+            </div>
+            <div className="train-live-head">
+              <div><b>{trainingPhaseLabel(job.phase)}</b>
+                {job.phase === 'training' && <small>{job.epoch || 0}/{job.epochs || ready.expected_epochs} epoch</small>}
+              </div>
+              <b>{overall}%</b>
+            </div>
+            <div className="train-meter" role="progressbar" aria-label="전체 학습 진행률"
+              aria-valuemin="0" aria-valuemax="100" aria-valuenow={overall}>
+              <span style={{ width: `${overall}%` }} />
+            </div>
+            <div className="train-time">
+              <span>경과 <b>{formatDuration(liveElapsed)}</b></span>
+              <span>예상 남음 <b>{job.phase === 'training' ? formatDuration(liveEta) : '단계 전환 중'}</b></span>
+            </div>
+          </div>
+        )}
+
+        {!running && job.status === 'failed' && (
+          <div className="train-result failure" role="alert">
+            <b>{trainingPhaseLabel(job.phase)}에서 멈췄습니다</b>
+            <span>{job.error || '학습 워커가 종료되었습니다. 데이터와 로그를 확인한 뒤 다시 시도하세요.'}</span>
+          </div>
+        )}
+
+        {!running && job.status === 'completed' && (
+          <div className={`train-result ${job.promoted ? 'success' : 'kept'}`}>
+            <b>{job.promoted ? '새 모델을 오토라벨에 적용했습니다' : '새 모델 대신 기존 모델을 유지했습니다'}</b>
+            <span>{job.promoted
+              ? '품질 하한과 기존 모델 비교를 통과했습니다.'
+              : '새 모델이 품질 하한 또는 기존 모델 비교를 넘지 못해 안전하게 교체하지 않았습니다.'}</span>
+            <div className="train-metrics">
+              <span>validation mAP50 <b>{metric(job.map50)}</b></span>
+              <span>holdout mAP50 <b>{metric(job.test_map50)}</b></span>
+              <span>운영 F1 <b>{metric(job.operational_f1)}</b></span>
+              <span>checkpoint <b>{job.checkpoint || '—'}.pt</b></span>
+            </div>
+          </div>
+        )}
+
+        {!running && (
+          <>
+            <div className="train-section-head"><b>학습 준비도</b><small>승인 라벨만 사용</small></div>
+            {readinessError && <div className="warn-text">준비도를 불러오지 못했습니다. 승인 수 기준으로 표시합니다.</div>}
+            <div className="train-readiness-grid">
+              <div><small>승인 데이터</small><b>{ready.approved}장</b></div>
+              <div><small>예상 분할</small><b>{ready.split_counts.train}/{ready.split_counts.val}/{ready.split_counts.test}</b>
+                <em>train / val / test</em></div>
+              <div><small>추천 설정</small><b>{ready.recommended_arch}</b><em>{ready.expected_epochs} epoch</em></div>
+              <div><small>현재 단계</small><b>{readinessLabel(ready)}</b>
+                <em>{ready.professional_ready ? '독립 평가 가능' : `전문 기준까지 ${ready.remaining_professional ?? '—'}장`}</em></div>
+            </div>
+            {(ready.warnings || []).length > 0 && (
+              <div className="train-warning-list" role="status">
+                {(ready.warnings || []).map((warning) => <div key={warning}>⚠ {warning}</div>)}
+              </div>
+            )}
+            {!ready.ready_manual && (
+              <div className="train-callout">수동 학습은 승인 <b>{ready.min_manual}장</b>부터 가능합니다. 안정적인 첫 학습은 <b>{ready.min_auto}장 이상</b>을 권장합니다.</div>
+            )}
+            {active_model && (
+              <div className={`active-model-line model-${activeQuality.tone}`}>
+                <span>현재 오토라벨 모델 · {activeQuality.label}</span>
+                <b>mAP50 {metric(active_model.map50)}</b>
+                {active_model.meta?.operational_f1 != null && <b>운영 F1 {metric(active_model.meta.operational_f1)}</b>}
+                <small>승인 {active_model.train_images}장 · {active_model.meta?.checkpoint || 'best'}.pt</small>
+                {active_model.meta?.quality_reason && <small className="model-quality-reason">{active_model.meta.quality_reason}</small>}
+              </div>
+            )}
+          </>
+        )}
+
+        {!running && <LatestModelDiagnosis pid={pid}
+          refreshKey={`${job.status}:${modelRefreshKey}`} />}
+
+        <div className="train-actions">
+          <button className="primary" disabled={running || !ready.ready_manual} onClick={onTrigger}
+            title={ready.ready_manual ? '현재 승인 라벨로 로컬 학습을 시작합니다' : `승인 ${ready.min_manual}장부터 학습할 수 있습니다`}>
+            {running ? '학습 진행 중…' : job.status === 'failed' ? '로컬 학습 다시 시도' : '로컬 학습 시작'}
+          </button>
+          {!running && ready.ready_manual && <small>Mac GPU(MPS) 사용 · 화면을 닫아도 계속 진행</small>}
+        </div>
+
+        <details className="cloud-train">
+          <summary>Colab GPU 학습 · 결과 적용</summary>
+          <ol>
+            <li><a href={api.trainingDatasetUrl(pid)}>1. 승인 학습 데이터.zip</a></li>
+            <li><a href={api.colabNotebookUrl(pid)}>2. Colab 노트북.ipynb</a> · T4에서 모두 실행</li>
+            <li>마지막에 받은 <code>autolabel-model.zip</code>을 아래에서 검증·적용</li>
+          </ol>
+          <div className="hint">노트북 설정은 위 추천 epoch와 자동으로 맞습니다. test가 부족하면 실험 모델로 표시되고 자동 적용되지 않습니다.</div>
+          <ModelImport pid={pid} onMsg={onMsg} onChanged={onModelChange} />
+        </details>
+        <ModelHistory pid={pid} refreshKey={`${job.status}:${modelRefreshKey}`}
+          onMsg={onMsg} onChanged={onModelChange} />
+      </div>
+    </details>
   )
 }
 
 // 통계적 배치 검수 — 표본만 보고 배치 전체를 판정
-function SamplingPanel({ plan, onSubmit, onClose }) {
-  const [defects, setDefects] = useState(0)
+function SamplingPanel({ plan, current, sampleImages, onOpen, onSubmit, onClose }) {
+  const [reviews, setReviews] = useState({})
+  const [busy, setBusy] = useState(false)
+  useEffect(() => { setReviews({}) }, [plan.lot_token])
+  const reviewed = Object.keys(reviews).length
+  const defects = Object.values(reviews).filter(Boolean).length
+  const complete = sampleImages.length === plan.sample_size && reviewed === plan.sample_size
+  const mark = (isDefect) => {
+    if (!current || !plan.sample_image_ids.includes(current.id)) return
+    const nextReviews = { ...reviews, [current.id]: isDefect }
+    setReviews(nextReviews)
+    const next = sampleImages.find((im) => !(im.id in nextReviews))
+    if (next) onOpen(next)
+  }
   return (
     <div className="card" style={{ borderColor: 'var(--accent)' }}>
       <div className="panel-title">📊 배치 검수 진행 중</div>
       <div className="hint">
         대기 <b>{plan.lot_size}</b>장 중 <b>{plan.sample_size}</b>장만 검사하면 됩니다
         (검수 {(plan.saving * 100).toFixed(0)}% 절감).<br />
-        표본을 보고 <b>라벨이 틀린 이미지 수</b>를 세어 입력하세요.
+        왼쪽 목록에는 <b>뽑힌 표본만</b> 표시됩니다. 현재 이미지의 라벨이 맞는지 판정하세요.
         불량 <b>{plan.max_defects}개 이하</b>면 배치 전체가 승인됩니다.
       </div>
-      <div className="row">
-        <input type="number" min="0" value={defects} style={{ width: 70 }}
-          onChange={(e) => setDefects(+e.target.value)} />
-        <button className="primary" onClick={() => onSubmit(defects)}>판정</button>
-        <button onClick={onClose}>취소</button>
+      <div className="sampling-progress" aria-live="polite">
+        판정 <b>{reviewed}/{plan.sample_size}</b> · 오류 <b>{defects}</b>
       </div>
-      <div className="hint">
-        표본 이미지 id: {plan.sample_image_ids?.slice(0, 12).join(', ')}
-        {plan.sample_image_ids?.length > 12 ? ' …' : ''}
+      {sampleImages.length !== plan.sample_size && (
+        <div className="bad-text">표본 일부를 찾을 수 없습니다. 취소 후 새 계획을 만드세요.</div>
+      )}
+      <div className="row">
+        <button className="ok" disabled={!current} onClick={() => mark(false)}>✓ 정상 · 다음</button>
+        <button className="bad" disabled={!current} onClick={() => mark(true)}>✗ 라벨 오류 · 다음</button>
+      </div>
+      <div className="row">
+        <button className="primary" disabled={!complete || busy} onClick={async () => {
+          setBusy(true)
+          try { await onSubmit(defects) } finally { setBusy(false) }
+        }}>{busy ? '판정 중…' : `배치 판정 (${defects}개 오류)`}</button>
+        <button onClick={onClose}>취소</button>
       </div>
     </div>
   )
 }
 
 // 학습 라운드별 성능 추이 + 롤백
-function ModelHistory({ pid, refreshKey, onMsg }) {
+function ModelHistory({ pid, refreshKey, onMsg, onChanged }) {
   const [models, setModels] = useState([])
   const [open, setOpen] = useState(false)
   useEffect(() => {
@@ -1391,8 +1972,9 @@ function ModelHistory({ pid, refreshKey, onMsg }) {
     <div style={{ marginTop: 8 }}>
       <div className="panel-title">학습 이력 ({models.length})</div>
       <div className="hint">막대 = 홀드아웃 성능(학습·게이트에 안 쓴 데이터 기준)</div>
-      {models.map((m) => (
-        <div key={m.id} className="row" style={{ fontSize: 12, gap: 8 }}>
+      {models.map((m) => {
+        const quality = modelQuality(m)
+        return <div key={m.id} className="row model-history-row">
           <div style={{ width: 56, height: 8, background: 'var(--bg3)', borderRadius: 4 }}>
             <div style={{ width: `${((m.test_map50 ?? m.map50 ?? 0) / best) * 100}%`,
               height: '100%', background: m.active ? 'var(--ok)' : '#4a5560',
@@ -1405,17 +1987,21 @@ function ModelHistory({ pid, refreshKey, onMsg }) {
             (val {m.map50?.toFixed(2) ?? '—'})
           </span>
           <span className="hint" style={{ margin: 0 }}>{m.train_images}장</span>
-          {m.meta?.imported && <span className="hint" style={{ margin: 0 }}>임포트</span>}
+          <span className={`model-quality-badge model-${quality.tone}`}>{quality.label}</span>
           {m.active
-            ? <span className="ok-text">● 사용 중</span>
-            : <button style={{ padding: '1px 6px', fontSize: 11 }}
+            ? <span className={quality.usable ? 'ok-text' : 'warn-text'}>● 사용 중</span>
+            : <button className="model-use" disabled={!quality.usable}
+                title={quality.usable ? '이 후보를 오토라벨 모델로 적용합니다' : (m.meta?.quality_reason || quality.label)}
                 onClick={async () => {
-                  await api.activateModel(pid, m.id)
-                  setModels(await api.listModels(pid))
-                  onMsg(`모델 #${m.id}로 전환 (홀드아웃 ${m.test_map50?.toFixed(3) ?? '—'})`)
-                }}>사용</button>}
+                  try {
+                    await api.activateModel(pid, m.id)
+                    setModels(await api.listModels(pid))
+                    await onChanged?.()
+                    onMsg(`모델 #${m.id}로 전환 (홀드아웃 ${m.test_map50?.toFixed(3) ?? '—'})`)
+                  } catch (e) { onMsg(`모델 적용 실패: ${e.message}`, true) }
+                }}>{quality.usable ? '사용' : '차단'}</button>}
         </div>
-      ))}
+      })}
       {curve.length >= 2 && (
         <div className="hint" style={{ marginTop: 6 }}>
           데이터 효율: {curve.map((m) => `${m.train_images}장→${m.test_map50.toFixed(2)}`).join(' · ')}
@@ -1440,7 +2026,7 @@ function ModelHistory({ pid, refreshKey, onMsg }) {
 const ROW_H = 54
 
 function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setSortMode,
-  onDelete, onBulk }) {
+  onDelete, onBulk, sampleMode = false }) {
   const badge = { unlabeled: '·', prelabeled: '◐', approved: '✓', rejected: '✗' }
   const pos = visible.findIndex((im) => im.id === current?.id)
 
@@ -1509,7 +2095,9 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
 
   return (
     <div className="imagelist">
-      <div className="row filters">
+      {sampleMode ? (
+        <div className="sample-banner"><b>검수 표본 {visible.length}장</b> · 목록 잠금</div>
+      ) : <div className="row filters">
         {/* 거부도 필터에 둔다 — 예전엔 '전체'에서만 보여 되살릴 방법이 없었다 */}
         {['all', 'prelabeled', 'approved', 'unlabeled', 'rejected', 'flagged'].map((f) => (
           <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}
@@ -1523,8 +2111,8 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
           onClick={() => setSortMode(sortMode === 'conf' ? 'none' : 'conf')} title="신뢰도 낮은 이미지 먼저">불확실</button>
         <button className={sortMode === 'qa' ? 'active' : ''}
           onClick={() => setSortMode(sortMode === 'qa' ? 'none' : 'qa')} title="모델과 라벨이 싸우는 이미지 먼저 (QA 분석 후)">의심</button>
-      </div>
-      {picked.size > 0 ? (
+      </div>}
+      {!sampleMode && picked.size > 0 ? (
         <div className="row bulkbar">
           <b>{picked.size}장 선택</b>
           <button className="ok" onClick={() => applyBulk('approved')}>✓ 일괄 승인</button>
@@ -1534,7 +2122,7 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
       ) : (
         <div className="hint">
           {pos >= 0 ? <b>{pos + 1} / {visible.length}</b> : `${visible.length}장`}
-          {' · ←→ 이동 · Shift/⌘+클릭 다중 선택'}
+          {sampleMode ? ' · ←→ 이동 · 위에서 정상/오류 판정' : ' · ←→ 이동 · Shift/⌘+클릭 다중 선택'}
         </div>
       )}
       {/* 스크롤러(div) 안에 전체 높이만큼의 ul을 두고 보이는 행만 절대 위치로
@@ -1547,8 +2135,15 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
           const i = start + wi
           return (
           <li key={im.id} style={{ top: i * ROW_H }}
+            role="button" tabIndex={0} aria-current={current?.id === im.id ? 'true' : undefined}
             className={`${current?.id === im.id ? 'active' : ''}${picked.has(im.id) ? ' picked' : ''}`}
-            onClick={(e) => onRowClick(im, i, e)}>
+            onClick={(e) => onRowClick(im, i, e)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                onRowClick(im, i, e)
+              }
+            }}>
             <img src={api.thumbUrl(im.id)} loading="lazy" alt="" width="44" height="44" />
             <div className="meta">
               <div className="name">{im.file_name}</div>
@@ -1560,8 +2155,8 @@ function ImageList({ visible, current, onOpen, filter, setFilter, sortMode, setS
                 {(im.vlm_flags ?? 0) > 0 ? <span className="vflag"> · 심판 ✗{im.vlm_flags}</span> : null}
               </small>
             </div>
-            <button className="x rowdel" title="이미지 삭제"
-              onClick={(e) => { e.stopPropagation(); onDelete(im) }}>×</button>
+            {!sampleMode && <button className="x rowdel" title="이미지 삭제"
+              onClick={(e) => { e.stopPropagation(); onDelete(im) }}>×</button>}
           </li>
           )
         })}

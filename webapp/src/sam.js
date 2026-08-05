@@ -1,17 +1,25 @@
 // SAM 브라우저 디코더 — Phase 0에서 검증된 패턴 이식.
 // 핵심 교훈 반영: 원본 크기 복원은 ONNX 그래프가 아니라 JS에서(세로 이미지 crop 버그 회피),
 // 이미지 전환 시 임베딩 무효화(레이스 차단).
-import * as ort from 'onnxruntime-web'
 import { api } from './api'
+
+export { maskToRLE, rleToMask } from './rle'
 
 // wasmPaths 미설정 — Vite 번들러 모드에서 ORT가 자체 경로로 wasm 로드 (버전 불일치·public 임포트 문제 회피)
 
 let session = null
+let ortRuntime = null
 let embedState = null // { imageId, tensor, origSize, scale }
 let loadSeq = 0
 
+const getOrt = async () => {
+  if (!ortRuntime) ortRuntime = await import('onnxruntime-web')
+  return ortRuntime
+}
+
 export async function loadDecoder() {
   if (!session) {
+    const ort = await getOrt()
     session = await ort.InferenceSession.create('/sam_decoder.onnx', {
       executionProviders: ['wasm'],
     })
@@ -30,6 +38,7 @@ export async function ensureEmbed(imageId) {
   embedState = null
   const j = await api.embed(imageId)
   if (seq !== loadSeq) return null // 그 사이 다른 이미지 로드 — 폐기
+  const ort = await getOrt()
   const bytes = Uint8Array.from(atob(j.embedding), (c) => c.charCodeAt(0))
   embedState = {
     imageId,
@@ -43,7 +52,7 @@ export async function ensureEmbed(imageId) {
 
 // points: [{x, y, label}] 이미지 픽셀 좌표. 반환: { mask: Uint8Array(W*H), iou }
 export async function decodeMask(imageId, points) {
-  const emb = await ensureEmbed(imageId)
+  const [emb, ort] = await Promise.all([ensureEmbed(imageId), getOrt()])
   if (!emb) return null
   await loadDecoder()
   const n = points.length
@@ -110,39 +119,6 @@ export function maskToBbox(mask, W, H) {
   }
   if (x2 < 0) return null
   return [x1, y1, x2 - x1 + 1, y2 - y1 + 1]
-}
-
-// 마스크 → COCO 비압축 RLE (Fortran/열 우선, 0부터 시작하는 교대 카운트)
-export function maskToRLE(mask, W, H) {
-  const counts = []
-  let cur = 0, run = 0
-  for (let x = 0; x < W; x++) {
-    for (let y = 0; y < H; y++) {
-      const v = mask[y * W + x]
-      if (v === cur) run++
-      else { counts.push(run); cur = v; run = 1 }
-    }
-  }
-  counts.push(run)
-  return { counts, size: [H, W] }
-}
-
-// COCO 비압축 RLE → 마스크 (기존 어노테이션 렌더용)
-export function rleToMask(rle) {
-  const [H, W] = rle.size
-  const m = new Uint8Array(W * H)
-  let cur = 0, pos = 0
-  for (const run of rle.counts) {
-    if (cur === 1) {
-      for (let k = 0; k < run; k++) {
-        const p = pos + k
-        m[(p % H) * W + Math.floor(p / H)] = 1
-      }
-    }
-    pos += run
-    cur = 1 - cur
-  }
-  return m
 }
 
 // 마스크 → 색칠된 오프스크린 캔버스 (Konva Image 소스)

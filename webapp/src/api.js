@@ -1,6 +1,10 @@
 // 백엔드 API 클라이언트 — vite proxy로 /api → :8899
-const j = (r) => {
-  if (!r.ok) throw new Error(`API ${r.status}`)
+const j = async (r) => {
+  if (!r.ok) {
+    let payload
+    try { payload = await r.json() } catch { /* 응답 본문이 없는 오류 */ }
+    throw new Error(payload?.detail || `API ${r.status}`)
+  }
   return r.json()
 }
 
@@ -48,11 +52,11 @@ export const api = {
       body: JSON.stringify({ status }),
     }).then(j),
   embed: (iid) => fetch(`/api/images/${iid}/embed`).then(j),
-  autolabelOne: (iid, ontology) =>
+  autolabelOne: (iid, ontology, opts = {}) =>
     fetch(`/api/images/${iid}/autolabel`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ontology, masks: false }),
+      body: JSON.stringify({ ontology, masks: false, ...opts }),
     }).then(j),
   autolabelBatch: (pid, opts = {}) =>
     fetch(`/api/projects/${pid}/autolabel`, {
@@ -61,6 +65,7 @@ export const api = {
       body: JSON.stringify(opts),
     }).then(j),
   autolabelStatus: (pid) => fetch(`/api/projects/${pid}/autolabel/status`).then(j),
+  foundationProfile: (pid) => fetch(`/api/projects/${pid}/foundation-profile`).then(j),
   saveRubric: (pid, rubric) =>
     fetch(`/api/projects/${pid}/rubric`, {
       method: 'PUT',
@@ -76,6 +81,8 @@ export const api = {
   vlmStatus: (pid) => fetch(`/api/projects/${pid}/vlm-judge/status`).then(j),
   capabilities: () => fetch('/api/capabilities').then(j),
   exportUrl: (pid, fmt) => `/api/projects/${pid}/export.zip?fmt=${fmt}`,
+  trainingDatasetUrl: (pid) => `/api/projects/${pid}/training-dataset.zip`,
+  colabNotebookUrl: (pid) => `/api/projects/${pid}/colab-notebook`,
   modelUrl: (pid) => `/api/projects/${pid}/model`,
   deleteImage: (iid) => fetch(`/api/images/${iid}`, { method: 'DELETE' }).then(j),
   deleteProject: (pid) => fetch(`/api/projects/${pid}`, { method: 'DELETE' }).then(j),
@@ -101,6 +108,13 @@ export const api = {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }).then(j),
+  importModelFile: (pid, file) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return fetch(`/api/projects/${pid}/models/import-upload`, {
+      method: 'POST', body: fd,
+    }).then(j)
+  },
   runQa: (pid, background = false) =>
     fetch(`/api/projects/${pid}/qa?background=${background}`, { method: 'POST' }).then(j),
   qaStatus: (pid) => fetch(`/api/projects/${pid}/qa/status`).then(j),
@@ -139,10 +153,12 @@ export const api = {
   nextToLabel: (pid, n = 20) =>
     fetch(`/api/projects/${pid}/next-to-label?n=${n}`).then(j),
   listModels: (pid) => fetch(`/api/projects/${pid}/models`).then(j),
-  activateModel: (pid, mid) =>
-    fetch(`/api/projects/${pid}/models/${mid}/activate`, { method: 'POST' }).then(j),
+  activateModel: (pid, mid, force = false) =>
+    fetch(`/api/projects/${pid}/models/${mid}/activate${force ? '?force=true' : ''}`,
+      { method: 'POST' }).then(j),
   triggerTrain: (pid) => fetch(`/api/projects/${pid}/train`, { method: 'POST' }).then(j),
   trainStatus: (pid) => fetch(`/api/projects/${pid}/train/status`).then(j),
+  trainReadiness: (pid) => fetch(`/api/projects/${pid}/train/readiness`).then(j),
 }
 
 export const PALETTE = [

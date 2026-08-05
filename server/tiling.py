@@ -42,6 +42,31 @@ def _iou(a, b):
     return inter / (aw * ah + bw * bh - inter + 1e-6)
 
 
+def _overlap(a, b):
+    """IoU와 양방향 포함률 중 최대 — 큰/작은 박스 중복도 잡는다."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    return max(_iou(a, b), inter / (aw * ah + 1e-6), inter / (bw * bh + 1e-6))
+
+
+def suppress_trusted_overlaps(dets: list[dict], trusted: list[dict],
+                              overlap_thr: float = 0.3) -> tuple[list[dict], int]:
+    """사람 라벨과 같은 클래스·같은 객체인 새 모델 초안을 억제한다.
+
+    서로 다른 클래스는 part/부모 또는 실제 중첩 객체일 수 있어 보존한다.
+    """
+    kept = [d for d in dets if all(
+        d.get("class_name") != t.get("class_name")
+        or _overlap(d["bbox"], t["bbox"]) < overlap_thr
+        for t in trusted)]
+    return kept, len(dets) - len(kept)
+
+
 def merge_nms(dets: list[dict], iou_thr: float = 0.5) -> list[dict]:
     """타일 경계에서 중복 검출된 박스를 합친다 (클래스별 NMS)."""
     out = []

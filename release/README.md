@@ -18,7 +18,10 @@ cp release/sam_decoder_vit_l.onnx webapp/public/sam_decoder.onnx
 **이 도구로 만든 전용 모델 예시.** PCB 결함 6종(open/short/mousebite/spur/copper/pinhole) 검출.
 
 - 학습: 승인 라벨 42장 (DeepPCB), YOLO11n, 로컬 MPS 약 12분
-- 골드 val mAP50 **0.738**, 홀드아웃 10장 mAP50 **0.593**
+- 학습 당시 골드 val mAP50 **0.738** · 현재 번들 홀드아웃 10장 재현값
+  mAP50 **0.571**(전체 PR, conf=0.001) / **0.333**(도구 운용 conf=0.30)
+- 도구의 **누락 최소화** 프로필(conf=0.10+TTA)은 같은 홀드아웃에서
+  mAP50 **0.482**, 후보 124개(GT 81개). 기본 43개보다 검수량은 늘지만 누락을 줄인다
 - 비교: 같은 데이터에서 Grounding DINO 제로샷은 사실상 검출 실패 (10장에 3개)
 
 제로샷이 통하지 않는 도메인에서 수십 장 시드로 실용 모델이 나온다는 증거물.
@@ -27,6 +30,12 @@ cp release/sam_decoder_vit_l.onnx webapp/public/sam_decoder.onnx
 ```python
 from ultralytics import YOLO
 YOLO("release/pcb_defect_yolo11n_map50_0.738.pt").predict("pcb.jpg", conf=0.4)
+```
+
+번들 DeepPCB 샘플로 수치를 다시 확인하려면:
+
+```bash
+.venv/bin/python scripts/eval_release_pcb.py
 ```
 
 라이선스 주의: YOLO11n 파생이므로 **AGPL-3.0**.

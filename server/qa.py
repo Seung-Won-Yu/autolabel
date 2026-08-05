@@ -186,6 +186,7 @@ def analyze(pid: int, progress: dict | None = None) -> dict:
     # 넣으면 같은 객체를 두 번 세어 오류율이 부풀려진다.
     est_rate = (n_mismatch + n_spurious) / max(n_labels, 1)
     return {
+        "model_id": student["id"],
         "images_analyzed": len(scored),
         "labels_checked": n_labels,
         "flagged_images": len(flagged),

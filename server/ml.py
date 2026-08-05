@@ -8,6 +8,7 @@ import io
 import os
 import threading
 import time
+from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -27,7 +28,12 @@ _lock = threading.Lock()
 _infer_lock = threading.Lock()
 _sam_predictor = None
 _dino = None
-_embed_cache: dict[str, dict] = {}
+try:
+    EMBED_CACHE_MAX = max(0, int(os.environ.get("AUTOLABEL_EMBED_CACHE_SIZE", "8")))
+except ValueError:
+    EMBED_CACHE_MAX = 8
+_embed_cache: OrderedDict[str, dict] = OrderedDict()
+_embed_cache_lock = threading.Lock()
 _current_key: str | None = None
 
 
@@ -71,17 +77,41 @@ def get_dino():
     return _dino
 
 
+def _embed_cache_get(key: str) -> dict | None:
+    with _embed_cache_lock:
+        hit = _embed_cache.get(key)
+        if hit is not None:
+            _embed_cache.move_to_end(key)
+        return hit
+
+
+def _embed_cache_put(key: str, value: dict) -> None:
+    """수백 장 리뷰가 수 GB RAM을 먹지 않도록 최근 임베딩만 보관한다."""
+    with _embed_cache_lock:
+        if EMBED_CACHE_MAX == 0:
+            return
+        _embed_cache[key] = value
+        _embed_cache.move_to_end(key)
+        while len(_embed_cache) > EMBED_CACHE_MAX:
+            _embed_cache.popitem(last=False)
+
+
 def embed_image(data: bytes) -> dict:
-    """SAM 임베딩 — 이미지 해시 캐시. 브라우저 디코더용."""
+    """SAM 임베딩 — 이미지 해시 기반 bounded LRU 캐시. 브라우저 디코더용."""
     global _current_key
     key = hashlib.sha256(data).hexdigest()
-    if key in _embed_cache:
-        return {**_embed_cache[key], "cached": True, "encode_ms": 0}
+    cached = _embed_cache_get(key)
+    if cached is not None:
+        return {**cached, "cached": True, "encode_ms": 0}
 
     image = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
     predictor = get_sam()
     t0 = time.perf_counter()
     with _infer_lock:
+        # 같은 이미지 요청이 동시에 들어왔으면 앞 요청이 잠금 안에서 계산했을 수 있다.
+        cached = _embed_cache_get(key)
+        if cached is not None:
+            return {**cached, "cached": True, "encode_ms": 0}
         predictor.set_image(image)
         _current_key = key
         emb = predictor.get_image_embedding().cpu().numpy().astype(np.float32)
@@ -92,7 +122,7 @@ def embed_image(data: bytes) -> dict:
         "shape": list(emb.shape),
         "orig_size": [image.shape[0], image.shape[1]],
     }
-    _embed_cache[key] = result
+    _embed_cache_put(key, result)
     return {**result, "cached": False, "encode_ms": encode_ms}
 
 
@@ -317,8 +347,14 @@ def detect_sam3(image: Image.Image, ontology: list[dict]) -> list[dict]:
 _students: dict[str, object] = {}
 
 
-def detect_student(image: Image.Image, model_row: dict, ontology: list[dict]) -> list[dict]:
-    """파인튜닝된 학생 모델(YOLO) 추론 — 활성 champion이 있으면 이쪽이 기본."""
+def detect_student(image: Image.Image, model_row: dict, ontology: list[dict],
+                   augment: bool = False) -> list[dict]:
+    """파인튜닝된 학생 모델(YOLO) 추론 — 활성 champion이 있으면 이쪽이 기본.
+
+    YOLO의 기본 conf=0.25를 그대로 두면 QA·회수율 모드에서 요청한 0.10 후보가
+    모델 내부에서 이미 사라진다. 가장 낮은 클래스 임계값을 추론기에도 넘기고,
+    최종 클래스별 필터는 아래에서 다시 적용한다.
+    """
     from ultralytics import YOLO
 
     path = model_row["path"]
@@ -326,7 +362,15 @@ def detect_student(image: Image.Image, model_row: dict, ontology: list[dict]) ->
         _students[path] = YOLO(path)
     names = model_row["meta"]["names"]
     thresholds = {c["name"]: float(c.get("threshold", 0.35)) for c in ontology}
-    result = _students[path].predict(image, device=DEVICE, verbose=False)[0]
+    # 전용 모델 confidence는 파운데이션 모델과 같은 척도가 아니다. val에서
+    # 산출한 모델별 F1 최적점이 있으면 사용자가 정한 상한 안에서 보정한다.
+    # (실측: AP 0.86인 best.pt가 confidence 0.01대라 기본 0.3에서 0건.)
+    calibrated = model_row.get("meta", {}).get("calibrated_thresholds", {})
+    thresholds = {name: min(value, float(calibrated.get(name, value)))
+                  for name, value in thresholds.items()}
+    candidate_conf = max(0.001, min(thresholds.values(), default=0.35))
+    result = _students[path].predict(
+        image, device=DEVICE, verbose=False, conf=candidate_conf, augment=augment)[0]
     detections = []
     for box in result.boxes:
         name = names[int(box.cls)]

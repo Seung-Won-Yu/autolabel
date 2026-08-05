@@ -9,24 +9,27 @@
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from server.db import get_db, row_to_dict
 
-import os as _os
-
-ROOT = Path(_os.environ.get("AUTOLABEL_DATA_ROOT") or Path(__file__).parent.parent)
-RUNS = ROOT / "data" / "runs"
+CODE_ROOT = Path(__file__).parent.parent
+DATA_ROOT = Path(os.environ.get("AUTOLABEL_DATA_ROOT") or CODE_ROOT)
+RUNS = DATA_ROOT / "data" / "runs"
+UPLOADS = Path(os.environ.get("AUTOLABEL_DATA") or DATA_ROOT / "data") / "uploads"
 MIN_APPROVED = 8        # 자동 트리거 최소 승인 이미지 수
 RETRAIN_DELTA = 5       # 마지막 학습 이후 신규 승인 N장마다 재학습
 VAL_RATIO = 0.2
 MIN_VAL = 30   # 이보다 작은 val은 모델 품질을 가리지 못한다 (실측: 12장 val이 오판)
 TEST_RATIO = 0.15
 MIN_TEST = 20  # 홀드아웃 — 학습·게이트에서 완전 배제, 진짜 성능 보고 전용
+MIN_CLASS_IMAGES = 3  # 클래스당 최소 다양성. 그 미만은 점수보다 누락 위험이 더 크다
 
 _lock = threading.Lock()
 _procs: dict[int, subprocess.Popen] = {}
@@ -38,7 +41,25 @@ def _status_path(pid: int) -> Path:
     return RUNS / f"train_status_{pid}.json"
 
 
-def plan_splits(assigned: dict) -> dict:
+def _training_counts(pid: int) -> tuple[int, int]:
+    """현재 승인 수와 마지막 학습 스냅샷 크기."""
+    conn = get_db()
+    approved = conn.execute(
+        "SELECT COUNT(*) c FROM images WHERE project_id=? AND status='approved'",
+        (pid,)).fetchone()["c"]
+    last = conn.execute(
+        "SELECT MAX(train_images) m FROM models WHERE project_id=?", (pid,)).fetchone()["m"] or 0
+    conn.close()
+    return approved, last
+
+
+def _run_scheduled(pid: int) -> None:
+    with _lock:
+        _timers.pop(pid, None)
+    maybe_start_training(pid)
+
+
+def plan_splits(assigned: dict, groups: dict | None = None) -> dict:
     """이미지별 train/val/test 배정. 입력 {id: 기존 split 또는 None} → {id: split}.
 
     val·test 하한(MIN_VAL·MIN_TEST)은 예산 안에서만 채운다 — train에 항상
@@ -52,19 +73,49 @@ def plan_splits(assigned: dict) -> dict:
         # 0장이다. 이 경우만 배정을 처음부터 다시 한다 (라운드 간 비교 기준
         # 유지보다 학습이 되는 것이 먼저다).
         assigned = dict.fromkeys(assigned)
-    val_ids = {i for i, s in assigned.items() if s == "val"}
-    test_ids = {i for i, s in assigned.items() if s == "test"}
-    pool = [i for i, s in assigned.items() if s is None]
-    random.Random(42).shuffle(pool)
+    groups = groups or {i: f"image:{i}" for i in assigned}
+    members: dict[str, list[int]] = {}
+    for iid in assigned:
+        members.setdefault(str(groups.get(iid) or f"image:{iid}"), []).append(iid)
 
-    budget = max(0, (n - max(1, n // 2)) - len(val_ids) - len(test_ids))
-    for ids, need in ((val_ids, max(MIN_VAL, int(n * VAL_RATIO))),
-                      (test_ids, max(MIN_TEST, int(n * TEST_RATIO)))):
-        while len(ids) < need and pool and budget > 0:
-            ids.add(pool.pop())
-            budget -= 1
-    return {i: ("val" if i in val_ids else "test" if i in test_ids else "train")
-            for i in assigned}
+    # 기존 배정이 한 그룹 안에서 갈렸다면 다수결로 한쪽에 모은다. 비디오의
+    # 인접 프레임이 train/val에 섞인 상태를 유지하는 것보다 라운드 기준을 한 번
+    # 바로잡는 편이 낫다. 동률은 train을 우선해 학습 몫을 고갈시키지 않는다.
+    group_split = {}
+    priority = {"train": 2, "val": 1, "test": 0}
+    for key, ids in members.items():
+        known = [assigned[i] for i in ids if assigned[i] in priority]
+        if known:
+            group_split[key] = max(priority, key=lambda s: (known.count(s), priority[s]))
+
+    counts = {s: sum(len(members[g]) for g, v in group_split.items() if v == s)
+              for s in ("train", "val", "test")}
+    pool = [g for g in members if g not in group_split]
+    random.Random(42).shuffle(pool)
+    budget = max(0, n - max(1, n // 2) - counts["val"] - counts["test"])
+    for split, need in (("val", max(MIN_VAL, int(n * VAL_RATIO))),
+                        ("test", max(MIN_TEST, int(n * TEST_RATIO)))):
+        while counts[split] < need and pool and budget > 0:
+            # 그룹 전체가 예산에 들어와야만 평가 셋으로 보낸다. 긴 영상 하나뿐인
+            # 데이터는 같은 영상을 양쪽에 섞어 가짜 점수를 만드는 대신 train에 둔다.
+            pick = next((g for g in reversed(pool) if len(members[g]) <= budget), None)
+            if pick is None:
+                break
+            pool.remove(pick)
+            group_split[pick] = split
+            counts[split] += len(members[pick])
+            budget -= len(members[pick])
+    for key in pool:
+        group_split[key] = "train"
+    return {i: group_split[str(groups.get(i) or f"image:{i}")] for i in assigned}
+
+
+def _image_group(im: dict) -> str:
+    if im.get("group_key"):
+        return im["group_key"]
+    # migration 이전 비디오 프레임도 파일명으로 묶는다.
+    m = re.match(r"^(.*)_f\d{6}\.[^.]+$", im["file_name"])
+    return f"video:{m.group(1)}" if m else f"image:{im['id']}"
 
 
 def _alive(os_pid) -> bool:
@@ -99,7 +150,11 @@ def job_status(pid: int) -> dict:
 
 
 def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
-    """승인된 이미지만 YOLO 포맷으로 export. train/val 분할은 결정적(시드 고정).
+    """승인된 이미지만 YOLO 포맷으로 export. train/val/test 분할은 고정.
+
+    반환 장수는 test까지 포함한 승인 스냅샷 전체다. 이를 train+val만 세면 모델
+    기록이 승인 수보다 작아져, 신규 승인 1장만 추가해도 RETRAIN_DELTA를 이미
+    넘은 것으로 오인하고 불필요한 재학습이 시작된다.
     라벨 0개 승인 이미지 = 배경 네거티브 샘플로 포함."""
     conn = get_db()
     proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
@@ -124,7 +179,8 @@ def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
     # 모델을 0.57로 오판해 승격을 막은 사고에서 나온 규칙.
     assigned = {r[0]["id"]: (r[0]["split"] or ("val" if r[0]["is_val"] else None))
                 for r in rows}
-    plan = plan_splits(assigned)
+    groups = {r[0]["id"]: _image_group(r[0]) for r in rows}
+    plan = plan_splits(assigned, groups)
     val_ids = {i for i, s in plan.items() if s == "val"}
     test_ids = {i for i, s in plan.items() if s == "test"}
     conn.executemany("UPDATE images SET split=? WHERE id=?",
@@ -149,7 +205,7 @@ def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
         for im, anns in items:
             # 연결 임포트 이미지는 원본 경로, 업로드 이미지는 복사본 경로
             src = Path(im["src_path"]) if im.get("src_path") else (
-                ROOT / "data" / "uploads" / str(pid) / f"{im['id']}_{im['file_name']}")
+                UPLOADS / str(pid) / f"{im['id']}_{im['file_name']}")
             if not src.exists():
                 continue  # 원본이 사라진 연결 이미지는 건너뜀
             dst = out / "images" / split / f"{im['id']}_{im['file_name']}"
@@ -168,7 +224,92 @@ def _export_yolo_dataset(pid: int, out: Path) -> tuple[int, list[str]]:
     (out / "data.yaml").write_text(
         f"path: {out}\ntrain: images/train\nval: images/val\ntest: images/test\n"
         f"names: {json.dumps(names)}\n")
-    return len(splits["train"]) + len(splits["val"]), names
+    return sum(len(items) for items in splits.values()), names
+
+
+def training_readiness(pid: int) -> dict | None:
+    """학습 시작 전에 UI가 보여줄 읽기 전용 준비도와 예상 분할."""
+    conn = get_db()
+    project = conn.execute("SELECT ontology FROM projects WHERE id=?", (pid,)).fetchone()
+    if not project:
+        conn.close()
+        return None
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, file_name, split, is_val, group_key FROM images "
+        "WHERE project_id=? AND status='approved'", (pid,))]
+    last = conn.execute(
+        "SELECT MAX(train_images) m FROM models WHERE project_id=?", (pid,)).fetchone()["m"] or 0
+    has_model = conn.execute(
+        "SELECT 1 FROM models WHERE project_id=? LIMIT 1", (pid,)).fetchone() is not None
+    assigned = {r["id"]: (r["split"] or ("val" if r["is_val"] else None)) for r in rows}
+    groups = {r["id"]: _image_group(r) for r in rows}
+    planned = plan_splits(assigned, groups) if assigned else {}
+    split_counts = {s: sum(v == s for v in planned.values())
+                    for s in ("train", "val", "test")}
+    approved = len(rows)
+    next_auto_at = max(MIN_APPROVED, last + RETRAIN_DELTA)
+    ontology = json.loads(project["ontology"] or "[]")
+    classes = ontology if isinstance(ontology, list) else ontology.get("classes", [])
+    class_names = [c.get("name") for c in classes if isinstance(c, dict) and c.get("name")]
+    coverage_rows = conn.execute(
+        "SELECT a.class_name, COUNT(*) boxes, COUNT(DISTINCT a.image_id) images "
+        "FROM annotations a JOIN images i ON i.id=a.image_id "
+        "WHERE i.project_id=? AND i.status='approved' GROUP BY a.class_name", (pid,)).fetchall()
+    coverage_found = {r["class_name"]: {"boxes": r["boxes"], "images": r["images"]}
+                      for r in coverage_rows}
+    class_coverage = {name: coverage_found.get(name, {"boxes": 0, "images": 0})
+                      for name in class_names}
+    conn.close()
+    from server.train_worker import pick_arch
+
+    blockers = []
+    if approved < 4:
+        blockers.append(f"수동 학습까지 승인 {4 - approved}장 더 필요")
+    if split_counts["train"] == 0 and approved:
+        blockers.append("학습용 train 분할이 비어 있음")
+    evaluation_ready = (split_counts["val"] >= MIN_VAL
+                        and split_counts["test"] >= MIN_TEST)
+    sparse_classes = [name for name, c in class_coverage.items()
+                      if c["images"] < MIN_CLASS_IMAGES]
+    coverage_ready = bool(class_names) and not sparse_classes
+    professional_ready = evaluation_ready and coverage_ready
+    warnings = []
+    if approved >= 4 and split_counts["test"] == 0:
+        warnings.append("독립 홀드아웃(test)이 0장이라 실제 성능을 판정할 수 없습니다")
+    elif split_counts["test"] < MIN_TEST:
+        warnings.append(f"전문 평가용 홀드아웃이 {MIN_TEST - split_counts['test']}장 부족합니다")
+    if approved >= 4 and split_counts["val"] < MIN_VAL:
+        warnings.append(f"안정적인 검증셋이 {MIN_VAL - split_counts['val']}장 부족합니다")
+    if sparse_classes:
+        preview = ", ".join(sparse_classes[:4]) + (" 외" if len(sparse_classes) > 4 else "")
+        warnings.append(f"클래스별 승인 다양성이 부족합니다: {preview} (각 {MIN_CLASS_IMAGES}장 권장)")
+    stage = "collecting" if approved < 4 else ("validated" if professional_ready else "experiment")
+    min_professional_approved = 2 * (MIN_VAL + MIN_TEST)
+    return {
+        "approved": approved,
+        "last_trained": last,
+        "new_since_last": max(0, approved - last),
+        "min_manual": 4,
+        "min_auto": MIN_APPROVED,
+        "next_auto_at": next_auto_at,
+        "remaining_auto": max(0, next_auto_at - approved),
+        "ready_manual": approved >= 4 and split_counts["train"] > 0,
+        "ready_auto": approved >= next_auto_at and split_counts["train"] > 0,
+        "stage": stage,
+        "evaluation_ready": evaluation_ready,
+        "coverage_ready": coverage_ready,
+        "professional_ready": professional_ready,
+        "min_professional_approved": min_professional_approved,
+        "remaining_professional": max(0, min_professional_approved - approved),
+        "has_model": has_model,
+        "recommended_arch": pick_arch(approved),
+        "expected_epochs": 60 if split_counts["train"] < 100 else 100,
+        "split_counts": split_counts,
+        "class_count": len(classes),
+        "class_coverage": class_coverage,
+        "blockers": blockers,
+        "warnings": warnings,
+    }
 
 
 def maybe_start_training(pid: int, force: bool = False, debounce: bool = False) -> dict:
@@ -178,11 +319,18 @@ def maybe_start_training(pid: int, force: bool = False, debounce: bool = False) 
     첫 몇 장만으로 학습이 시작돼 나머지가 반영되지 않던 문제를 막는다.
     """
     if debounce and not force:
+        running = job_status(pid)
+        if running.get("status") == "running":
+            return running
+        approved, last = _training_counts(pid)
+        need = max(MIN_APPROVED, last + RETRAIN_DELTA)
+        if approved < need:
+            return {"status": "skipped", "approved": approved, "need": need}
         with _lock:
             t = _timers.get(pid)
             if t:
                 t.cancel()
-            timer = threading.Timer(DEBOUNCE_SEC, lambda: maybe_start_training(pid))
+            timer = threading.Timer(DEBOUNCE_SEC, lambda: _run_scheduled(pid))
             timer.daemon = True
             _timers[pid] = timer
             timer.start()
@@ -190,31 +338,33 @@ def maybe_start_training(pid: int, force: bool = False, debounce: bool = False) 
     with _lock:
         if job_status(pid).get("status") == "running":
             return job_status(pid)
-        conn = get_db()
-        approved = conn.execute(
-            "SELECT COUNT(*) c FROM images WHERE project_id=? AND status='approved'",
-            (pid,)).fetchone()["c"]
-        last = conn.execute(
-            "SELECT MAX(train_images) m FROM models WHERE project_id=?", (pid,)).fetchone()["m"] or 0
-        conn.close()
+        approved, last = _training_counts(pid)
         if not force:
             if approved < MIN_APPROVED or approved < last + RETRAIN_DELTA:
                 return {"status": "skipped", "approved": approved,
                         "need": max(MIN_APPROVED, last + RETRAIN_DELTA)}
         RUNS.mkdir(parents=True, exist_ok=True)
+        started_at = time.time()
         _status_path(pid).write_text(json.dumps(
-            {"status": "running", "phase": "starting", "approved": approved}))
+            {"status": "running", "phase": "starting", "approved": approved,
+             "started_at": started_at, "updated_at": started_at,
+             "elapsed_sec": 0, "progress": 0}))
         log = open(RUNS / f"train_log_{pid}.txt", "a")
         proc = subprocess.Popen(
             [sys.executable, "-m", "server.train_worker", str(pid)],
-            cwd=ROOT, stdout=log, stderr=log)
+            # 데이터 저장 루트가 외장 디스크·임시 경로여도 Python 모듈은 코드
+            # 루트에서 실행해야 한다. 둘을 같은 ROOT로 쓰면 워커가 server 모듈을
+            # 못 찾아 즉시 종료한다.
+            cwd=CODE_ROOT, stdout=log, stderr=log)
         _procs[pid] = proc
         # OS pid를 상태 파일에 남긴다. _procs는 인메모리라 서버가 재시작하면
         # 워커 생사를 알 수 없어 상태가 영원히 running으로 멈췄다.
         _status_path(pid).write_text(json.dumps(
             {"status": "running", "phase": "starting", "approved": approved,
-             "pid_os": proc.pid}))
-        return {"status": "running", "phase": "starting", "approved": approved}
+             "pid_os": proc.pid, "started_at": started_at,
+             "updated_at": time.time(), "elapsed_sec": 0, "progress": 0}))
+        return {"status": "running", "phase": "starting", "approved": approved,
+                "started_at": started_at, "elapsed_sec": 0, "progress": 0}
 
 
 def active_model(pid: int) -> dict | None:

@@ -595,9 +595,8 @@
 <a class="skip-link" href="#content">본문으로 건너뛰기</a>
 <div id="progress"></div>
 
-<!-- 공용 스프라이트 — 목업과 비교 슬라이더가 같은 장면을 쓴다.
-     사진이 아니라 그린 장면이지만, 무엇이 찍혔는지 한눈에 읽혀야
-     "박스가 뭘 감쌌는지"가 전달된다 (회색 얼룩은 아무것도 말해주지 않는다). -->
+<!-- 공용 스프라이트 — 대표 화면은 번들 모델을 실제 평가한 DeepPCB
+     00041030 홀드아웃을 쓴다. 비디오 설명만 움직임을 읽기 쉬운 도식을 유지한다. -->
 <svg class="sprites" width="0" height="0" aria-hidden="true" focusable="false">
   <defs>
     <linearGradient id="skyG2" x1="0" y1="0" x2="0" y2="1">
@@ -659,8 +658,8 @@
       </g>
     </g>
 
-    <!-- 장면 전체 (900×420) -->
-    <g id="photo">
+    <!-- 비디오 추적 설명용 장면 (900×420) -->
+    <g id="videoPhoto">
       <rect width="900" height="420" fill="url(#skyG2)"/>
       <circle cx="205" cy="98" r="86" fill="url(#sunG2)" opacity=".85"/>
       <circle cx="205" cy="98" r="27" fill="#ffe9c4"/>
@@ -677,6 +676,32 @@
       <use href="#dogStand" x="188" y="196"/>
       <use href="#dogSit" x="430" y="210"/>
       <use href="#fence" x="580" y="186"/>
+    </g>
+
+    <!-- 실제 번들 모델 홀드아웃 샘플. 원본은 docs/deep-pcb-00041030.svg에
+         자급식으로 포함해 GitHub Pages에서도 외부 요청 없이 재현된다. -->
+    <g id="pcbPhoto">
+      <rect width="640" height="640" fill="#fff"/>
+      <image href="deep-pcb-00041030.svg" width="640" height="640"/>
+    </g>
+    <!-- 비교 슬라이더의 900×420 가로 조판 -->
+    <g id="photo">
+      <rect width="900" height="420" fill="#0a0d14"/>
+      <rect x="224" width="452" height="420" fill="#111722"/>
+      <image href="deep-pcb-00041030.svg" x="240" width="420" height="420"/>
+      <g fill="#f5f7fb" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+        <text x="28" y="52" font-size="12" fill="#8793a8" letter-spacing="1.4">REAL HOLDOUT</text>
+        <text x="28" y="82" font-size="19" font-weight="700">DeepPCB</text>
+        <text x="28" y="106" font-size="13" fill="#aab3c3">00041030_test.jpg</text>
+        <text x="700" y="52" font-size="12" fill="#8793a8" letter-spacing="1.4">GROUND TRUTH</text>
+        <text x="700" y="82" font-size="19" font-weight="700">10 defects</text>
+        <text x="700" y="106" font-size="13" fill="#aab3c3">6 classes</text>
+        <text x="28" y="350" font-size="12" fill="#8793a8">번들 모델 평가에 사용</text>
+        <text x="28" y="372" font-size="12" fill="#8793a8">외부 데모 이미지 아님</text>
+        <text x="700" y="350" font-size="12" fill="#8793a8">open · short · spur</text>
+        <text x="700" y="372" font-size="12" fill="#8793a8">copper · pinhole ·</text>
+        <text x="700" y="394" font-size="12" fill="#8793a8">mousebite</text>
+      </g>
     </g>
   </defs>
 </svg>
@@ -720,100 +745,106 @@
     <div class="band rise d5">
       <div><b>0.995</b><span>문서 서명 제로샷 mAP50</span></div>
       <div><b>0.8<small>초</small></b><span>장당 박스 오토라벨</span></div>
-      <div><b>75</b><span>회귀 테스트 통과</span></div>
+      <div><b>137</b><span>회귀 테스트 통과</span></div>
       <div><b>0</b><span>필수 클라우드 의존</span></div>
     </div>
   </div>
 
   <div class="stage rise d6">
-    <div class="window" id="mockup" role="img"
-         aria-label="autolabel 화면 구성 재현: 왼쪽 이미지 목록, 가운데 자동 박스가 그려진 캔버스, 오른쪽 심판 판정이 달린 어노테이션 목록">
+      <div class="window" id="mockup" role="img"
+         aria-label="실제 DeepPCB 홀드아웃에 번들 모델을 실행한 autolabel 화면 재현: 왼쪽 이미지 목록, 가운데 자동 박스가 그려진 캔버스, 오른쪽 정답 비교 결과">
       <div class="titlebar">
         <div class="dots" aria-hidden="true"><i></i><i></i><i></i></div>
-        <span class="name">autolabel — dog-finder</span>
-        <span class="prog">12/15 승인</span>
+        <span class="name">autolabel — pcb-defect</span>
+        <span class="prog">샘플 1/10</span>
       </div>
       <div class="app">
         <!-- 좌: 목록 -->
         <div class="side">
           <div class="todo">
-            <em>지금 할 일 · 4단계</em><b>리뷰 3장 남음</b>
-            <span>맞으면 A, 틀리면 고친 뒤 A</span>
+            <em>실제 홀드아웃 검수</em><b>초안 10개 확인</b>
+            <span>6개 일치 · 4개 수정/삭제 후보</span>
           </div>
           <div class="chips">
-            <span class="fchip">전체</span><span class="fchip">리뷰 대기</span>
-            <span class="fchip on">심판 ✗</span><span class="fchip">불확실</span>
+            <span class="fchip">전체</span><span class="fchip">일치 6</span>
+            <span class="fchip on">검수 4</span><span class="fchip">저신뢰</span>
           </div>
-          <div class="thumb sel"><i></i><div class="t"><b>frame_0042.jpg</b><span class="f">3개 · 심판 ✗1</span></div></div>
-          <div class="thumb"><i></i><div class="t"><b>frame_0047.jpg</b><span>2개 · conf 0.94</span></div></div>
-          <div class="thumb"><i></i><div class="t"><b>frame_0051.jpg</b><span>1개 · conf 0.88</span></div></div>
-          <div class="thumb"><i></i><div class="t"><b>frame_0055.jpg</b><span>2개 · conf 0.77</span></div></div>
-          <div class="thumb"><i></i><div class="t"><b>frame_0060.jpg</b><span>라벨 없음</span></div></div>
+          <div class="thumb sel"><i></i><div class="t"><b>00041030_test.jpg</b><span class="f">10개 · 검수 4</span></div></div>
+          <div class="thumb"><i></i><div class="t"><b>00041031_test.jpg</b><span>모델 초안 완료</span></div></div>
+          <div class="thumb"><i></i><div class="t"><b>00041032_test.jpg</b><span>모델 초안 완료</span></div></div>
+          <div class="thumb"><i></i><div class="t"><b>00041033_test.jpg</b><span>모델 초안 완료</span></div></div>
+          <div class="thumb"><i></i><div class="t"><b>00041034_test.jpg</b><span>모델 초안 완료</span></div></div>
         </div>
 
         <!-- 중: 캔버스 -->
         <div class="canvas">
-          <!-- 장면 좌표계(900×420)를 캔버스 비율만큼 잘라 쓴다 — 비교 슬라이더와
-               같은 장면·같은 박스 좌표라 두 화면이 정확히 대응한다 -->
-          <svg viewBox="158 44 596 364" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-            <use href="#photo"/>
+          <!-- 실제 640×640 홀드아웃과 실추론 좌표를 그대로 쓴다. -->
+          <svg viewBox="0 0 640 640" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+            <use href="#pcbPhoto"/>
             <!-- 스캔 라인 -->
-            <rect class="mk-scan" x="158" y="44" width="3" height="364" fill="#7fd4ff" opacity=".9"/>
-            <!-- 자동 박스 -->
-            <g fill="none" stroke-width="3">
-              <rect class="mk-box" x="182" y="190" width="140" height="134" rx="6" stroke="#2997ff"/>
-              <rect class="mk-box b2" x="424" y="204" width="110" height="120" rx="6" stroke="#2997ff"/>
-              <rect class="mk-box b3" x="574" y="180" width="162" height="150" rx="6" stroke="#ff453a"/>
+            <rect class="mk-scan" x="0" y="0" width="4" height="640" fill="#7fd4ff" opacity=".9"/>
+            <!-- 번들 모델 실제 출력: 파란 계열은 정답 일치, 빨강은 검수 후보 -->
+            <g fill="none" stroke-width="4">
+              <rect class="mk-box" x="325.1" y="191.6" width="34.4" height="54.9" rx="5" stroke="#2997ff"/>
+              <rect class="mk-box b2" x="506.7" y="373.8" width="38.6" height="57.4" rx="5" stroke="#ff9f0a"/>
+              <rect class="mk-box b3" x="400" y="409.9" width="34.7" height="36.3" rx="5" stroke="#32d74b"/>
+              <rect x="172.7" y="59.1" width="33.9" height="29.4" rx="5" stroke="#64d2ff"/>
+              <rect x="57.2" y="152.5" width="19.7" height="26.8" rx="5" stroke="#32d74b"/>
+              <rect x="208.9" y="119.2" width="41.5" height="38.4" rx="5" stroke="#ff9f0a"/>
+              <rect x="171.9" y="369.6" width="51.3" height="36" rx="5" stroke="#ff453a"/>
+              <rect x="55" y="465" width="33" height="30.4" rx="5" stroke="#ff453a"/>
             </g>
             <!-- 라벨 -->
-            <g class="mono" font-size="13" font-weight="700">
+            <g class="mono" font-size="14" font-weight="700">
               <g class="mk-lab">
-                <rect x="182" y="167" width="86" height="20" rx="5" fill="#2997ff"/>
-                <text x="189" y="181.5" fill="#fff">dog 0.97</text>
+                <rect x="325" y="166" width="104" height="23" rx="5" fill="#2997ff"/>
+                <text x="332" y="182.5" fill="#fff">short 0.84</text>
               </g>
               <g class="mk-lab l2">
-                <rect x="424" y="181" width="86" height="20" rx="5" fill="#2997ff"/>
-                <text x="431" y="195.5" fill="#fff">dog 0.81</text>
+                <rect x="506" y="348" width="112" height="23" rx="5" fill="#ff9f0a"/>
+                <text x="513" y="364.5" fill="#111">copper 0.83</text>
               </g>
               <g class="mk-lab l3">
-                <rect x="574" y="157" width="86" height="20" rx="5" fill="#ff453a"/>
-                <text x="581" y="171.5" fill="#fff">dog 0.40</text>
+                <rect x="172" y="34" width="136" height="23" rx="5" fill="#64d2ff"/>
+                <text x="179" y="50.5" fill="#07131c">mousebite 0.56</text>
               </g>
             </g>
-            <!-- 심판 칩 -->
+            <!-- 홀드아웃 정답 비교 칩 -->
             <g class="mk-chip">
-              <circle cx="322" cy="190" r="13" fill="#32d74b"/>
-              <path d="M316 190l4.5 4.5 8-9" stroke="#0b1a0e" stroke-width="2.6" fill="none"
+              <circle cx="359" cy="192" r="14" fill="#32d74b"/>
+              <path d="M353 192l4.5 4.5 8-9" stroke="#0b1a0e" stroke-width="2.6" fill="none"
                     stroke-linecap="round" stroke-linejoin="round"/>
             </g>
             <g class="mk-chip c2">
-              <circle cx="534" cy="204" r="13" fill="#32d74b"/>
-              <path d="M528 204l4.5 4.5 8-9" stroke="#0b1a0e" stroke-width="2.6" fill="none"
+              <circle cx="545" cy="374" r="14" fill="#32d74b"/>
+              <path d="M539 374l4.5 4.5 8-9" stroke="#0b1a0e" stroke-width="2.6" fill="none"
                     stroke-linecap="round" stroke-linejoin="round"/>
             </g>
             <g class="mk-chip c3">
-              <circle cx="736" cy="180" r="13" fill="#ff453a"/>
-              <path d="M731 175l10 10M741 175l-10 10" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/>
+              <circle cx="223" cy="370" r="14" fill="#ff453a"/>
+              <path d="M218 365l10 10M228 365l-10 10" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/>
             </g>
           </svg>
         </div>
 
         <!-- 우: 어노테이션 + 판정 -->
         <div class="panel">
-          <h4>어노테이션 (3)</h4>
-          <div class="arow live"><span class="n">1</span><span class="cls">dog</span>
-            <span class="cf">0.97</span><span class="vchip p">✓</span></div>
-          <div class="arow live"><span class="n">2</span><span class="cls">dog</span>
-            <span class="cf">0.81</span><span class="vchip p">✓</span></div>
-          <div class="arow live"><span class="n">3</span><span class="cls">dog</span>
-            <span class="cf">0.40</span><span class="vchip f">✗</span></div>
-          <p class="hint">심판: 개가 아니라 세로 나무 판자 구조물 — 위반</p>
+          <h4>어노테이션 (10)</h4>
+          <div class="arow live"><span class="n">1</span><span class="cls">short</span>
+            <span class="cf">0.84</span><span class="vchip p">✓</span></div>
+          <div class="arow live"><span class="n">2</span><span class="cls">copper</span>
+            <span class="cf">0.83</span><span class="vchip p">✓</span></div>
+          <div class="arow live"><span class="n">3</span><span class="cls">pinhole</span>
+            <span class="cf">0.62</span><span class="vchip p">✓</span></div>
+          <div class="arow live"><span class="n">4</span><span class="cls">mousebite</span>
+            <span class="cf">0.56</span><span class="vchip p">✓</span></div>
+          <p class="hint">홀드아웃 비교: 6개 일치 · 중복/오분류/오탐 4개는 사람이 검수</p>
           <p class="hint" style="margin-top:14px">
             <kbd>A</kbd> 승인 · <kbd>X</kbd> 거부<br><kbd>←→</kbd> 이동 · <kbd>⌘Z</kbd> 되돌리기</p>
         </div>
       </div>
     </div>
-    <p class="caption">화면 구성 재현 도식 — 실제 앱은 이 배치로 동작한다 (스크린샷 아님)</p>
+    <p class="caption">실제 DeepPCB 홀드아웃 + 번들 모델 추론 결과 — 앱 레이아웃만 재현한 도식</p>
   </div>
 </header>
 
@@ -826,7 +857,7 @@
       순서가 거꾸로다. 슬라이더를 끌어 차이를 보라.</p>
 
     <div class="compare reveal" id="cmp" style="--p:50%">
-      <span class="tag l">원본</span><span class="tag r">자동 라벨 + 심판</span>
+      <span class="tag l">실제 원본</span><span class="tag r">실제 모델 초안</span>
       <!-- 전: 원본 -->
       <svg viewBox="0 0 900 420" aria-hidden="true"><use href="#photo"/></svg>
       <!-- 후: 같은 장면 + 자동 라벨 + 판정 (목업과 동일 좌표) -->
@@ -834,32 +865,27 @@
         <svg viewBox="0 0 900 420">
           <use href="#photo"/>
           <g fill="none" stroke-width="3">
-            <rect x="182" y="190" width="140" height="134" rx="6" stroke="#2997ff"/>
-            <rect x="424" y="204" width="110" height="120" rx="6" stroke="#2997ff"/>
-            <rect x="574" y="180" width="162" height="150" rx="6" stroke="#ff453a"/>
+            <rect x="453.3" y="125.7" width="22.6" height="36" rx="4" stroke="#2997ff"/>
+            <rect x="572.5" y="245.3" width="25.3" height="37.7" rx="4" stroke="#ff9f0a"/>
+            <rect x="502.5" y="269" width="22.8" height="23.8" rx="4" stroke="#32d74b"/>
+            <rect x="353.3" y="38.8" width="22.2" height="19.3" rx="4" stroke="#64d2ff"/>
+            <rect x="277.5" y="100.1" width="12.9" height="17.6" rx="4" stroke="#32d74b"/>
+            <rect x="377.1" y="78.2" width="27.2" height="25.2" rx="4" stroke="#ff9f0a"/>
+            <rect x="352.8" y="242.6" width="33.7" height="23.6" rx="4" stroke="#ff453a"/>
+            <rect x="276.1" y="305.2" width="21.7" height="19.9" rx="4" stroke="#ff453a"/>
           </g>
-          <g class="mono" font-size="14" font-weight="700">
-            <rect x="182" y="165" width="92" height="21" rx="5" fill="#2997ff"/>
-            <text x="189" y="180.5" fill="#fff">dog 0.97</text>
-            <rect x="424" y="179" width="92" height="21" rx="5" fill="#2997ff"/>
-            <text x="431" y="194.5" fill="#fff">dog 0.81</text>
-            <rect x="574" y="155" width="92" height="21" rx="5" fill="#ff453a"/>
-            <text x="581" y="170.5" fill="#fff">dog 0.40</text>
+          <g class="mono" font-size="12" font-weight="700">
+            <rect x="452" y="105" width="82" height="18" rx="4" fill="#2997ff"/>
+            <text x="458" y="118.5" fill="#fff">short .84</text>
+            <rect x="552" y="286" width="92" height="18" rx="4" fill="#ff9f0a"/>
+            <text x="558" y="299.5" fill="#111">copper .83</text>
+            <rect x="328" y="19" width="112" height="18" rx="4" fill="#64d2ff"/>
+            <text x="334" y="32.5" fill="#07131c">mousebite .56</text>
           </g>
+          <!-- 실측 평가 결과를 장면 안에서 바로 읽히게 -->
           <g>
-            <circle cx="322" cy="190" r="14" fill="#32d74b"/>
-            <path d="M315.5 190l5 5 8.5-9.5" stroke="#0b1a0e" stroke-width="2.8" fill="none"
-                  stroke-linecap="round" stroke-linejoin="round"/>
-            <circle cx="534" cy="204" r="14" fill="#32d74b"/>
-            <path d="M527.5 204l5 5 8.5-9.5" stroke="#0b1a0e" stroke-width="2.8" fill="none"
-                  stroke-linecap="round" stroke-linejoin="round"/>
-            <circle cx="736" cy="180" r="14" fill="#ff453a"/>
-            <path d="M730 174l12 12M742 174l-12 12" stroke="#fff" stroke-width="2.8" stroke-linecap="round"/>
-          </g>
-          <!-- 위반 근거를 장면 안에서 바로 읽히게 -->
-          <g>
-            <rect x="470" y="352" width="404" height="34" rx="9" fill="rgba(8,10,16,.78)"/>
-            <text x="486" y="374" font-size="15" fill="#ffd9d6">심판 ✗ — 개가 아니라 세로 나무 판자 구조물</text>
+            <rect x="472" y="352" width="402" height="34" rx="9" fill="rgba(8,10,16,.84)"/>
+            <text x="488" y="374" font-size="15" fill="#dce7ff">정답 비교 — 6개 일치 · 4개 수정/삭제 후보</text>
           </g>
         </svg>
       </div>
@@ -884,8 +910,8 @@
       <div class="card reveal" style="--i:1">
         <div class="ic" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none"
           stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M20 6 9 17l-5-5"/></svg></div>
-        <h3>예외만 본다</h3>
-        <p>고신뢰는 자동 승인, 심판이 걸러낸 위반·불확실만 사람에게 온다. 전수 판독이 예외 확인으로 바뀐다.</p>
+        <h3>검증된 예외만 본다</h3>
+        <p>홀드아웃과 클래스별 정밀도 검증을 통과한 초안만 자동 승인한다. 나머지와 심판의 위반·불확실은 사람에게 온다.</p>
         <div class="kv"><kbd>A</kbd> 승인 · <kbd>X</kbd> 거부 · <kbd>⌘Z</kbd>는 이미지를 건너서도 되돌린다</div>
       </div>
       <div class="card reveal" style="--i:2">
@@ -915,10 +941,10 @@
       </div>
       <div class="step">
         <div class="dot">2</div>
-        <h3>자동 초안 — 엔진은 알아서 고른다</h3>
-        <p>전용 모델이 있으면 그것, 없으면 SAM 3, 그것도 없으면 Grounding DINO + SAM.
-          고해상도·작은 객체는 타일링으로 나눠 본다.</p>
-        <div class="kv">장당 <b>0.8초</b>(박스) · 프롬프트가 약하면 실험 기능이 후보를 비교해 준다</div>
+        <h3>자동 초안 — 두 엔진을 먼저 견준다</h3>
+        <p>전용 모델이 없으면 SAM 3와 Grounding DINO를 처음 3장에서 교차 시험한다.
+          승인 정답이 쌓이면 클래스마다 검수 비용이 적었던 엔진 또는 둘의 합의를 자동 선택한다.</p>
+        <div class="kv">SAM 3가 없으면 Grounding DINO(+SAM 마스크) · 고해상도는 타일링</div>
       </div>
       <div class="step">
         <div class="dot">3</div>
@@ -936,16 +962,16 @@
       <div class="step">
         <div class="dot">5</div>
         <h3>자동 학습 — 이겨야 교체</h3>
-        <p>승인 8장부터 별도 프로세스로 학습(서버 재시작에도 생존). 3분할 + 고정 홀드아웃으로
-          라운드마다 같은 기준으로 평가한다.</p>
-        <div class="kv">데이터 규모에 따라 <b>n → s → m</b> 자동 승급 · 이전 모델로 롤백 가능</div>
+        <p>승인 8장부터 실험 학습을 시작하고, 데이터가 쌓이면 그룹이 섞이지 않는 train/val/test로 평가한다.
+          현재 모델과 같은 val에서 비교해 이긴 후보만 교체한다.</p>
+        <div class="kv">학습 중 epoch·ETA 표시 · Colab 번들도 성능표를 검증한 뒤 적용</div>
       </div>
       <div class="step">
         <div class="dot">↻</div>
         <h3>다시 2번으로 — 이번엔 더 정확하게</h3>
         <p>승급한 전용 모델이 초안 엔진을 대신한다. 초안이 좋아지면 리뷰가 줄고,
           리뷰가 줄면 더 많이 승인된다.</p>
-        <div class="kv">실측 PCB: 제로샷 ≈0 → 42장 <b>0.593</b> → 300장 <b>0.963</b></div>
+        <div class="kv">실측 PCB: 제로샷 ≈0 → 42장 <b>0.571</b> → 300장 <b>0.963</b></div>
       </div>
     </div>
 
@@ -957,22 +983,22 @@
           — 같은 객체는 <code>meta.track_id</code>로 묶인다</span>
       </figcaption>
       <div class="strip">
-        <div class="frame"><svg viewBox="160 156 260 196" aria-hidden="true"><use href="#photo"/>
+        <div class="frame"><svg viewBox="160 156 260 196" aria-hidden="true"><use href="#videoPhoto"/>
           <rect x="182" y="190" width="140" height="134" rx="6" fill="none" stroke="#2997ff" stroke-width="3"/>
           <rect x="182" y="167" width="96" height="20" rx="5" fill="#2997ff"/>
           <text x="189" y="181.5" class="mono" font-size="13" font-weight="700" fill="#fff">track #1</text>
         </svg><span>frame 001</span></div>
-        <div class="frame"><svg viewBox="168 156 260 196" aria-hidden="true"><use href="#photo"/>
+        <div class="frame"><svg viewBox="168 156 260 196" aria-hidden="true"><use href="#videoPhoto"/>
           <rect x="182" y="190" width="140" height="134" rx="6" fill="none" stroke="#2997ff" stroke-width="3"/>
           <rect x="182" y="167" width="96" height="20" rx="5" fill="#2997ff"/>
           <text x="189" y="181.5" class="mono" font-size="13" font-weight="700" fill="#fff">track #1</text>
         </svg><span>frame 004</span></div>
-        <div class="frame"><svg viewBox="176 156 260 196" aria-hidden="true"><use href="#photo"/>
+        <div class="frame"><svg viewBox="176 156 260 196" aria-hidden="true"><use href="#videoPhoto"/>
           <rect x="182" y="190" width="140" height="134" rx="6" fill="none" stroke="#2997ff" stroke-width="3"/>
           <rect x="182" y="167" width="96" height="20" rx="5" fill="#2997ff"/>
           <text x="189" y="181.5" class="mono" font-size="13" font-weight="700" fill="#fff">track #1</text>
         </svg><span>frame 007</span></div>
-        <div class="frame"><svg viewBox="184 156 260 196" aria-hidden="true"><use href="#photo"/>
+        <div class="frame"><svg viewBox="184 156 260 196" aria-hidden="true"><use href="#videoPhoto"/>
           <rect x="182" y="190" width="140" height="134" rx="6" fill="none" stroke="#2997ff" stroke-width="3"/>
           <rect x="182" y="167" width="96" height="20" rx="5" fill="#2997ff"/>
           <text x="189" y="181.5" class="mono" font-size="13" font-weight="700" fill="#fff">track #1</text>
@@ -1035,7 +1061,7 @@
       </div>
       <div class="card reveal" style="--i:1">
         <span class="metric">0.963</span>
-        <p><b>PCB 결함 (제로샷 완전 실패 도메인)</b><br>≈0 → 승인 42장 0.593 → 300장 0.963.
+        <p><b>PCB 결함 (제로샷 완전 실패 도메인)</b><br>≈0 → 승인 42장 0.571 → 300장 0.963.
           특수 도메인의 정공법</p>
       </div>
       <div class="card reveal" style="--i:2">
@@ -1071,7 +1097,7 @@
           <tr><td>비디오 트래킹 — 팬 영상 10프레임</td><td>박스 19개 · 9프레임 연속</td></tr>
           <tr><td>익스포트 → 재임포트 왕복 (128장)</td><td>460 → 460 박스</td></tr>
           <tr><td>목록 전송량 (썸네일 캐시 도입 후)</td><td>−97.8%</td></tr>
-          <tr><td>회귀 테스트 — 백엔드 / 브라우저</td><td>49 / 26 통과</td></tr>
+          <tr><td>회귀 테스트 — 백엔드 / 프론트(unit+browser)</td><td>88 / 14+35 통과</td></tr>
         </tbody>
       </table>
     </div>
@@ -1085,7 +1111,7 @@
     <span class="eyebrow reveal">신뢰</span>
     <h2 class="reveal">조용히 틀리지 않는다</h2>
     <p class="lede reveal">라벨링 도구의 최악은 오류가 아니라 <em>보고되지 않은 오류</em>다.
-      회귀 테스트 75개는 전부 실제로 한 번씩 깨졌던 경로다.</p>
+      회귀 테스트 137개는 실제 결함과 핵심 경계 조건을 재현해 막는다.</p>
     <div class="grid g3 stagger">
       <div class="card reveal" style="--i:0">
         <h3>완료가 아닌 종료를<br>완료라고 말하지 않는다</h3>
@@ -1111,6 +1137,8 @@
       <span class="cap-chip">타일링 추론</span>
       <span class="cap-chip">계층 라벨 (person.head)</span>
       <span class="cap-chip">프롬프트 실험</span>
+      <span class="cap-chip">SAM 3 · GDINO 교차 시험</span>
+      <span class="cap-chip">검수 기반 클래스 라우팅</span>
       <span class="cap-chip">누락 라벨 찾기</span>
       <span class="cap-chip">라벨 의심 랭킹</span>
       <span class="cap-chip">권장 임계값 자동 계산</span>
@@ -1119,8 +1147,8 @@
       <span class="cap-chip">일괄 승인·거부</span>
       <span class="cap-chip">100단계 되돌리기</span>
       <span class="cap-chip">학습 이력·롤백</span>
-      <span class="cap-chip">외부 <code>.pt</code> 등록</span>
-      <span class="cap-chip">Colab 학습 노트북</span>
+      <span class="cap-chip">검증 모델 자동 승인</span>
+      <span class="cap-chip">Colab 모델 번들 검증</span>
       <span class="cap-chip">COCO · YOLO zip</span>
     </div>
   </div>
@@ -1141,8 +1169,8 @@ git clone https://github.com/Seung-Won-Yu/autolabel.git &amp;&amp; cd autolabel
 <span class="c"># 3. 실행 — 백엔드 + 프론트 동시, 브라우저 자동 오픈</span>
 ./start.sh<span class="cursor"></span></pre>
     <ul class="plain stagger reveal">
-      <li><b>코드를 고쳤다면</b> — <code>./test.sh &amp;&amp; ./test-e2e.sh</code>로 백엔드 49개와
-        브라우저 26개 회귀 경로를 확인한다.</li>
+      <li><b>코드를 고쳤다면</b> — <code>./test.sh &amp;&amp; ./test-e2e.sh</code>로 백엔드 88개와
+        프론트 49개(unit 14 + 브라우저 35) 회귀 경로를 확인한다.</li>
       <li><b>첫 프로젝트</b> — 이름 짓고, 클래스 한 줄 적고, 이미지 던지고, “전체 오토라벨”을 누른다.
         나머지는 “지금 할 일” 배너가 단계별로 안내한다.</li>
       <li><b>SAM 3는 선택</b> — <a href="https://huggingface.co/facebook/sam3">facebook/sam3</a> 접근 승인 후
@@ -1174,9 +1202,10 @@ git clone https://github.com/Seung-Won-Yu/autolabel.git &amp;&amp; cd autolabel
       <details class="reveal"><summary>내 도메인은 특수한데 될까?</summary><div class="body">
         <p>텍스트로 설명되는 개념이면 첫날부터 자동에 가깝다(서명 실측 0.995).
           PCB 미세 결함처럼 제로샷이 완전히 실패하는 도메인은 수동 수십 장이 필요하다 —
-          대신 그 뒤로는 급격히 좋아진다(42장 0.593 → 300장 0.963).</p>
-        <p>어느 쪽인지는 첫 배치 결과가 알려준다. 검출률이 낮으면 도구가 다음 수(프롬프트 실험 /
-          직접 라벨 후 학습)를 지정해 준다.</p>
+          대신 그 뒤로는 급격히 좋아진다(42장 0.571 → 300장 0.963).</p>
+        <p>첫 3장에서는 SAM 3와 Grounding DINO를 함께 돌려 합의·단독 후보를 보여주고,
+          사람이 승인한 결과로 클래스별 엔진을 보정한다. 그래도 검출률이 낮으면 도구가 다음 수
+          (프롬프트 실험 / 직접 라벨 후 학습)를 지정한다.</p>
       </div></details>
       <details class="reveal"><summary>팀에서 같이 쓸 수 있나?</summary><div class="body">
         <p>지금은 1인 로컬 전제다(SQLite · 단일 프로세스). 여러 사람이 동시에 쓰려면
