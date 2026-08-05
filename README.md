@@ -9,15 +9,15 @@
 
 기본 경로 100% 로컬 · 필수 API 키 없음 · COCO/YOLO 출력 — Apple Silicon 한 대로 전 과정 완결.
 
-**[소개 페이지](https://seung-won-yu.github.io/autolabel/)** ·
+**[소개 페이지](https://seung-won-yu.github.io/autolabel/?v=20260805-2)** ·
 **[60초 시작](#60초-시작)** · **[실측 성능](#얼마나-잘-되나)** · **[설계 원칙](#설계-원칙-전부-실사고에서-나온-것)**
 
 `백엔드 88 · 프론트 49(unit 14 + 브라우저 35) 회귀` · `서명 제로샷 mAP50 0.995` · `장당 0.8초`
 
 <br>
 
-<a href="https://seung-won-yu.github.io/autolabel/">
-  <img src="docs/og.png" alt="autolabel — 모델 초안, 예외 검수, 자동 학습으로 이어지는 로컬 오토라벨링 도구" width="900">
+<a href="https://seung-won-yu.github.io/autolabel/?v=20260805-2">
+  <img src="docs/og.png?v=20260805-2" alt="autolabel — 모델 초안, 예외 검수, 자동 학습으로 이어지는 로컬 오토라벨링 도구" width="900">
 </a>
 
 <sub>대표 화면은 번들 모델을 실제 DeepPCB 홀드아웃에 실행한 결과다. 00041030 샘플의 모델 초안과 정답 비교를 그대로 사용했다.</sub>
