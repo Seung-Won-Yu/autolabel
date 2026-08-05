@@ -12,6 +12,8 @@
 **[소개 페이지](https://seung-won-yu.github.io/autolabel/)** ·
 **[3단계 설치](#실행)** · **[실측 성능](#실측-성능)**
 
+`백엔드 49 · 브라우저 26 회귀 통과` · `서명 제로샷 mAP50 0.995` · `장당 0.8초`
+
 <br>
 
 <a href="https://seung-won-yu.github.io/autolabel/">
