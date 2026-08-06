@@ -696,11 +696,13 @@
         <text x="700" y="52" font-size="12" fill="#8793a8" letter-spacing="1.4">GROUND TRUTH</text>
         <text x="700" y="82" font-size="19" font-weight="700">10 defects</text>
         <text x="700" y="106" font-size="13" fill="#aab3c3">6 classes</text>
-        <text x="28" y="350" font-size="12" fill="#8793a8">번들 모델 평가에 사용</text>
-        <text x="28" y="372" font-size="12" fill="#8793a8">외부 데모 이미지 아님</text>
-        <text x="700" y="350" font-size="12" fill="#8793a8">open · short · spur</text>
-        <text x="700" y="372" font-size="12" fill="#8793a8">copper · pinhole ·</text>
-        <text x="700" y="394" font-size="12" fill="#8793a8">mousebite</text>
+        <!-- 각주는 y 280~330에 둔다. 아래 띠(y 340~400)는 "after" 레이어의
+             정답 비교 알약 자리다 — 여기까지 내리면 알약이 클래스 목록을 덮는다. -->
+        <text x="28" y="286" font-size="12" fill="#8793a8">번들 모델 평가에 사용</text>
+        <text x="28" y="308" font-size="12" fill="#8793a8">외부 데모 이미지 아님</text>
+        <text x="700" y="286" font-size="12" fill="#8793a8">open · short · spur</text>
+        <text x="700" y="308" font-size="12" fill="#8793a8">copper · pinhole ·</text>
+        <text x="700" y="330" font-size="12" fill="#8793a8">mousebite</text>
       </g>
     </g>
   </defs>
@@ -882,10 +884,12 @@
             <rect x="328" y="19" width="112" height="18" rx="4" fill="#64d2ff"/>
             <text x="334" y="32.5" fill="#07131c">mousebite .56</text>
           </g>
-          <!-- 실측 평가 결과를 장면 안에서 바로 읽히게 -->
+          <!-- 실측 평가 결과를 장면 안에서 바로 읽히게. 알약은 슬라이더 기본
+               위치(x=450)보다 오른쪽에서 시작해야 첫 화면에서 문장이 잘리지
+               않는다. 폭도 텍스트에 맞춘다 — 남는 폭이 각주를 덮었다. -->
           <g>
-            <rect x="472" y="352" width="402" height="34" rx="9" fill="rgba(8,10,16,.84)"/>
-            <text x="488" y="374" font-size="15" fill="#dce7ff">정답 비교 — 6개 일치 · 4개 수정/삭제 후보</text>
+            <rect x="462" y="352" width="272" height="34" rx="9" fill="rgba(8,10,16,.84)"/>
+            <text x="478" y="374" font-size="14" fill="#dce7ff">정답 비교 — 6개 일치 · 4개 수정/삭제 후보</text>
           </g>
         </svg>
       </div>
