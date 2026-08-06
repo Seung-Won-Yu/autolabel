@@ -946,9 +946,9 @@
       <div class="step">
         <div class="dot">2</div>
         <h3>자동 초안 — 두 엔진을 먼저 견준다</h3>
-        <p>전용 모델이 없으면 SAM 3와 Grounding DINO를 처음 3장에서 교차 시험한다.
+        <p>전용 모델이 없으면 SAM 3와 Grounding DINO를 앞 30장 교차 실행해 비교 표본을 만든다.
           승인 정답이 쌓이면 클래스마다 검수 비용이 적었던 엔진 또는 둘의 합의를 자동 선택한다.</p>
-        <div class="kv">SAM 3가 없으면 Grounding DINO(+SAM 마스크) · 고해상도는 타일링</div>
+        <div class="kv">경로가 정해진 뒤에도 <b>10장에 1장은 두 엔진을 다시</b> 돌려 근거를 갱신 · SAM 3가 없으면 Grounding DINO(+SAM 마스크)</div>
       </div>
       <div class="step">
         <div class="dot">3</div>

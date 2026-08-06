@@ -624,7 +624,7 @@ def _batch_verdict(job: dict, total: int, ontology: list[str] | None = None) -> 
         "missing_classes": [name for name in ontology if not class_counts.get(name)],
         "large_boxes": large_boxes,
         "agreement_counts": job.get("agreement_counts") or {},
-        "ensemble_pilot": job.get("ensemble_pilot") or {},
+        "engine_plan": job.get("engine_plan") or {},
     }
     agreement = diagnostics["agreement_counts"]
     ensemble_total = sum(agreement.values())
@@ -632,10 +632,14 @@ def _batch_verdict(job: dict, total: int, ontology: list[str] | None = None) -> 
     solo = agreement.get("sam3_only", 0) + agreement.get("gdino_only", 0)
     ensemble_advice = (f" 두 모델 합의 {consensus}개 · 단독 후보 {solo}개이며, "
                        "단독 후보부터 검수하세요." if ensemble_total else "")
-    pilot = diagnostics["ensemble_pilot"]
-    pilot_advice = (f" 초기 {pilot.get('images', 0)}장 교차 시험에서 합의가 낮아 "
-                    "나머지는 SAM3로 자동 전환했습니다."
-                    if pilot.get("decision") == "sam3" else "")
+    plan = diagnostics["engine_plan"]
+    both = plan.get("both_engine_images", 0)
+    # 왜 일부만 두 엔진을 돌렸는지 사용자에게 그대로 알린다 — 숨은 자동 전환이
+    # 아니라 정해진 예산이라는 것이 읽혀야 한다.
+    plan_advice = (f" {total}장 중 {both}장을 두 엔진으로 교차 검출했습니다"
+                   f"(앞 {plan.get('seed_target', 0)}장 + 이후 "
+                   f"{plan.get('explore_every', 0)}장마다 1장)."
+                   if both and both < total else "")
     if hit == 0:
         return {"verdict": "empty", **diagnostics, "advice":
                 "한 장도 못 찾았습니다. 검출 프롬프트를 영어로 바꾸거나 "
@@ -663,14 +667,14 @@ def _batch_verdict(job: dict, total: int, ontology: list[str] | None = None) -> 
     if rate >= 0.7 and not warnings:
         return {"verdict": "good", **diagnostics,
                 "advice": f"{total}장 중 {hit}장에서 검출 · 박스 {found}개."
-                          f"{pilot_advice}{ensemble_advice} 리뷰를 시작하세요."}
+                          f"{plan_advice}{ensemble_advice} 리뷰를 시작하세요."}
 
     if warnings:
         return {"verdict": "partial", **diagnostics, "warnings": warnings,
                 "advice": f"{total}장 중 {hit}장에서 {found}개를 찾았지만 품질 경고가 있습니다: "
                           f"{' · '.join(warnings)}. 검출률만으로 정확하다고 보지 말고, "
                           "클래스별 대표 이미지를 먼저 확인한 뒤 프롬프트를 조정하거나 "
-                          f"직접 라벨로 전용 모델을 학습하세요.{pilot_advice}{ensemble_advice}"}
+                          f"직접 라벨로 전용 모델을 학습하세요.{plan_advice}{ensemble_advice}"}
     # 중간 커버리지는 단정하지 않는다 — 대상이 없는 이미지가 섞인 데이터셋에선
     # 낮은 검출률이 정답이다 (실측: 개 9장+비개 6장에서 9/15 검출 = 만점인데
     # "제로샷 약함"으로 오판해 프롬프트 실험·수동 라벨로 오도했다)
@@ -678,7 +682,7 @@ def _batch_verdict(job: dict, total: int, ontology: list[str] | None = None) -> 
             f"{total}장 중 {hit}장에서 검출({found}개). 못 찾은 {total - hit}장에 실제로 "
             "대상이 없다면 정상입니다 — 빈 이미지 몇 장을 열어 누락인지 확인하세요. "
             "누락이 많으면 '프롬프트 실험'으로 표현을 고르거나, 직접 라벨 수십 장으로 "
-            f"전용 모델을 학습시키면 급격히 좋아집니다.{pilot_advice}{ensemble_advice}", **diagnostics}
+            f"전용 모델을 학습시키면 급격히 좋아집니다.{plan_advice}{ensemble_advice}", **diagnostics}
 
 
 def _box_area_ratio(bbox: list[float], image: Image.Image) -> float:
@@ -696,34 +700,36 @@ def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool
     conn = get_db()
     learned_profile = foundation.build_profile(conn, pid, ontology)
     class_routes = foundation.useful_routes(learned_profile)
-    foundation_engine = ("auto" if has_student else
-                         "routed" if class_routes else
-                         "ensemble" if ml.sam3_available() else "foundation")
-    pilot_images = 0
-    pilot_decision = ("student" if has_student else
-                      "calibrated" if class_routes else "testing")
+    # 전용 모델이 있으면 파운데이션을 안 쓰고, SAM3가 없으면 고를 것이 없다.
+    # 둘 다 아닐 때만 seed/재탐색 스케줄이 의미를 갖는다.
+    fixed_engine = ("auto" if has_student else
+                    None if ml.sam3_available() else "foundation")
+    settled_engine = "routed" if class_routes else "sam3"
+    seeded = 0 if fixed_engine else foundation.audited_both(conn, pid)
+    both_runs = 0
+
+    def _engine_plan(both: int) -> dict:
+        """이번 배치가 엔진을 어떻게 배분했는지 — UI가 그대로 보여준다."""
+        return {"mode": fixed_engine or settled_engine, "both_engine_images": both,
+                "seeded_before": seeded, "seed_target": ensemble.SEED_IMAGES,
+                "explore_every": ensemble.EXPLORE_EVERY}
+
     try:
         for n, iid in enumerate(image_ids, 1):
             image = Image.open(_image_path(iid)).convert("RGB")
+            engine_mode = fixed_engine or ensemble.batch_engine(
+                n - 1, settled_engine, seeded)
+            both_runs += engine_mode == "ensemble"
             dets, used_engine = _detect_auto(
-                pid, image, ontology, engine=foundation_engine,
+                pid, image, ontology, engine=engine_mode,
                 profile=profile, candidate_conf=candidate_conf,
-                class_routes=class_routes if foundation_engine == "routed" else None)
+                class_routes=class_routes if engine_mode == "routed" else None)
             # 사람이 후보를 삭제하거나 박스를 고쳐도 원본 예측은 감사 테이블에
             # 남는다. 승인이 끝난 표본부터 다음 배치의 클래스별 경로에 반영된다.
             foundation.replace_audit(conn, pid, iid, dets, used_engine)
             raw_agreement = ensemble.agreement_counts(dets)
             for key, value in raw_agreement.items():
                 agreement_totals[key] += value
-            if foundation_engine == "ensemble":
-                pilot_images += 1
-                keep_ensemble = ensemble.pilot_should_continue(
-                    agreement_totals, pilot_images)
-                if keep_ensemble is False:
-                    foundation_engine = "sam3"
-                    pilot_decision = "sam3"
-                elif keep_ensemble is True:
-                    pilot_decision = "ensemble"
             detected_count = len(dets)
             # 재실행은 낡은 모델 초안만 교체한다. 사람이 직접 만들거나 고친
             # 같은 클래스 박스는 정답으로 보고, 겹치는 새 초안을 추가하지 않는다.
@@ -764,12 +770,12 @@ def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool
                         found=found, saved=saved, hit=hit,
                         class_counts=class_counts, large_boxes=large_boxes,
                         agreement_counts=agreement_totals,
-                        ensemble_pilot={"images": pilot_images, "decision": pilot_decision},
+                        engine_plan=_engine_plan(both_runs),
                         suppressed_human_overlap=suppressed)
         verdict = _batch_verdict(
             {"found": found, "hit": hit, "class_counts": class_counts,
              "large_boxes": large_boxes, "agreement_counts": agreement_totals,
-             "ensemble_pilot": {"images": pilot_images, "decision": pilot_decision}},
+             "engine_plan": _engine_plan(both_runs)},
             len(image_ids), [item["name"] for item in ontology])
         if suppressed:
             verdict["advice"] += f" 사람 라벨과 겹친 중복 {suppressed}개는 저장하지 않았습니다."

@@ -115,12 +115,13 @@ kbd {
 .ns-head { font-size: 11px; color: #8ab4ff; font-weight: 700; letter-spacing: 0.3px; }
 .ns-title { font-size: 15px; font-weight: 700; margin: 3px 0; }
 .ns-desc { font-size: 12px; color: var(--dim); line-height: 1.5; }
-.ensemble-pilot-result {
+.engine-plan-result {
   display: grid; gap: 2px; margin-top: 7px; padding: 6px 8px; border-radius: 6px;
   background: rgba(46, 204, 113, .08); border-left: 2px solid var(--ok); font-size: 10px;
 }
-.ensemble-pilot-result.sam3 { background: rgba(241, 196, 15, .08); border-left-color: var(--warn); }
-.ensemble-pilot-result span { color: var(--dim); line-height: 1.35; }
+/* 아직 승인 근거 없이 기본 엔진으로 도는 상태 — 확정된 경로와 구분한다 */
+.engine-plan-result.sam3 { background: rgba(241, 196, 15, .08); border-left-color: var(--warn); }
+.engine-plan-result span { color: var(--dim); line-height: 1.35; }
 .foundation-profile { display: grid; gap: 6px; }
 .foundation-head, .foundation-class {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;

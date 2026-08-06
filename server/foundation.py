@@ -41,13 +41,13 @@ def detect(image, ontology: list[dict], engine: str = "ensemble",
 
     if engine == "sam3" and ml.sam3_available():
         try:
-            return _mark_source(ml.detect_sam3(image, ontology), "sam3"), "sam3(pilot 선택)"
+            return _mark_source(ml.detect_sam3(image, ontology), "sam3"), "sam3(단독)"
         except Exception:
-            # 초기 3장 뒤 SAM3를 선택했더라도 이후 한 장의 추론 실패가 배치
-            # 전체를 중단시키면 안 된다. 같은 온톨로지를 GDINO로 즉시 보충한다.
+            # 단일 엔진으로 좁힌 뒤에도 한 장의 추론 실패가 배치 전체를
+            # 중단시키면 안 된다. 같은 온톨로지를 GDINO로 즉시 보충한다.
             dets = (tiling.detect_tiled(image, lambda im: ml.detect(im, ontology))
                     if use_tiles else ml.detect(image, ontology))
-            used = "foundation(sam3 선택 후 실패)" + ("+tiled" if use_tiles else "")
+            used = "foundation(sam3 실패 보충)" + ("+tiled" if use_tiles else "")
             return _mark_source(dets, "gdino"), used
     if engine in ("gdino", "foundation") or not ml.sam3_available():
         dets = (tiling.detect_tiled(image, lambda im: ml.detect(im, ontology))
@@ -106,6 +106,18 @@ def detect(image, ontology: list[dict], engine: str = "ensemble",
         raise RuntimeError(
             f"SAM3와 Grounding DINO가 모두 실패했습니다: {sam3_error}; {gdino_error}")
     return dets, used
+
+
+def audited_both(conn, project_id: int) -> int:
+    """양쪽 엔진을 다 돌려둔 이미지 수 — 배치 시작 시 seed 예산 계산에 쓴다.
+
+    build_profile의 reviewed_images와 다르다. 저쪽은 '승인까지 끝나 근거가 된'
+    표본이고, 이쪽은 '승인 여부와 무관하게 비교 자료가 준비된' 표본이다.
+    seed는 자료를 만드는 단계라 승인을 기다리지 않는다.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) c FROM foundation_audits "
+        "WHERE project_id=? AND sam3_ran=1 AND gdino_ran=1", (project_id,)).fetchone()["c"]
 
 
 def _ran_engines(used_engine: str) -> set[str]:

@@ -930,12 +930,12 @@ function NextStep({ project, images, trainInfo, job, onAutolabel }) {
       <div className="ns-head">지금 할 일 · {step.n}단계</div>
       <div className="ns-title">{step.title}</div>
       <div className="ns-desc">{step.desc}</div>
-      {job?.status === 'completed' && job.ensemble_pilot?.images > 0 && (
-        <div className={`ensemble-pilot-result ${job.ensemble_pilot.decision}`}>
-          <b>초기 {job.ensemble_pilot.images}장 교차 시험</b>
-          <span>{job.ensemble_pilot.decision === 'ensemble'
-            ? 'SAM3·GDINO 합의가 확인되어 두 모델을 계속 사용했습니다.'
-            : '합의가 낮아 나머지는 SAM3로 자동 전환했습니다.'}</span>
+      {job?.status === 'completed' && job.engine_plan?.both_engine_images > 0 && (
+        <div className={`engine-plan-result ${job.engine_plan.mode}`}>
+          <b>두 엔진 교차 검출 {job.engine_plan.both_engine_images}장</b>
+          <span>{job.engine_plan.seeded_before < job.engine_plan.seed_target
+            ? `비교 표본 ${job.engine_plan.seed_target}장을 채우는 중입니다. 승인하면 클래스별 엔진 선택 근거가 됩니다.`
+            : `${job.engine_plan.explore_every}장마다 1장은 두 엔진을 다시 돌려 선택 근거를 갱신합니다.`}</span>
         </div>
       )}
       {step.action && (

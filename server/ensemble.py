@@ -6,8 +6,13 @@ SAM3와 Grounding DINO의 confidence는 서로 보정된 값이 아니므로 점
 """
 
 MATCH_IOU = 0.45
-PILOT_IMAGES = 3
-MIN_PILOT_AGREEMENT = 0.10
+
+# 양쪽 엔진을 다 돌려 감사 표본을 만드는 앞부분. 이 표본이 승인되면
+# foundation.build_profile이 클래스별 경로를 정하는 근거가 된다.
+SEED_IMAGES = 30
+# 경로가 정해진 뒤에도 이 주기로 한 장은 양쪽을 다시 돌린다. 없으면 감사
+# 표본이 더 안 쌓여 build_profile이 초기 표본에 영구히 갇힌다 (자기 봉인).
+EXPLORE_EVERY = 10
 
 
 def iou(a: list[float], b: list[float]) -> float:
@@ -86,13 +91,24 @@ def agreement_counts(detections: list[dict]) -> dict[str, int]:
     return counts
 
 
-def pilot_should_continue(counts: dict[str, int], images_seen: int,
-                          min_images: int = PILOT_IMAGES,
-                          min_agreement: float = MIN_PILOT_AGREEMENT) -> bool | None:
-    """초기 표본에서 실제 보완 신호가 있을 때만 느린 이중 추론을 계속한다."""
-    if images_seen < min_images:
-        return None
-    total = sum(counts.get(key, 0) for key in ("consensus", "sam3_only", "gdino_only"))
-    if total == 0:
-        return False
-    return counts.get("consensus", 0) / total >= min_agreement
+def batch_engine(index: int, settled: str, audited_both: int,
+                 seed_images: int = SEED_IMAGES,
+                 explore_every: int = EXPLORE_EVERY) -> str:
+    """배치의 index번째(0-based) 이미지에서 실제로 돌릴 파운데이션 모드.
+
+    settled: 승인 근거로 정해진 기본 모드('routed') 또는 근거가 없을 때의
+        기본 단일 엔진('sam3').
+    audited_both: 배치 시작 시점에 이미 양쪽을 돌려둔 이미지 수.
+
+    이중 추론을 이어갈지 말지는 품질로 추측하지 않는다. 합의율로 판단하던
+    이전 방식은 재는 값이 틀렸다 — 합의 박스는 한쪽 엔진만 돌려도 나오므로
+    이중 추론의 이득이 아니다. 이득은 상대 엔진만 찾은 후보인데, 합의율이
+    낮을수록(= 서로 다른 것을 찾을수록) 이중 추론을 껐다. 방향이 반대였다.
+
+    그래서 품질 판단을 빼고 명시적 예산으로 바꾼다. 앞의 seed_images장은
+    근거를 만들기 위해 양쪽을 돌리고, 그 뒤에도 explore_every마다 한 장은
+    양쪽을 돌려 근거가 계속 자라게 한다.
+    """
+    if audited_both + index < seed_images:
+        return "ensemble"
+    return "ensemble" if index % explore_every == 0 else settled

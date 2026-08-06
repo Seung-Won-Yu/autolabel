@@ -835,6 +835,66 @@ def test_batch_autolabel_preserves_human_boxes_and_records_engine(
     assert bad.status_code == 400
 
 
+def test_routed_batch_keeps_collecting_both_engine_samples(
+        client, make_image, tmp_path, monkeypatch):
+    """경로가 정해진 뒤에도 재탐색 주기마다 양쪽을 돌려 근거가 계속 자란다.
+
+    이게 없으면 sam3_ran=1 AND gdino_ran=1 행이 더 안 생겨 build_profile이
+    초기 표본에 갇힌다 — 틀린 라우팅을 뒤집을 데이터가 영원히 안 쌓인다.
+    """
+    from server import ensemble, foundation, main
+    from server.db import get_db
+    from server.ensemble import fuse_foundation_detections
+
+    ontology = [{"name": "defect", "prompt": "surface defect"}]
+    pid = _project(client, "route-explore", ontology)
+
+    # SEED_IMAGES만큼 승인된 양쪽 감사 표본을 만들어 seed 단계를 끝낸다.
+    conn = get_db()
+    for i in range(ensemble.SEED_IMAGES):
+        seed_id = conn.execute(
+            "INSERT INTO images (project_id,file_name,width,height,status) "
+            "VALUES (?,?,?,?,?)", (pid, f"seed{i}.jpg", 200, 200, "approved")).lastrowid
+        conn.execute(
+            "INSERT INTO annotations (image_id,class_name,bbox,source) VALUES (?,?,?,?)",
+            (seed_id, "defect", "[10,10,20,20]", "human"))
+        # SAM3는 정답과 일치, GDINO는 빗나감 -> 검수 비용이 낮은 sam3로 라우팅된다
+        foundation.replace_audit(conn, pid, seed_id, fuse_foundation_detections(
+            [{"class_name": "defect", "bbox": [10, 10, 20, 20], "confidence": 0.8}],
+            [{"class_name": "defect", "bbox": [100, 100, 20, 20], "confidence": 0.7}],
+        ), "ensemble(sam3+gdino)")
+    conn.commit()
+    assert foundation.audited_both(conn, pid) == ensemble.SEED_IMAGES
+    conn.close()
+
+    img = make_image(tmp_path / "route-explore", "b.jpg")
+    with open(img, "rb") as f:
+        iid = client.post(f"/api/projects/{pid}/images",
+                          files=[("files", ("b.jpg", f, "image/jpeg"))]).json()["saved"][0]
+
+    seen = []
+
+    def fake_detect(_pid, _image, _onto, engine="auto", *_a, **_kw):
+        seen.append(engine)
+        used = ("ensemble(sam3+gdino)" if engine == "ensemble" else
+                "routed(sam3)" if engine == "routed" else "sam3(단독)")
+        return [{"class_name": "defect", "bbox": [10, 10, 20, 20], "confidence": 0.9}], used
+
+    monkeypatch.setattr(main, "_detect_auto", fake_detect)
+    batch = [iid] * (ensemble.EXPLORE_EVERY + 2)
+    main._run_batch(pid, batch, ontology, False)
+
+    # seed는 끝났으므로 EXPLORE_EVERY 주기의 장만 양쪽을 돌린다.
+    assert seen[0] == "ensemble"
+    assert seen[1:ensemble.EXPLORE_EVERY] == ["routed"] * (ensemble.EXPLORE_EVERY - 1)
+    assert seen[ensemble.EXPLORE_EVERY] == "ensemble"
+
+    plan = client.get(f"/api/projects/{pid}/autolabel/status").json()["engine_plan"]
+    assert plan["mode"] == "routed"
+    assert plan["both_engine_images"] == 2
+    assert plan["seeded_before"] == ensemble.SEED_IMAGES
+
+
 def test_export_skips_labels_of_removed_classes(client, make_image, tmp_path):
     """온톨로지에서 빠진 클래스의 라벨은 제외해야 한다.
 
@@ -1270,11 +1330,13 @@ def test_batch_verdict_prioritizes_low_agreement_candidates():
     v = _batch_verdict({
         "hit": 10, "found": 12, "class_counts": {"defect": 12},
         "agreement_counts": {"consensus": 2, "sam3_only": 6, "gdino_only": 4},
-        "ensemble_pilot": {"images": 3, "decision": "sam3"},
+        "engine_plan": {"mode": "sam3", "both_engine_images": 4,
+                        "seeded_before": 0, "seed_target": 30, "explore_every": 10},
     }, 10, ["defect"])
     assert v["verdict"] == "partial"
     assert "합의가 2/12개로 낮음" in v["advice"]
-    assert "나머지는 SAM3로 자동 전환" in v["advice"]
+    # 왜 10장 중 4장만 두 엔진을 돌렸는지 숨기지 않고 예산으로 설명한다
+    assert "10장 중 4장을 두 엔진으로 교차 검출" in v["advice"]
     assert v["agreement_counts"]["gdino_only"] == 4
     assert "검출률만으로" in v["advice"]
 

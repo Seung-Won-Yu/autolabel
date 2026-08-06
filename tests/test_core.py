@@ -8,7 +8,7 @@ import os
 import pytest
 
 from server import sampling
-from server.ensemble import agreement_counts, fuse_foundation_detections, pilot_should_continue
+from server.ensemble import agreement_counts, batch_engine, fuse_foundation_detections
 from server.parts import parse_ontology
 from server.tiling import merge_nms, suppress_trusted_overlaps, tile_boxes
 from server.train_worker import epoch_progress, pick_arch, pick_imgsz
@@ -196,12 +196,25 @@ def test_foundation_ensemble_matches_each_candidate_only_once():
     assert agreement_counts(result) == {"consensus": 1, "sam3_only": 1, "gdino_only": 0}
 
 
-def test_ensemble_pilot_stops_when_models_do_not_agree():
-    weak = {"consensus": 0, "sam3_only": 8, "gdino_only": 2}
-    assert pilot_should_continue(weak, 2) is None
-    assert pilot_should_continue(weak, 3) is False
-    useful = {"consensus": 2, "sam3_only": 5, "gdino_only": 3}
-    assert pilot_should_continue(useful, 3) is True
+def test_seed_budget_runs_both_engines_until_sample_is_built():
+    # 표본이 아직 없다 — 예산만큼은 무조건 양쪽을 돌린다.
+    assert [batch_engine(i, "sam3", 0, seed_images=5) for i in range(5)] == ["ensemble"] * 5
+    # 이전 배치에서 3장을 채웠으면 이번 배치는 2장만 더 채우면 된다.
+    assert [batch_engine(i, "sam3", 3, seed_images=5, explore_every=10)
+            for i in range(4)] == ["ensemble", "ensemble", "sam3", "sam3"]
+
+
+def test_exploration_keeps_both_engine_samples_growing_after_routing():
+    """경로가 정해진 뒤에도 주기적으로 양쪽을 돌려야 근거가 자란다.
+
+    이게 없으면 sam3_ran=1 AND gdino_ran=1 행이 더 안 생겨서 build_profile이
+    초기 표본에 영구히 갇힌다 — 틀린 판정을 뒤집을 데이터가 사라진다.
+    """
+    modes = [batch_engine(i, "routed", 99, seed_images=5, explore_every=4)
+             for i in range(8)]
+    assert modes == ["ensemble", "routed", "routed", "routed",
+                     "ensemble", "routed", "routed", "routed"]
+    assert modes.count("ensemble") == 2  # 8장 중 2장 = 1/4 주기 그대로
 
 
 def test_recall_profile_uses_low_candidate_threshold_and_tta(monkeypatch):
@@ -270,7 +283,7 @@ def test_cold_start_keeps_gdino_when_sam3_fails(monkeypatch):
     assert agreement_counts(dets)["gdino_only"] == 1
 
 
-def test_pilot_selected_sam3_skips_gdino(monkeypatch):
+def test_settled_sam3_route_skips_gdino(monkeypatch):
     from PIL import Image
 
     from server import main, tiling
@@ -284,10 +297,10 @@ def test_pilot_selected_sam3_skips_gdino(monkeypatch):
     dets, engine = main._detect_auto(
         1, Image.new("RGB", (640, 640)), [{"name": "defect"}], engine="sam3")
     assert len(dets) == 1
-    assert engine == "sam3(pilot 선택)"
+    assert engine == "sam3(단독)"
 
 
-def test_pilot_selected_sam3_failure_falls_back_to_gdino(monkeypatch):
+def test_settled_sam3_failure_falls_back_to_gdino(monkeypatch):
     from PIL import Image
 
     from server import foundation, tiling
@@ -305,7 +318,7 @@ def test_pilot_selected_sam3_failure_falls_back_to_gdino(monkeypatch):
 
     assert len(dets) == 1
     assert dets[0]["meta"]["foundation_engine"] == "gdino"
-    assert engine == "foundation(sam3 선택 후 실패)"
+    assert engine == "foundation(sam3 실패 보충)"
 
 
 def test_reviewed_foundation_profile_selects_lower_work_engine(client):
