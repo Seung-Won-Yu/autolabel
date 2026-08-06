@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import tempfile
 import threading
 import zipfile
@@ -18,7 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from server import ensemble, foundation, importer, jobs, ml, train, video, vlm
+from server import ensemble, foundation, importer, jobs, ml, parts, tiling, train, video, vlm
 from server.db import get_db, init_db, row_to_dict
 
 DATA_ROOT = Path(os.environ.get("AUTOLABEL_DATA")
@@ -126,8 +127,6 @@ def create_project(body: dict):
 @app.get("/api/capabilities")
 def capabilities():
     """설치된 모델 역량 — UI가 SAM 3 유무 등을 안내하는 데 쓴다."""
-    from pathlib import Path
-
     return {
         "sam3": ml.sam3_available(),
         "sam3_hint": "models/sam3.pt 를 두면 텍스트 검출이 SAM 3로 승급됩니다 "
@@ -540,8 +539,6 @@ def _detect_auto(pid: int, image: Image.Image, ontology: list, engine: str = "au
     온톨로지에 '부모.자식' 표기가 있으면 part 캐스케이드까지 수행한다.
     반환: (검출, 사용 엔진)
     """
-    from server import parts, tiling
-
     parent_onto, parts_by_parent = parts.parse_ontology(ontology)
     # 고해상도 이미지는 타일링으로 작은 객체 회수율을 올린다 (SAHI 패턴)
     use_tiles = tiling.should_tile(image)
@@ -730,7 +727,6 @@ def _run_batch(pid: int, image_ids: list[int], ontology: list[dict], masks: bool
             detected_count = len(dets)
             # 재실행은 낡은 모델 초안만 교체한다. 사람이 직접 만들거나 고친
             # 같은 클래스 박스는 정답으로 보고, 겹치는 새 초안을 추가하지 않는다.
-            from server import tiling
             trusted = [row_to_dict(r) for r in conn.execute(
                 "SELECT * FROM annotations WHERE image_id=? AND source!='model'", (iid,))]
             dets, n_suppressed = tiling.suppress_trusted_overlaps(dets, trusted)
@@ -1497,8 +1493,6 @@ def delete_image(iid: int):
 
 @app.delete("/api/projects/{pid}")
 def delete_project(pid: int):
-    import shutil
-
     conn = get_db()
     conn.execute("DELETE FROM foundation_candidates WHERE project_id=?", (pid,))
     conn.execute("DELETE FROM foundation_audits WHERE project_id=?", (pid,))
@@ -1545,10 +1539,6 @@ def _exportable_images(conn, pid: int, include_rejected: bool):
 
 @app.get("/api/projects/{pid}/export.zip")
 def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
-    import os as _os
-    import tempfile
-    import zipfile
-
     from starlette.background import BackgroundTask
 
     conn = get_db()
@@ -1612,7 +1602,7 @@ def export_zip(pid: int, fmt: str = "yolo", include_rejected: bool = False):
                  "X-Images-Exported": str(len(images) - missing),
                  "X-Images-Missing": str(missing),
                  "X-Annotations-Skipped": str(skipped)},
-        background=BackgroundTask(_os.unlink, tmp.name))
+        background=BackgroundTask(os.unlink, tmp.name))
 
 
 # ---------- 통계적 배치 검수 ----------
@@ -1693,10 +1683,6 @@ def training_dataset_zip(pid: int):
     train/val/test 분할을 써야 사람 검수가 끝나지 않은 초안과 평가 누출이
     모델에 들어가지 않는다.
     """
-    import shutil
-    import tempfile
-    import zipfile
-
     from starlette.background import BackgroundTask
 
     conn = get_db()

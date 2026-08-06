@@ -30,6 +30,10 @@ def detect(image, ontology: list[dict], engine: str = "ensemble",
            class_routes: dict[str, str] | None = None) -> tuple[list[dict], str]:
     """파운데이션 엔진 실행과 장애 시 폴백을 한 경계에서 처리한다.
 
+    engine: 'sam3' | 'gdino' | 'foundation'은 단일 엔진을 강제한다. 그 외
+    ('ensemble', 'routed', 호출부가 학생 모델을 못 찾고 넘긴 'auto')는 모두
+    두 엔진 교차 경로로 간다 — 알 수 없는 값이 조용히 한쪽으로 새지 않는다.
+
     class_routes 값은 sam3/gdino/ensemble이다. 미결정 클래스는 ensemble로
     취급해 어느 클래스도 조용히 누락하지 않는다.
     """
